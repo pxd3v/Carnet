@@ -1,5 +1,5 @@
 /target/
+/mutants.out/
 /.superpowers/
 *.profraw
 lcov.info
-

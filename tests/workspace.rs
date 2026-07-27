@@ -260,14 +260,16 @@ fn open_workspace(root: PathBuf) -> Workspace {
 
 proptest! {
     #[test]
-    fn hostile_components_never_resolve_or_create_outside_the_root(
+    fn every_path_mutation_rejects_hostile_components_without_touching_the_root(
         before in prop::collection::vec("[a-zA-Z0-9_-]{1,12}", 0..6),
         after in prop::collection::vec("[a-zA-Z0-9_-]{1,12}", 0..6),
-        hostile in prop_oneof![Just(".."), Just(".git")],
+        hostile in prop_oneof![Just(".."), Just(".git"), Just(".GIT"), Just(".Git"), Just(".gIt")],
     ) {
         let sandbox = tempdir().unwrap();
-        let root = fs::canonicalize(sandbox.path()).unwrap();
-        let outside = root.parent().unwrap().join(format!("outside-{}", Uuid::new_v4()));
+        let root = sandbox.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        fs::write(root.join("source.md"), "source").unwrap();
         let workspace = open_workspace(root.clone());
         let path = before
             .iter()
@@ -278,13 +280,78 @@ proptest! {
             .collect::<PathBuf>();
 
         prop_assert!(workspace.resolve_note(&path).is_err());
-        let create = Workspace::apply(FileOperation::CreateFile {
-            workspace,
-            path,
-        });
-        prop_assert!(create.is_err());
-        prop_assert!(!outside.exists());
+        let operations = [
+            FileOperation::CreateFile {
+                workspace: workspace.clone(),
+                path: path.clone(),
+            },
+            FileOperation::CreateFolder {
+                workspace: workspace.clone(),
+                path: path.clone(),
+            },
+            FileOperation::Rename {
+                workspace: workspace.clone(),
+                from: PathBuf::from("source.md"),
+                to: path.clone(),
+            },
+            FileOperation::Rename {
+                workspace: workspace.clone(),
+                from: path.clone(),
+                to: PathBuf::from("renamed.md"),
+            },
+            FileOperation::Move {
+                workspace: workspace.clone(),
+                from: PathBuf::from("source.md"),
+                to: path.clone(),
+            },
+            FileOperation::Move {
+                workspace: workspace.clone(),
+                from: path.clone(),
+                to: PathBuf::from("moved.md"),
+            },
+            FileOperation::Delete {
+                workspace,
+                path: path.clone(),
+                confirmed: true,
+            },
+        ];
+        for operation in operations {
+            prop_assert!(Workspace::apply(operation).is_err(), "path: {}", path.display());
+        }
+        prop_assert_eq!(fs::read_to_string(root.join("source.md")).unwrap(), "source");
+        prop_assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn save_rejects_a_missing_ancestor_replaced_by_a_symlink_after_load() {
+    let sandbox = tempdir().unwrap();
+    let root = sandbox.path().join("repo");
+    fs::create_dir(&root).unwrap();
+    let root = fs::canonicalize(root).unwrap();
+    let outside = tempdir().unwrap();
+    let workspace = open_workspace(root.clone());
+    let missing = workspace
+        .load_note(&workspace.resolve_note(Path::new("future/note.md")).unwrap())
+        .unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.join("future")).unwrap();
+
+    let error = Workspace::apply(FileOperation::Save {
+        note: missing,
+        content: "confined".into(),
+        overwrite: false,
+    })
+    .unwrap_err();
+
+    assert!(matches!(error, FileError::Path(PathError::Symlink { .. })));
+    assert!(!outside.path().join("note.md").exists());
+    assert!(
+        fs::symlink_metadata(root.join("future"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[test]

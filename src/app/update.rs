@@ -355,6 +355,15 @@ impl App {
             AppEvent::Action(AppAction::ConfirmDelete) => self.confirm_delete(),
             AppEvent::Action(AppAction::SubmitFileAction(path)) => self.submit_file_action(path),
             AppEvent::Action(AppAction::Dismiss) => {
+                match self.dialog.as_ref() {
+                    Some(Dialog::DirtyNavigation) => {
+                        return self.update(AppEvent::DirtyChoice(DirtyChoice::Cancel));
+                    }
+                    Some(Dialog::ExternalConflict(_)) => {
+                        return self.update(AppEvent::ConflictChoice(ConflictChoice::Cancel));
+                    }
+                    _ => {}
+                }
                 self.dialog = None;
                 self.dialog_input.clear();
                 self.repository_form = RepositoryFormState::default();
@@ -640,6 +649,9 @@ impl App {
                 Vec::new()
             }
             AppEvent::ConflictChoice(ConflictChoice::Reload) => {
+                if !matches!(self.dialog, Some(Dialog::ExternalConflict(_))) {
+                    return Vec::new();
+                }
                 self.dialog = None;
                 self.pending_intent = None;
                 let path = match &self.screen {
@@ -650,10 +662,16 @@ impl App {
                     .unwrap_or_default()
             }
             AppEvent::ConflictChoice(ConflictChoice::Overwrite) => {
+                if !matches!(self.dialog, Some(Dialog::ExternalConflict(_))) {
+                    return Vec::new();
+                }
                 self.dialog = None;
                 self.save(true)
             }
             AppEvent::ConflictChoice(ConflictChoice::Cancel) => {
+                if !matches!(self.dialog, Some(Dialog::ExternalConflict(_))) {
+                    return Vec::new();
+                }
                 self.dialog = None;
                 self.pending_intent = None;
                 Vec::new()
@@ -778,14 +796,18 @@ impl App {
                     .unwrap_or_default()
             }
             AppEvent::DirtyChoice(DirtyChoice::Save) => {
-                if self.pending_mutation.is_some() {
+                if !matches!(self.dialog, Some(Dialog::DirtyNavigation))
+                    || self.pending_mutation.is_some()
+                {
                     return Vec::new();
                 }
                 self.dialog = None;
                 self.global_save()
             }
             AppEvent::DirtyChoice(DirtyChoice::Discard) => {
-                if self.pending_mutation.is_some() {
+                if !matches!(self.dialog, Some(Dialog::DirtyNavigation))
+                    || self.pending_mutation.is_some()
+                {
                     return Vec::new();
                 }
                 let intent = self.pending_intent.take();
@@ -796,7 +818,9 @@ impl App {
                     .unwrap_or_default()
             }
             AppEvent::DirtyChoice(DirtyChoice::Cancel) => {
-                if self.pending_mutation.is_some() {
+                if !matches!(self.dialog, Some(Dialog::DirtyNavigation))
+                    || self.pending_mutation.is_some()
+                {
                     return Vec::new();
                 }
                 self.pending_intent = None;

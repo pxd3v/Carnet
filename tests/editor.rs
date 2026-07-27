@@ -5,7 +5,7 @@ use carnet::{
     editor::{
         Clipboard, ClipboardError, Editor, EditorCommand, EditorOutcome, HighlightLanguage, Motion,
     },
-    workspace::{FileOperation, NewlineStyle, Workspace},
+    workspace::{FileError, FileOperation, FileOutcome, NewlineStyle, Workspace},
 };
 use tempfile::tempdir;
 use unicode_segmentation::UnicodeSegmentation;
@@ -14,10 +14,17 @@ use uuid::Uuid;
 use proptest::prelude::*;
 
 #[test]
-fn editor_starts_clean_and_builds_a_save_with_the_loaded_metadata() {
+fn complete_undo_saves_with_original_metadata_and_retains_conflict_detection() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     let sandbox = tempdir().unwrap();
     let root = fs::canonicalize(sandbox.path()).unwrap();
-    fs::write(root.join("note.md"), b"\xef\xbb\xbffirst\r\nsecond\r\n").unwrap();
+    let note_path = root.join("note.md");
+    let original_bytes = b"\xef\xbb\xbffirst\r\nsecond\r\n";
+    fs::write(&note_path, original_bytes).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&note_path, fs::Permissions::from_mode(0o640)).unwrap();
     let workspace = open_workspace(root);
     let note = workspace
         .load_note(&workspace.resolve_note(Path::new("note.md")).unwrap())
@@ -32,7 +39,8 @@ fn editor_starts_clean_and_builds_a_save_with_the_loaded_metadata() {
     editor.apply(EditorCommand::Undo);
     assert_eq!(editor.text(), "first\nsecond\n");
     assert!(!editor.is_dirty());
-    match editor.save_operation(false) {
+    let operation = editor.save_operation(false);
+    match &operation {
         FileOperation::Save {
             note,
             content,
@@ -48,6 +56,21 @@ fn editor_starts_clean_and_builds_a_save_with_the_loaded_metadata() {
         }
         operation => panic!("unexpected operation: {operation:?}"),
     }
+
+    let FileOutcome::Saved(saved) = Workspace::apply(operation).unwrap() else {
+        panic!("expected saved note");
+    };
+    assert_eq!(fs::read(&note_path).unwrap(), original_bytes);
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(&note_path).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+
+    fs::write(&note_path, b"\xef\xbb\xbfexternal\r\n").unwrap();
+    let error = Workspace::apply(Editor::from_loaded(saved).save_operation(false)).unwrap_err();
+    assert!(matches!(error, FileError::ExternalModification { .. }));
+    assert_eq!(fs::read(&note_path).unwrap(), b"\xef\xbb\xbfexternal\r\n");
 }
 
 #[test]
@@ -204,6 +227,44 @@ fn literal_find_navigates_forward_backward_and_wraps() {
     );
     assert_eq!(editor.selection(), Some(16..19));
     assert!(!editor.is_dirty());
+}
+
+#[test]
+fn select_all_resets_find_navigation_to_the_new_cursor() {
+    let mut editor = editor_from("find.md", "cat one cat two");
+    editor.apply(EditorCommand::SetFindQuery("cat".into()));
+    editor.apply(EditorCommand::FindNext);
+    assert_eq!(editor.selection(), Some(0..3));
+
+    editor.apply(EditorCommand::SelectAll);
+    assert_eq!(editor.selection(), Some(0..15));
+
+    assert_eq!(
+        editor.apply(EditorCommand::FindNext),
+        EditorOutcome::SearchMatch {
+            current: 1,
+            total: 2,
+        }
+    );
+    assert_eq!(editor.selection(), Some(0..3));
+}
+
+#[test]
+fn find_next_starts_at_or_after_the_current_cursor() {
+    let mut editor = editor_from("find.md", "cat cat");
+    for _ in 0..4 {
+        editor.apply(move_command(Motion::Right, false));
+    }
+    editor.apply(EditorCommand::SetFindQuery("cat".into()));
+
+    assert_eq!(
+        editor.apply(EditorCommand::FindNext),
+        EditorOutcome::SearchMatch {
+            current: 2,
+            total: 2,
+        }
+    );
+    assert_eq!(editor.selection(), Some(4..7));
 }
 
 #[test]

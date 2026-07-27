@@ -143,6 +143,96 @@ fn pending_mutations_reject_clean_navigation_quit_and_dirty_discard() {
 }
 
 #[test]
+fn dismissing_dirty_navigation_cancels_its_pending_intent() {
+    use carnet::app::{Dialog, NavigationAction};
+
+    let (_sandbox, mut app) = app_with_note(102, "note.md", "base");
+    app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "dirty ".into(),
+    ))));
+    app.update(AppEvent::Action(AppAction::Navigate(
+        NavigationAction::Quit,
+    )));
+    assert_eq!(app.dialog, Some(Dialog::DirtyNavigation));
+    assert_eq!(
+        app.pending_intent,
+        Some(PendingIntent::Navigation(NavigationAction::Quit))
+    );
+
+    assert!(app.update(AppEvent::Action(AppAction::Dismiss)).is_empty());
+
+    assert_eq!(app.dialog, None);
+    assert_eq!(app.pending_intent, None);
+    assert!(!app.quit.requested);
+    assert_eq!(workspace_editor(&app).text(), "dirty base");
+    assert!(workspace_editor(&app).is_dirty());
+}
+
+#[test]
+fn dirty_choices_are_ignored_unless_dirty_navigation_owns_the_dialog() {
+    use carnet::app::{DirtyChoice, FailureKind, NavigationAction};
+
+    let (_sandbox, mut app) = app_with_note(103, "note.md", "base");
+    app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "dirty ".into(),
+    ))));
+    app.update(AppEvent::Action(AppAction::Navigate(
+        NavigationAction::Quit,
+    )));
+    app.dialog = Some(carnet::app::Dialog::Failure {
+        kind: FailureKind::Runtime,
+        message: "foreground failure".into(),
+    });
+
+    assert!(
+        app.update(AppEvent::DirtyChoice(DirtyChoice::Discard))
+            .is_empty()
+    );
+
+    assert_eq!(
+        app.pending_intent,
+        Some(PendingIntent::Navigation(NavigationAction::Quit))
+    );
+    assert!(!app.quit.requested);
+    assert_eq!(workspace_editor(&app).text(), "dirty base");
+    assert!(workspace_editor(&app).is_dirty());
+}
+
+#[test]
+fn conflict_choices_are_ignored_unless_an_external_conflict_owns_the_dialog() {
+    use carnet::app::{ConflictChoice, Dialog, ExternalConflict, FailureKind, GlobalAction};
+
+    let (_sandbox, mut app) = app_with_note(104, "note.md", "base");
+    app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "dirty ".into(),
+    ))));
+    app.update(AppEvent::Action(AppAction::Global(GlobalAction::Save)));
+    let (mutation_id, _, repository_root) = pending_mutation_identity(&app);
+    app.update(AppEvent::MutationConflict {
+        mutation_id,
+        repository_id: Uuid::from_u128(104),
+        repository_root,
+        conflict: ExternalConflict::Modified {
+            path: PathBuf::from("note.md"),
+        },
+    });
+    assert!(matches!(app.dialog, Some(Dialog::ExternalConflict(_))));
+    app.dialog = Some(Dialog::Failure {
+        kind: FailureKind::Runtime,
+        message: "foreground failure".into(),
+    });
+
+    assert!(
+        app.update(AppEvent::ConflictChoice(ConflictChoice::Overwrite))
+            .is_empty()
+    );
+
+    assert!(app.pending_mutation.is_none());
+    assert_eq!(workspace_editor(&app).text(), "dirty base");
+    assert!(workspace_editor(&app).is_dirty());
+}
+
+#[test]
 fn dirty_create_file_waits_for_save_success_before_starting_the_create() {
     use carnet::{
         app::{Dialog, DirtyChoice, Focus, TreeAction},
@@ -1639,6 +1729,10 @@ fn failed_save_stays_on_the_dirty_note_and_marks_a_failure_exit() {
             source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "still read only"),
         }),
     });
+    app.update(AppEvent::Action(AppAction::Dismiss));
+    app.update(AppEvent::Action(AppAction::Navigate(
+        NavigationAction::Quit,
+    )));
     app.update(AppEvent::DirtyChoice(DirtyChoice::Discard));
     assert_eq!(app.quit.final_status, None);
     app.update(AppEvent::QuitFinalized);
@@ -2448,12 +2542,15 @@ fn find_editor_action_invalidates_a_pending_clipboard_read() {
 
 #[test]
 fn discarding_editor_changes_invalidates_a_pending_clipboard_read() {
-    use carnet::app::{DirtyChoice, GlobalAction};
+    use carnet::app::{DirtyChoice, GlobalAction, NavigationAction};
 
     let (_sandbox, mut app) = app_with_note(101, "note.md", "base");
     app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
         "mine ".into(),
     ))));
+    app.update(AppEvent::Action(AppAction::Navigate(
+        NavigationAction::Quit,
+    )));
     let effect = app.update(AppEvent::Action(AppAction::Global(GlobalAction::Paste)));
     let [AppEffect::ReadClipboard { request_id, origin }] = &effect[..] else {
         panic!("paste did not emit one identified clipboard read");

@@ -268,6 +268,49 @@ fn a_failed_commit_keeps_saved_bytes_and_runtime_retry_recovers_clean_exit() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn failed_catalog_persistence_rolls_back_visible_state_and_exits_one() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = tempdir().unwrap();
+    let config_directory = sandbox.path().join("config");
+    let config = config_directory.join("catalog.toml");
+    let root = sandbox.path().join("notes");
+    GitRepo::initialize(&root).unwrap();
+    let mut catalog = Catalog::create_at(&config);
+    catalog.register("notes", &root).unwrap();
+    catalog.save().unwrap();
+    let launch = route(Cli::try_parse_from(["carnet"]).unwrap(), &catalog).unwrap();
+    let mut harness = Harness::new(catalog, launch);
+    fs::set_permissions(&config_directory, fs::Permissions::from_mode(0o555)).unwrap();
+
+    harness.dispatch(AppEvent::Action(AppAction::Home(
+        HomeAction::RenameSelected,
+    )));
+    harness.dispatch(AppEvent::Action(AppAction::SetRepositoryFormInput(
+        "renamed".into(),
+    )));
+    harness.dispatch(AppEvent::Action(AppAction::SubmitRepositoryForm));
+    fs::set_permissions(&config_directory, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(harness.runtime.app().home.repositories[0].name, "notes");
+    assert!(harness.runtime.app().failures.catalog.is_some());
+    let persisted = Catalog::load_at(&config).unwrap();
+    assert!(persisted.resolve_repo(Some("notes")).is_ok());
+    assert!(persisted.resolve_repo(Some("renamed")).is_err());
+
+    harness.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::Quit)));
+    assert_eq!(
+        harness.runtime.finalize_quit(Duration::from_secs(1)),
+        AppExitStatus::Failure
+    );
+    assert_eq!(
+        harness.runtime.app().quit.final_status,
+        Some(AppExitStatus::Failure)
+    );
+}
+
 struct Harness {
     runtime: Runtime,
 }

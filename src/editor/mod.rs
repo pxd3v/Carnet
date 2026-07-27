@@ -406,6 +406,7 @@ impl Editor {
         self.anchor = Some(0);
         self.cursor = self.buffer.len_chars();
         self.preferred_column = None;
+        self.search.reset_navigation();
         if before == (self.cursor, self.selection()) {
             EditorOutcome::NoChange
         } else {
