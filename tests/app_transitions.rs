@@ -2,8 +2,8 @@ use std::{fs, path::PathBuf};
 
 use carnet::{
     app::{
-        App, AppAction, AppEffect, AppEvent, DefaultChoiceState, HomeAction, PendingFileMutation,
-        PendingIntent, Screen,
+        App, AppAction, AppEffect, AppEvent, CatalogSnapshot, DefaultChoiceState, HomeAction,
+        PendingFileMutation, PendingIntent, Screen,
     },
     catalog::RepoEntry,
     editor::EditorCommand,
@@ -565,6 +565,10 @@ fn workspace_open_invalidates_a_rename_dialog_from_the_previous_repository() {
     let (_sandbox_a, mut app) = app_with_note(100, "note.md", "a");
     let (sandbox_b, repository_b, _workspace_b, _git_b) =
         workspace_fixture(101, "repository-b", "note.md", "b");
+    app.home.repositories.push(repository_b.clone());
+    app.home
+        .repository_availability
+        .push(carnet::app::RepositoryAvailability::Available);
     app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
     app.update(AppEvent::Action(AppAction::Tree(TreeAction::Rename)));
     assert!(matches!(
@@ -616,6 +620,10 @@ fn workspace_open_invalidates_delete_confirmation_from_the_previous_repository()
     let (_sandbox_a, mut app) = app_with_note(102, "note.md", "a");
     let (sandbox_b, repository_b, _workspace_b, _git_b) =
         workspace_fixture(103, "repository-b", "note.md", "b");
+    app.home.repositories.push(repository_b.clone());
+    app.home
+        .repository_availability
+        .push(carnet::app::RepositoryAvailability::Available);
     app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
     app.update(AppEvent::Action(AppAction::Tree(TreeAction::Delete)));
     assert!(matches!(app.dialog, Some(Dialog::ConfirmDelete { .. })));
@@ -754,6 +762,10 @@ fn workspace_open_clears_old_deferred_file_intent_but_keeps_global_dialog() {
     let (_sandbox_a, mut app) = app_with_note(107, "note.md", "a");
     let (_sandbox_b, repository_b, _workspace_b, _git_b) =
         workspace_fixture(108, "repository-b", "note.md", "b");
+    app.home.repositories.push(repository_b.clone());
+    app.home
+        .repository_availability
+        .push(carnet::app::RepositoryAvailability::Available);
     app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
     app.update(AppEvent::Action(AppAction::Tree(TreeAction::Rename)));
     let Some(Dialog::FileAction { origin, .. }) = app.dialog.clone() else {
@@ -2270,7 +2282,7 @@ fn global_editor_shortcuts_are_pure_and_clipboard_work_is_effect_driven() {
 
 #[test]
 fn outer_runtime_effect_failures_return_as_explicit_app_events() {
-    use carnet::{app::FailureKind, catalog::CatalogError, editor::ClipboardError};
+    use carnet::{app::FailureKind, editor::ClipboardError};
 
     let repository = repository(48, "notes");
     let mut app = App::home(vec![repository.clone()], Some(repository.id), None);
@@ -2282,11 +2294,8 @@ fn outer_runtime_effect_failures_return_as_explicit_app_events() {
     );
 
     let mut catalog_app = App::home(vec![repository.clone()], Some(repository.id), None);
-    catalog_app.update(AppEvent::DefaultRepositoryPersisted {
-        repository_id: repository.id,
-        result: Err(CatalogError::RepositoryNotFound {
-            name: "notes".into(),
-        }),
+    catalog_app.update(AppEvent::RepositoryCatalogFailed {
+        message: "notes is not registered".into(),
     });
     assert_eq!(
         catalog_app
@@ -2343,6 +2352,26 @@ fn choosing_a_default_preserves_the_pending_note_until_workspace_open_finishes()
         HomeAction::ChooseSelectedAsDefault,
     )));
 
+    assert_eq!(app.home.default_repository, None);
+    assert_eq!(
+        app.home.default_choice,
+        DefaultChoiceState::AwaitingSelection
+    );
+    assert_eq!(app.home.pending_note, Some(pending_note.clone()));
+    assert!(matches!(
+        &effects[..],
+        [AppEffect::SetDefaultRepository { repository_id }]
+            if *repository_id == repository.id
+    ));
+    assert!(app.pending_request.is_none());
+
+    let effects = app.update(AppEvent::RepositoryCatalogChanged(CatalogSnapshot {
+        repositories: vec![repository.clone()],
+        default_repository: Some(repository.id),
+        selected_repository: Some(repository.id),
+    }));
+
+    assert_eq!(app.home.default_repository, Some(repository.id));
     assert_eq!(
         app.home.default_choice,
         DefaultChoiceState::ResumingPendingNote {
@@ -2350,18 +2379,58 @@ fn choosing_a_default_preserves_the_pending_note_until_workspace_open_finishes()
             note: pending_note.clone(),
         }
     );
-    assert_eq!(app.home.pending_note, Some(pending_note.clone()));
     assert!(matches!(
         &effects[..],
-        [
-            AppEffect::SetDefaultRepository { repository_id },
-            AppEffect::OpenWorkspace {
-                repository: opened,
-                note: Some(note),
-                ..
-            }
-        ] if *repository_id == repository.id && opened == &repository && note == &pending_note
+        [AppEffect::OpenWorkspace {
+            repository: opened,
+            note: Some(note),
+            ..
+        }] if opened == &repository && note == &pending_note
     ));
+}
+
+#[test]
+fn enter_with_a_pending_note_persists_the_default_before_opening() {
+    let repository = repository(70, "chosen");
+    let pending_note = PathBuf::from("inbox/today.md");
+    let mut app = App::home(vec![repository.clone()], None, Some(pending_note.clone()));
+
+    let effects = app.update(AppEvent::Action(AppAction::Home(HomeAction::OpenSelected)));
+
+    assert!(matches!(
+        effects.as_slice(),
+        [AppEffect::SetDefaultRepository { repository_id }]
+            if *repository_id == repository.id
+    ));
+    assert_eq!(app.home.default_repository, None);
+    assert_eq!(app.home.pending_note, Some(pending_note));
+    assert!(app.pending_request.is_none());
+}
+
+#[test]
+fn failed_default_persistence_keeps_the_previous_default_and_pending_note() {
+    let first = repository(71, "first");
+    let chosen = repository(72, "chosen");
+    let note = PathBuf::from("pending.md");
+    let mut app = App::home(
+        vec![first.clone(), chosen.clone()],
+        Some(first.id),
+        Some(note.clone()),
+    );
+    app.home.selected = Some(1);
+
+    app.update(AppEvent::Action(AppAction::Home(
+        HomeAction::ChooseSelectedAsDefault,
+    )));
+    let effects = app.update(AppEvent::RepositoryCatalogFailed {
+        message: "catalog save failed".into(),
+    });
+
+    assert!(effects.is_empty());
+    assert_eq!(app.home.default_repository, Some(first.id));
+    assert_eq!(app.home.pending_note, Some(note));
+    assert!(app.pending_request.is_none());
+    assert!(app.failures.catalog.is_some());
 }
 
 #[test]
@@ -2413,6 +2482,13 @@ fn workspace_open_result_resumes_the_pending_note_and_clears_home_resume_state()
         HomeAction::ChooseSelectedAsDefault,
     )));
 
+    let open = app.update(AppEvent::RepositoryCatalogChanged(CatalogSnapshot {
+        repositories: vec![repository.clone()],
+        default_repository: Some(repository.id),
+        selected_repository: Some(repository.id),
+    }));
+    assert!(matches!(open.as_slice(), [AppEffect::OpenWorkspace { .. }]));
+
     let request_id = app.pending_request.as_ref().unwrap().request_id();
     let effects = app.update(AppEvent::WorkspaceOpened {
         request_id,
@@ -2436,6 +2512,74 @@ fn workspace_open_result_resumes_the_pending_note_and_clears_home_resume_state()
     );
     assert_eq!(workspace.editor.as_ref().unwrap().text(), "hello");
     drop(sandbox);
+}
+
+#[test]
+fn catalog_rename_or_unregister_invalidates_a_pending_workspace_open() {
+    for repositories in [
+        Vec::new(),
+        vec![RepoEntry {
+            id: Uuid::from_u128(73),
+            name: "renamed".into(),
+            path: PathBuf::from("/repos/original"),
+        }],
+    ] {
+        let (sandbox, repository, workspace, git) =
+            workspace_fixture(73, "original", "note.md", "hello");
+        let tree = workspace.tree().unwrap();
+        let note = workspace
+            .load_note(
+                &workspace
+                    .resolve_note(PathBuf::from("note.md").as_path())
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut app = App::home(vec![repository.clone()], Some(repository.id), None);
+        app.update(AppEvent::Action(AppAction::Home(HomeAction::OpenSelected)));
+        let request_id = app.pending_request.as_ref().unwrap().request_id();
+
+        app.update(AppEvent::RepositoryCatalogChanged(CatalogSnapshot {
+            repositories,
+            default_repository: None,
+            selected_repository: None,
+        }));
+        assert!(app.pending_request.is_none());
+
+        app.update(AppEvent::WorkspaceOpened {
+            request_id,
+            repository_id: repository.id,
+            workspace,
+            git,
+            tree,
+            note: Some(note),
+        });
+
+        assert!(matches!(app.screen, Screen::Home));
+        drop(sandbox);
+    }
+}
+
+#[test]
+fn pending_workspace_open_suppresses_repository_home_mutations() {
+    let repository = repository(74, "notes");
+
+    for action in [
+        HomeAction::CreateRepository,
+        HomeAction::RegisterRepository,
+        HomeAction::RenameSelected,
+        HomeAction::SetDefaultSelected,
+        HomeAction::UnregisterSelected,
+    ] {
+        let mut app = App::home(vec![repository.clone()], Some(repository.id), None);
+        app.update(AppEvent::Action(AppAction::Home(HomeAction::OpenSelected)));
+
+        assert!(
+            app.update(AppEvent::Action(AppAction::Home(action)))
+                .is_empty()
+        );
+        assert!(app.dialog.is_none());
+        assert!(app.pending_catalog.is_none());
+    }
 }
 
 fn repository(id: u128, name: &str) -> RepoEntry {

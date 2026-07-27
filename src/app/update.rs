@@ -1,7 +1,6 @@
 use uuid::Uuid;
 
 use crate::{
-    catalog::CatalogError,
     editor::{ClipboardError, Editor, EditorCommand},
     git::{CommitIntent, CommitOutcome, GitError, GitRepo, MutationCommitError},
     workspace::{FileOperation, FileOutcome, LoadedNote, TreeEntry, TreeEntryKind, Workspace},
@@ -10,10 +9,11 @@ use crate::{
 use super::{
     App, AppEffect, AppExitStatus, CatalogSnapshot, CommitStatus, DefaultChoiceState, Dialog,
     ExternalConflict, FailureKind, FileActionKind, FileMutationAction, Focus, MutationId,
-    NavigationAction, OverlayState, PendingFileMutation, PendingIntent, PendingMutation,
-    PendingMutationKind, PendingRequest, PendingSave, RepositoryActionKind, RepositoryAvailability,
-    RepositoryFormField, RepositoryFormState, RequestId, RuntimeFailure, SavedCommitFailure,
-    Screen, UnresolvedFailure, WorkspaceOrigin, WorkspaceState,
+    NavigationAction, OverlayState, PendingCatalogOperation, PendingDefaultIntent,
+    PendingFileMutation, PendingIntent, PendingMutation, PendingMutationKind, PendingRequest,
+    PendingSave, RepositoryActionKind, RepositoryAvailability, RepositoryFormField,
+    RepositoryFormState, RequestId, RuntimeFailure, SavedCommitFailure, Screen, UnresolvedFailure,
+    WorkspaceOrigin, WorkspaceState,
 };
 use super::{RuntimeError, RuntimeOperation};
 
@@ -105,10 +105,6 @@ pub enum AppEvent {
     RepositoryCatalogFailed {
         message: String,
     },
-    DefaultRepositoryPersisted {
-        repository_id: Uuid,
-        result: Result<(), CatalogError>,
-    },
     DirtyChoice(DirtyChoice),
     ConflictChoice(ConflictChoice),
     MutationApplied {
@@ -179,6 +175,14 @@ impl App {
         }
         match event {
             AppEvent::RepositoryCatalogChanged(snapshot) => {
+                if matches!(
+                    &self.pending_request,
+                    Some(PendingRequest::OpenWorkspace { repository, .. })
+                        if !snapshot.repositories.contains(repository)
+                ) {
+                    self.pending_request = None;
+                }
+                let pending_catalog = self.pending_catalog.take();
                 let old_selected = self
                     .home
                     .selected
@@ -217,6 +221,20 @@ impl App {
                     .or((!self.home.repositories.is_empty()).then_some(0));
                 self.failures.catalog = None;
 
+                if let Some(PendingCatalogOperation::SetDefault(intent)) = pending_catalog
+                    && snapshot.default_repository == Some(intent.repository.id)
+                    && self.home.repositories.contains(&intent.repository)
+                {
+                    if let Some(note) = intent.note {
+                        self.home.default_choice = DefaultChoiceState::ResumingPendingNote {
+                            repository_id: intent.repository.id,
+                            note: note.clone(),
+                        };
+                        return self.request_open_workspace(intent.repository, Some(note));
+                    }
+                    return Vec::new();
+                }
+
                 if self.home.pending_note.is_some()
                     && self.home.default_choice == DefaultChoiceState::AwaitingSelection
                     && let Some(default_repository) = snapshot.default_repository
@@ -237,26 +255,9 @@ impl App {
                 Vec::new()
             }
             AppEvent::RepositoryCatalogFailed { message } => {
+                self.pending_catalog = None;
                 self.record_outer_failure(FailureKind::Runtime, message, false);
                 Vec::new()
-            }
-            AppEvent::DefaultRepositoryPersisted {
-                repository_id,
-                result,
-            } => {
-                if self.home.default_repository != Some(repository_id) {
-                    return Vec::new();
-                }
-                match result {
-                    Ok(()) => {
-                        self.failures.catalog = None;
-                        Vec::new()
-                    }
-                    Err(error) => {
-                        self.record_outer_failure(FailureKind::Runtime, error.to_string(), false);
-                        Vec::new()
-                    }
-                }
             }
             AppEvent::ClipboardWritten(Ok(())) => {
                 self.failures.clipboard = None;
@@ -284,6 +285,7 @@ impl App {
                         Some(PendingRequest::OpenWorkspace {
                             request_id: pending_request,
                             repository_id: pending_repository,
+                            ..
                         }) if pending_request == request_id && pending_repository == repository_id
                     ),
                     RuntimeOperation::LoadNote => matches!(
@@ -440,7 +442,8 @@ impl App {
                 let kind = match error {
                     MutationCommitError::File(_) => FailureKind::Write,
                     MutationCommitError::WorkspaceMismatch
-                    | MutationCommitError::RepositoryMismatch => FailureKind::Runtime,
+                    | MutationCommitError::RepositoryMismatch
+                    | MutationCommitError::Runtime { .. } => FailureKind::Runtime,
                 };
                 let message = error.to_string();
                 let failure = UnresolvedFailure {
@@ -886,15 +889,24 @@ impl App {
                 tree,
                 note,
             } => {
+                let current_registration = self
+                    .home
+                    .repositories
+                    .iter()
+                    .find(|repository| **repository == *workspace.repo());
+                let request_matches = matches!(
+                    &self.pending_request,
+                    Some(PendingRequest::OpenWorkspace {
+                        request_id: pending_request,
+                        repository_id: pending_repository,
+                        repository: pending_registration,
+                    }) if *pending_request == request_id
+                        && *pending_repository == repository_id
+                        && pending_registration == workspace.repo()
+                );
                 if workspace.repo().id != repository_id
-                    || !matches!(
-                        self.pending_request,
-                        Some(PendingRequest::OpenWorkspace {
-                            request_id: pending_request,
-                            repository_id: pending_repository,
-                        }) if pending_request == request_id
-                            && pending_repository == repository_id
-                    )
+                    || current_registration.is_none()
+                    || !request_matches
                 {
                     return Vec::new();
                 }
@@ -953,6 +965,9 @@ impl App {
                 Vec::new()
             }
             AppEvent::Action(AppAction::Home(HomeAction::OpenSelected)) => {
+                if self.pending_catalog.is_some() || self.pending_request.is_some() {
+                    return Vec::new();
+                }
                 let Some(selected) = self.home.selected else {
                     return Vec::new();
                 };
@@ -965,6 +980,9 @@ impl App {
                     return Vec::new();
                 };
                 let note = self.home.pending_note.clone();
+                if note.is_some() && self.home.default_repository.is_none() {
+                    return self.start_default_repository(repository, note);
+                }
                 if let Some(note) = &note {
                     self.home.default_choice = DefaultChoiceState::ResumingPendingNote {
                         repository_id: repository.id,
@@ -974,7 +992,10 @@ impl App {
                 self.request_open_workspace(repository, note)
             }
             AppEvent::Action(AppAction::Home(HomeAction::ChooseSelectedAsDefault)) => {
-                if self.pending_mutation.is_some() {
+                if self.pending_mutation.is_some()
+                    || self.pending_request.is_some()
+                    || self.pending_catalog.is_some()
+                {
                     return Vec::new();
                 }
                 let Some(selected) = self.home.selected else {
@@ -991,21 +1012,12 @@ impl App {
                 let Some(note) = self.home.pending_note.clone() else {
                     return Vec::new();
                 };
-                self.home.default_repository = Some(repository.id);
-                self.home.default_choice = super::DefaultChoiceState::ResumingPendingNote {
-                    repository_id: repository.id,
-                    note: note.clone(),
-                };
-                let mut effects = self.request_open_workspace(repository.clone(), Some(note));
-                effects.insert(
-                    0,
-                    AppEffect::SetDefaultRepository {
-                        repository_id: repository.id,
-                    },
-                );
-                effects
+                self.start_default_repository(repository, Some(note))
             }
             AppEvent::Action(AppAction::Home(HomeAction::CreateRepository)) => {
+                if self.pending_request.is_some() || self.pending_catalog.is_some() {
+                    return Vec::new();
+                }
                 self.repository_form = RepositoryFormState::default();
                 self.dialog = Some(Dialog::RepositoryForm {
                     kind: RepositoryActionKind::Create,
@@ -1014,6 +1026,9 @@ impl App {
                 Vec::new()
             }
             AppEvent::Action(AppAction::Home(HomeAction::RegisterRepository)) => {
+                if self.pending_request.is_some() || self.pending_catalog.is_some() {
+                    return Vec::new();
+                }
                 self.repository_form = RepositoryFormState::default();
                 self.dialog = Some(Dialog::RepositoryForm {
                     kind: RepositoryActionKind::Register,
@@ -1022,6 +1037,9 @@ impl App {
                 Vec::new()
             }
             AppEvent::Action(AppAction::Home(HomeAction::RenameSelected)) => {
+                if self.pending_request.is_some() || self.pending_catalog.is_some() {
+                    return Vec::new();
+                }
                 let Some(repository) = self
                     .home
                     .selected
@@ -1042,6 +1060,9 @@ impl App {
                 Vec::new()
             }
             AppEvent::Action(AppAction::Home(HomeAction::SetDefaultSelected)) => {
+                if self.pending_request.is_some() || self.pending_catalog.is_some() {
+                    return Vec::new();
+                }
                 let Some(selected) = self.home.selected else {
                     return Vec::new();
                 };
@@ -1060,6 +1081,9 @@ impl App {
                 Vec::new()
             }
             AppEvent::Action(AppAction::Home(HomeAction::UnregisterSelected)) => {
+                if self.pending_request.is_some() || self.pending_catalog.is_some() {
+                    return Vec::new();
+                }
                 let Some(repository) = self
                     .home
                     .selected
@@ -1077,6 +1101,9 @@ impl App {
     }
 
     fn submit_repository_form(&mut self) -> Vec<AppEffect> {
+        if self.pending_request.is_some() || self.pending_catalog.is_some() {
+            return Vec::new();
+        }
         let Some(Dialog::RepositoryForm {
             kind,
             repository_id,
@@ -1114,12 +1141,23 @@ impl App {
             }
             RepositoryActionKind::Create | RepositoryActionKind::Register => return Vec::new(),
         };
+        self.pending_catalog = Some(match &effect {
+            AppEffect::CreateRepository { .. } => PendingCatalogOperation::Create,
+            AppEffect::RegisterRepository { .. } => PendingCatalogOperation::Register,
+            AppEffect::RenameRepository { repository_id, .. } => PendingCatalogOperation::Rename {
+                repository_id: *repository_id,
+            },
+            _ => unreachable!("repository form effects are catalog operations"),
+        });
         self.dialog = None;
         self.repository_form = RepositoryFormState::default();
         vec![effect]
     }
 
     fn confirm_repository_action(&mut self) -> Vec<AppEffect> {
+        if self.pending_request.is_some() || self.pending_catalog.is_some() {
+            return Vec::new();
+        }
         match self.dialog.take() {
             Some(Dialog::ConfirmSetDefault { repository_id, .. }) => {
                 let Some((selected, repository)) = self
@@ -1137,30 +1175,41 @@ impl App {
                 {
                     return Vec::new();
                 }
-                self.home.default_repository = Some(repository_id);
-                let mut effects = vec![AppEffect::SetDefaultRepository { repository_id }];
-                if let Some(note) = self.home.pending_note.clone() {
-                    self.home.default_choice = DefaultChoiceState::ResumingPendingNote {
-                        repository_id,
-                        note: note.clone(),
-                    };
-                    effects.extend(self.request_open_workspace(repository, Some(note)));
-                }
-                effects
+                self.start_default_repository(repository, self.home.pending_note.clone())
             }
-            Some(Dialog::ConfirmUnregister { repository_id, .. }) => self
-                .home
-                .repositories
-                .iter()
-                .any(|repository| repository.id == repository_id)
-                .then_some(AppEffect::UnregisterRepository { repository_id })
-                .into_iter()
-                .collect(),
+            Some(Dialog::ConfirmUnregister { repository_id, .. }) => {
+                if !self
+                    .home
+                    .repositories
+                    .iter()
+                    .any(|repository| repository.id == repository_id)
+                {
+                    return Vec::new();
+                }
+                self.pending_catalog = Some(PendingCatalogOperation::Unregister { repository_id });
+                vec![AppEffect::UnregisterRepository { repository_id }]
+            }
             dialog => {
                 self.dialog = dialog;
                 Vec::new()
             }
         }
+    }
+
+    fn start_default_repository(
+        &mut self,
+        repository: crate::catalog::RepoEntry,
+        note: Option<std::path::PathBuf>,
+    ) -> Vec<AppEffect> {
+        if self.pending_catalog.is_some() || self.pending_request.is_some() {
+            return Vec::new();
+        }
+        let repository_id = repository.id;
+        self.pending_catalog = Some(PendingCatalogOperation::SetDefault(PendingDefaultIntent {
+            repository,
+            note,
+        }));
+        vec![AppEffect::SetDefaultRepository { repository_id }]
     }
 
     fn workspace_editor_mut(&mut self) -> Option<&mut Editor> {
@@ -1465,6 +1514,7 @@ impl App {
         self.pending_request = Some(PendingRequest::OpenWorkspace {
             request_id,
             repository_id: repository.id,
+            repository: repository.clone(),
         });
         vec![AppEffect::OpenWorkspace {
             request_id,

@@ -416,6 +416,10 @@ fn repository_create_and_register_forms_emit_typed_outer_effects() {
         [carnet::app::AppEffect::CreateRepository { name, path }]
             if name == "journal" && path == &PathBuf::from("/tmp/journal")
     ));
+    app.update(AppEvent::RepositoryCatalogFailed {
+        message: "create stopped for test".into(),
+    });
+    app.update(AppEvent::Action(AppAction::Dismiss));
 
     let register = map_key(&app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
     app.update(register);
@@ -449,7 +453,7 @@ fn repository_selected_actions_keep_the_original_repository_id() {
         name: "second".into(),
         path: PathBuf::from("/repos/second"),
     };
-    let mut app = App::home(vec![first.clone(), second], None, None);
+    let mut app = App::home(vec![first.clone(), second.clone()], None, None);
 
     app.update(map_key(&app, KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT)).unwrap());
     assert!(matches!(
@@ -468,6 +472,17 @@ fn repository_selected_actions_keep_the_original_repository_id() {
         [carnet::app::AppEffect::RenameRepository { repository_id, name }]
             if *repository_id == first.id && name == "renamed"
     ));
+    let renamed = RepoEntry {
+        name: "renamed".into(),
+        ..first.clone()
+    };
+    app.update(AppEvent::RepositoryCatalogChanged(
+        carnet::app::CatalogSnapshot {
+            repositories: vec![renamed.clone(), second.clone()],
+            default_repository: None,
+            selected_repository: Some(first.id),
+        },
+    ));
 
     app.home.selected = Some(0);
     app.update(map_key(&app, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)).unwrap());
@@ -482,7 +497,14 @@ fn repository_selected_actions_keep_the_original_repository_id() {
         [carnet::app::AppEffect::SetDefaultRepository { repository_id }]
             if *repository_id == first.id
     ));
-    assert_eq!(app.home.default_repository, Some(first.id));
+    assert_eq!(app.home.default_repository, None);
+    app.update(AppEvent::RepositoryCatalogChanged(
+        carnet::app::CatalogSnapshot {
+            repositories: vec![renamed, second],
+            default_repository: Some(first.id),
+            selected_repository: Some(first.id),
+        },
+    ));
 
     app.home.selected = Some(0);
     app.update(map_key(&app, KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)).unwrap());

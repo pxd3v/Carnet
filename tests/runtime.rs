@@ -121,10 +121,12 @@ fn a_missing_cli_note_opens_as_unsaved_and_clipboard_falls_back_in_process() {
     ))));
     runtime.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::SelectAll)));
     runtime.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::Copy)));
+    runtime.wait_for_idle(Duration::from_secs(3)).unwrap();
     runtime.dispatch(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
         "replacement ".into(),
     ))));
     runtime.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::Paste)));
+    runtime.wait_for_idle(Duration::from_secs(3)).unwrap();
 
     let Screen::Workspace(workspace) = &runtime.app().screen else {
         panic!("expected workspace");

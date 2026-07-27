@@ -41,6 +41,7 @@ pub enum PendingRequest {
     OpenWorkspace {
         request_id: RequestId,
         repository_id: Uuid,
+        repository: RepoEntry,
     },
     LoadNote {
         request_id: RequestId,
@@ -131,6 +132,21 @@ pub struct CatalogSnapshot {
     pub repositories: Vec<RepoEntry>,
     pub default_repository: Option<Uuid>,
     pub selected_repository: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingDefaultIntent {
+    pub repository: RepoEntry,
+    pub note: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PendingCatalogOperation {
+    Create,
+    Register,
+    Rename { repository_id: Uuid },
+    SetDefault(PendingDefaultIntent),
+    Unregister { repository_id: Uuid },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -386,6 +402,7 @@ pub struct App {
     pub pending_mutation: Option<PendingMutation>,
     pub pending_intent: Option<PendingIntent>,
     pub pending_request: Option<PendingRequest>,
+    pub pending_catalog: Option<PendingCatalogOperation>,
     pub dialog: Option<Dialog>,
     pub dialog_input: String,
     pub repository_form: RepositoryFormState,
@@ -422,6 +439,7 @@ impl App {
             pending_mutation: None,
             pending_intent: None,
             pending_request: None,
+            pending_catalog: None,
             dialog: None,
             dialog_input: String::new(),
             repository_form: RepositoryFormState::default(),

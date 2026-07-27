@@ -86,6 +86,8 @@ pub enum RuntimeError {
     Path(#[from] PathError),
     #[error(transparent)]
     File(#[from] FileError),
+    #[error("background {operation} worker panicked")]
+    WorkerPanicked { operation: &'static str },
 }
 
 #[derive(Debug, Error)]
@@ -329,6 +331,14 @@ impl EffectExecutor {
     }
 
     fn run_serialized<T>(&self, repository_root: &Path, operation: impl FnOnce() -> T) -> T {
+        self.run_for_root(repository_root, operation)
+    }
+
+    pub(crate) fn run_for_root<T>(
+        &self,
+        repository_root: &Path,
+        operation: impl FnOnce() -> T,
+    ) -> T {
         let repository_lock = {
             let mut locks = self
                 .repository_locks

@@ -23,7 +23,7 @@ pub enum ClipboardError {
     Unavailable,
 }
 
-pub trait Clipboard {
+pub trait Clipboard: Send {
     fn read_text(&mut self) -> Result<String, ClipboardError>;
     fn write_text(&mut self, text: &str) -> Result<(), ClipboardError>;
 }

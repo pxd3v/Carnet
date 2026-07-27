@@ -55,6 +55,8 @@ pub enum MutationCommitError {
     WorkspaceMismatch,
     #[error("Git repository belongs to a different workspace")]
     RepositoryMismatch,
+    #[error("background mutation worker panicked: {message}")]
+    Runtime { message: String },
 }
 
 #[derive(Debug, Error)]
@@ -73,6 +75,8 @@ pub enum GitError {
         status: Option<i32>,
         stderr: String,
     },
+    #[error("background {operation} worker panicked")]
+    WorkerPanicked { operation: &'static str },
 }
 
 #[derive(Clone, Debug)]

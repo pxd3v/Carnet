@@ -6,11 +6,11 @@ pub use effect::{AppEffect, EffectExecutionError, EffectExecutor, RuntimeError, 
 pub use state::{
     App, AppExitStatus, CatalogSnapshot, CommitStatus, DefaultChoiceState, Dialog,
     ExternalConflict, FailureKind, FailureState, FileActionKind, FileMutationAction, Focus,
-    HomeState, MutationId, NavigationAction, OverlayState, PendingFileMutation, PendingIntent,
-    PendingMutation, PendingMutationKind, PendingRequest, PendingSave, QuitState,
-    RepositoryActionKind, RepositoryAvailability, RepositoryFormField, RepositoryFormState,
-    RequestId, RuntimeFailure, SavedCommitFailure, Screen, SidebarState, StatusState,
-    UnresolvedFailure, WorkspaceOrigin, WorkspaceState,
+    HomeState, MutationId, NavigationAction, OverlayState, PendingCatalogOperation,
+    PendingDefaultIntent, PendingFileMutation, PendingIntent, PendingMutation, PendingMutationKind,
+    PendingRequest, PendingSave, QuitState, RepositoryActionKind, RepositoryAvailability,
+    RepositoryFormField, RepositoryFormState, RequestId, RuntimeFailure, SavedCommitFailure,
+    Screen, SidebarState, StatusState, UnresolvedFailure, WorkspaceOrigin, WorkspaceState,
 };
 pub use update::{
     AppAction, AppEvent, ConflictChoice, DirtyChoice, GlobalAction, HomeAction, TreeAction,

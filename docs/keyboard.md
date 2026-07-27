@@ -27,7 +27,7 @@ Terminal bracketed-paste input is inserted as one editor transaction, so one und
 | Key | Action |
 | --- | --- |
 | `Up` / `Down` | Change the selected registration |
-| `Enter` | Open the selected available repository |
+| `Enter` | Open the selected available repository; when a pending CLI note needs a default, persist this selection as default first and then resume the note |
 | `c` | Create a repository with `git init`, then register it |
 | `a` | Register an existing Git work-tree root |
 | `Shift+R` | Rename the selected registration |
