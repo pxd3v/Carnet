@@ -23,17 +23,34 @@ impl RequestId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PendingOpen {
-    pub request_id: RequestId,
-    pub repository_id: Uuid,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PendingRequest {
+    OpenWorkspace {
+        request_id: RequestId,
+        repository_id: Uuid,
+    },
+    LoadNote {
+        request_id: RequestId,
+        repository_id: Uuid,
+        path: PathBuf,
+    },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingLoad {
-    pub request_id: RequestId,
-    pub repository_id: Uuid,
-    pub path: PathBuf,
+impl PendingRequest {
+    pub fn request_id(&self) -> RequestId {
+        match self {
+            Self::OpenWorkspace { request_id, .. } | Self::LoadNote { request_id, .. } => {
+                *request_id
+            }
+        }
+    }
+
+    pub fn path(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::OpenWorkspace { .. } => None,
+            Self::LoadNote { path, .. } => Some(path),
+        }
+    }
 }
 
 pub enum Screen {
@@ -108,6 +125,7 @@ pub struct PendingMutation {
     pub kind: PendingMutationKind,
     pub intent: CommitIntent,
     pub save: Option<PendingSave>,
+    pub reconciles_editor: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -125,6 +143,21 @@ pub enum NavigationAction {
     },
     Note(PathBuf),
     Quit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FileMutationAction {
+    CreateFile { path: PathBuf },
+    CreateFolder { path: PathBuf },
+    Rename { from: PathBuf, to: PathBuf },
+    Move { from: PathBuf, to: PathBuf },
+    Delete { path: PathBuf },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PendingIntent {
+    Navigation(NavigationAction),
+    Mutation(FileMutationAction),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -255,9 +288,8 @@ pub struct App {
     pub sidebar: SidebarState,
     pub overlay: OverlayState,
     pub pending_mutation: Option<PendingMutation>,
-    pub pending_navigation: Option<NavigationAction>,
-    pub pending_open: Option<PendingOpen>,
-    pub pending_load: Option<PendingLoad>,
+    pub pending_intent: Option<PendingIntent>,
+    pub pending_request: Option<PendingRequest>,
     pub dialog: Option<Dialog>,
     pub status: StatusState,
     pub quit: QuitState,
@@ -288,9 +320,8 @@ impl App {
             },
             overlay: OverlayState::None,
             pending_mutation: None,
-            pending_navigation: None,
-            pending_open: None,
-            pending_load: None,
+            pending_intent: None,
+            pending_request: None,
             dialog: None,
             status: StatusState::default(),
             quit: QuitState::default(),

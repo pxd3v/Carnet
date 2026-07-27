@@ -211,7 +211,7 @@ fn load_failures_return_typed_runtime_events_and_leave_app_state_retryable() {
     let workspace = Workspace::open(repo.entry.clone()).unwrap();
     let mut app = App::home(vec![repo.entry.clone()], Some(repo.entry.id), None);
     app.update(AppEvent::Action(AppAction::Home(HomeAction::OpenSelected)));
-    let request_id = app.pending_open.unwrap().request_id;
+    let request_id = app.pending_request.as_ref().unwrap().request_id();
     app.update(AppEvent::WorkspaceOpened {
         request_id,
         repository_id: repo.entry.id,
@@ -241,7 +241,7 @@ fn load_failures_return_typed_runtime_events_and_leave_app_state_retryable() {
     ));
 
     app.update(event);
-    assert_eq!(app.pending_load, None);
+    assert_eq!(app.pending_request, None);
     assert_eq!(
         app.failures.runtime.first().map(|_| FailureKind::Runtime),
         Some(FailureKind::Runtime),
@@ -301,12 +301,12 @@ fn out_of_order_open_load_and_failure_results_are_ignored_by_request_id() {
         .pop()
         .unwrap();
     assert!(request_id(&open_a) < request_id(&open_b));
-    let current_open_id = app.pending_open.as_ref().unwrap().request_id;
+    let current_open_id = app.pending_request.as_ref().unwrap().request_id();
 
     app.update(executor.execute(open_a).unwrap());
     assert!(matches!(app.screen, carnet::app::Screen::Home));
     assert_eq!(
-        app.pending_open.as_ref().unwrap().request_id,
+        app.pending_request.as_ref().unwrap().request_id(),
         current_open_id
     );
     app.update(executor.execute(open_b).unwrap());
@@ -328,10 +328,10 @@ fn out_of_order_open_load_and_failure_results_are_ignored_by_request_id() {
         .pop()
         .unwrap();
     assert!(request_id(&stale_success) < request_id(&current_success));
-    let current_success_id = app.pending_load.as_ref().unwrap().request_id;
+    let current_success_id = app.pending_request.as_ref().unwrap().request_id();
     app.update(executor.execute(stale_success).unwrap());
     assert_eq!(
-        app.pending_load.as_ref().unwrap().request_id,
+        app.pending_request.as_ref().unwrap().request_id(),
         current_success_id
     );
     app.update(executor.execute(current_success).unwrap());
@@ -356,17 +356,17 @@ fn out_of_order_open_load_and_failure_results_are_ignored_by_request_id() {
         .pop()
         .unwrap();
     assert!(request_id(&stale_load) < request_id(&current_load));
-    let current_load_id = app.pending_load.as_ref().unwrap().request_id;
+    let current_load_id = app.pending_request.as_ref().unwrap().request_id();
 
     app.update(executor.execute(stale_load).unwrap());
     assert_eq!(
-        app.pending_load.as_ref().unwrap().request_id,
+        app.pending_request.as_ref().unwrap().request_id(),
         current_load_id
     );
     assert!(app.failures.runtime.is_empty());
     app.update(executor.execute(current_load).unwrap());
 
-    assert_eq!(app.pending_load, None);
+    assert_eq!(app.pending_request, None);
     let carnet::app::Screen::Workspace(workspace) = &app.screen else {
         panic!("expected current workspace");
     };
@@ -374,6 +374,122 @@ fn out_of_order_open_load_and_failure_results_are_ignored_by_request_id() {
         workspace.current_note.as_deref(),
         Some(PathBuf::from("current.md").as_path())
     );
+}
+
+#[test]
+fn newer_load_supersedes_an_older_workspace_open() {
+    let repo_a = TestRepo::new(52);
+    let repo_b = TestRepo::new(53);
+    fs::write(repo_a.root().join("newest.md"), "newest").unwrap();
+    let executor = EffectExecutor::default();
+    let mut app = App::home(
+        vec![repo_a.entry.clone(), repo_b.entry.clone()],
+        Some(repo_a.entry.id),
+        None,
+    );
+
+    let initial_open = app
+        .update(AppEvent::Action(AppAction::Navigate(
+            NavigationAction::Repository {
+                repository: repo_a.entry.clone(),
+                note: None,
+            },
+        )))
+        .pop()
+        .unwrap();
+    app.update(executor.execute(initial_open).unwrap());
+
+    let stale_open = app
+        .update(AppEvent::Action(AppAction::Navigate(
+            NavigationAction::Repository {
+                repository: repo_b.entry.clone(),
+                note: None,
+            },
+        )))
+        .pop()
+        .unwrap();
+    let newest_load = app
+        .update(AppEvent::Action(AppAction::Navigate(
+            NavigationAction::Note(PathBuf::from("newest.md")),
+        )))
+        .pop()
+        .unwrap();
+    assert!(request_id(&stale_open) < request_id(&newest_load));
+
+    app.update(executor.execute(stale_open).unwrap());
+    let carnet::app::Screen::Workspace(workspace) = &app.screen else {
+        panic!("expected current workspace");
+    };
+    assert_eq!(workspace.repository.id, repo_a.entry.id);
+
+    app.update(executor.execute(newest_load).unwrap());
+    let carnet::app::Screen::Workspace(workspace) = &app.screen else {
+        panic!("expected current workspace");
+    };
+    assert_eq!(workspace.repository.id, repo_a.entry.id);
+    assert_eq!(
+        workspace.current_note.as_deref(),
+        Some(PathBuf::from("newest.md").as_path())
+    );
+}
+
+#[test]
+fn newer_workspace_open_supersedes_an_older_failing_load() {
+    let repo_a = TestRepo::new(54);
+    let repo_b = TestRepo::new(55);
+    let executor = EffectExecutor::default();
+    let mut app = App::home(
+        vec![repo_a.entry.clone(), repo_b.entry.clone()],
+        Some(repo_a.entry.id),
+        None,
+    );
+
+    let initial_open = app
+        .update(AppEvent::Action(AppAction::Navigate(
+            NavigationAction::Repository {
+                repository: repo_a.entry.clone(),
+                note: None,
+            },
+        )))
+        .pop()
+        .unwrap();
+    app.update(executor.execute(initial_open).unwrap());
+
+    let stale_load = app
+        .update(AppEvent::Action(AppAction::Navigate(
+            NavigationAction::Note(PathBuf::from("/outside.md")),
+        )))
+        .pop()
+        .unwrap();
+    let newest_open = app
+        .update(AppEvent::Action(AppAction::Navigate(
+            NavigationAction::Repository {
+                repository: repo_b.entry.clone(),
+                note: None,
+            },
+        )))
+        .pop()
+        .unwrap();
+    assert!(request_id(&stale_load) < request_id(&newest_open));
+    let newest_request_id = request_id(&newest_open);
+
+    app.update(executor.execute(stale_load).unwrap());
+    assert!(app.failures.runtime.is_empty());
+    assert_eq!(
+        app.pending_request.as_ref().unwrap().request_id().get(),
+        newest_request_id
+    );
+    let carnet::app::Screen::Workspace(workspace) = &app.screen else {
+        panic!("expected current workspace");
+    };
+    assert_eq!(workspace.repository.id, repo_a.entry.id);
+
+    app.update(executor.execute(newest_open).unwrap());
+    let carnet::app::Screen::Workspace(workspace) = &app.screen else {
+        panic!("expected newest workspace");
+    };
+    assert_eq!(workspace.repository.id, repo_b.entry.id);
+    assert_eq!(app.pending_request, None);
 }
 
 #[cfg(unix)]

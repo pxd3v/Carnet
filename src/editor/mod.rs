@@ -239,6 +239,16 @@ impl Editor {
         self.loaded = note;
     }
 
+    pub(crate) fn discard_changes(&mut self) {
+        self.buffer = TextBuffer::new(self.loaded.text());
+        self.cursor = 0;
+        self.anchor = None;
+        self.preferred_column = None;
+        self.history = History::default();
+        self.search = SearchState::default();
+        self.highlights = HighlightCache::for_path(self.loaded.path().relative());
+    }
+
     fn move_cursor(&mut self, motion: Motion, extend_selection: bool) -> EditorOutcome {
         let before = (self.cursor, self.selection());
         if !extend_selection {

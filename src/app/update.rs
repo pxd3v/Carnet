@@ -9,9 +9,9 @@ use crate::{
 
 use super::{
     App, AppEffect, AppExitStatus, CommitStatus, DefaultChoiceState, Dialog, ExternalConflict,
-    FailureKind, FileActionKind, Focus, NavigationAction, OverlayState, PendingLoad,
-    PendingMutation, PendingMutationKind, PendingOpen, PendingSave, RequestId, RuntimeFailure,
-    SavedCommitFailure, Screen, UnresolvedFailure, WorkspaceState,
+    FailureKind, FileActionKind, FileMutationAction, Focus, NavigationAction, OverlayState,
+    PendingIntent, PendingMutation, PendingMutationKind, PendingRequest, PendingSave, RequestId,
+    RuntimeFailure, SavedCommitFailure, Screen, UnresolvedFailure, WorkspaceState,
 };
 use super::{RuntimeError, RuntimeOperation};
 
@@ -143,6 +143,9 @@ pub enum AppEvent {
 
 impl App {
     pub fn update(&mut self, event: AppEvent) -> Vec<AppEffect> {
+        if self.editor_commands_suppressed() && is_editor_command_event(&event) {
+            return Vec::new();
+        }
         match event {
             AppEvent::DefaultRepositoryPersisted {
                 repository_id,
@@ -183,25 +186,27 @@ impl App {
                 error,
             } => {
                 let current = match operation {
-                    RuntimeOperation::OpenWorkspace => self.pending_open.is_some_and(|pending| {
-                        pending.request_id == request_id && pending.repository_id == repository_id
-                    }),
-                    RuntimeOperation::LoadNote => {
-                        self.pending_load.as_ref().is_some_and(|pending| {
-                            pending.request_id == request_id
-                                && pending.repository_id == repository_id
-                        })
-                    }
+                    RuntimeOperation::OpenWorkspace => matches!(
+                        self.pending_request,
+                        Some(PendingRequest::OpenWorkspace {
+                            request_id: pending_request,
+                            repository_id: pending_repository,
+                        }) if pending_request == request_id && pending_repository == repository_id
+                    ),
+                    RuntimeOperation::LoadNote => matches!(
+                        self.pending_request,
+                        Some(PendingRequest::LoadNote {
+                            request_id: pending_request,
+                            repository_id: pending_repository,
+                            ..
+                        }) if pending_request == request_id && pending_repository == repository_id
+                    ),
                     RuntimeOperation::Mutation | RuntimeOperation::RefreshTree => false,
                 };
                 if !current {
                     return Vec::new();
                 }
-                match operation {
-                    RuntimeOperation::OpenWorkspace => self.pending_open = None,
-                    RuntimeOperation::LoadNote => self.pending_load = None,
-                    RuntimeOperation::Mutation | RuntimeOperation::RefreshTree => {}
-                }
+                self.pending_request = None;
                 self.record_request_failure(
                     request_id,
                     repository_id,
@@ -318,7 +323,7 @@ impl App {
                     CommitOutcome::NoChanges => CommitStatus::NoChanges,
                 };
                 self.status.message = None;
-                if self.pending_navigation.is_some()
+                if self.pending_intent.is_some()
                     && self
                         .workspace_editor_mut()
                         .is_some_and(|editor| editor.is_dirty())
@@ -326,9 +331,9 @@ impl App {
                     self.dialog = Some(Dialog::DirtyNavigation);
                     return Vec::new();
                 }
-                let navigation = self.pending_navigation.take();
-                navigation
-                    .map(|target| self.perform_navigation(target))
+                let intent = self.pending_intent.take();
+                intent
+                    .map(|intent| self.perform_intent(intent))
                     .unwrap_or_default()
             }
             AppEvent::MutationSavedCommitFailed {
@@ -377,11 +382,16 @@ impl App {
                 repository_id,
                 note,
             } => {
-                if !self.pending_load.as_ref().is_some_and(|pending| {
-                    pending.request_id == request_id
-                        && pending.repository_id == repository_id
-                        && pending.path.as_path() == note.path().relative()
-                }) {
+                if !matches!(
+                    self.pending_request.as_ref(),
+                    Some(PendingRequest::LoadNote {
+                        request_id: pending_request,
+                        repository_id: pending_repository,
+                        path,
+                    }) if *pending_request == request_id
+                        && *pending_repository == repository_id
+                        && path.as_path() == note.path().relative()
+                ) {
                     return Vec::new();
                 }
                 let Screen::Workspace(workspace) = &mut self.screen else {
@@ -392,13 +402,13 @@ impl App {
                 }
                 workspace.current_note = Some(note.path().relative().to_path_buf());
                 workspace.editor = Some(Editor::from_loaded(note));
-                self.pending_load = None;
+                self.pending_request = None;
                 self.clear_runtime_failures(repository_id, RuntimeOperation::LoadNote);
                 Vec::new()
             }
             AppEvent::ConflictChoice(ConflictChoice::Reload) => {
                 self.dialog = None;
-                self.pending_navigation = None;
+                self.pending_intent = None;
                 let path = match &self.screen {
                     Screen::Workspace(workspace) => workspace.current_note.clone(),
                     Screen::Home => None,
@@ -412,7 +422,7 @@ impl App {
             }
             AppEvent::ConflictChoice(ConflictChoice::Cancel) => {
                 self.dialog = None;
-                self.pending_navigation = None;
+                self.pending_intent = None;
                 Vec::new()
             }
             AppEvent::MutationConflict {
@@ -479,12 +489,20 @@ impl App {
                         }
                         FileOutcome::Renamed { from, to } | FileOutcome::Moved { from, to } => {
                             select_tree_path(workspace, &to);
-                            if workspace.current_note.as_ref() == Some(&from) {
-                                note_to_load = Some(to);
+                            if let Some(rebased) = workspace
+                                .current_note
+                                .as_deref()
+                                .and_then(|path| rebase_path(path, &from, &to))
+                            {
+                                note_to_load = Some(rebased);
                             }
                         }
                         FileOutcome::Deleted(path) => {
-                            if workspace.current_note.as_ref() == Some(&path) {
+                            if workspace
+                                .current_note
+                                .as_deref()
+                                .is_some_and(|note| note.starts_with(&path))
+                            {
                                 workspace.current_note = None;
                                 workspace.editor = None;
                             }
@@ -514,14 +532,14 @@ impl App {
                 }
                 if matches!(pending.kind, PendingMutationKind::Save { .. }) {
                     if editor_has_newer_edits {
-                        if self.pending_navigation.is_some() {
+                        if self.pending_intent.is_some() {
                             self.dialog = Some(Dialog::DirtyNavigation);
                         }
                         return Vec::new();
                     }
-                    let navigation = self.pending_navigation.take();
-                    return navigation
-                        .map(|target| self.perform_navigation(target))
+                    let intent = self.pending_intent.take();
+                    return intent
+                        .map(|intent| self.perform_intent(intent))
                         .unwrap_or_default();
                 }
                 note_to_load
@@ -539,17 +557,18 @@ impl App {
                 if self.pending_mutation.is_some() {
                     return Vec::new();
                 }
-                let target = self.pending_navigation.take();
+                let intent = self.pending_intent.take();
+                self.discard_editor_changes();
                 self.dialog = None;
-                target
-                    .map(|target| self.perform_navigation(target))
+                intent
+                    .map(|intent| self.perform_intent(intent))
                     .unwrap_or_default()
             }
             AppEvent::DirtyChoice(DirtyChoice::Cancel) => {
                 if self.pending_mutation.is_some() {
                     return Vec::new();
                 }
-                self.pending_navigation = None;
+                self.pending_intent = None;
                 self.dialog = None;
                 Vec::new()
             }
@@ -561,7 +580,7 @@ impl App {
                     .workspace_editor_mut()
                     .is_some_and(|editor| editor.is_dirty())
                 {
-                    self.pending_navigation = Some(target);
+                    self.pending_intent = Some(PendingIntent::Navigation(target));
                     self.dialog = Some(Dialog::DirtyNavigation);
                     Vec::new()
                 } else {
@@ -664,14 +683,18 @@ impl App {
                 note,
             } => {
                 if workspace.repo().id != repository_id
-                    || !self.pending_open.is_some_and(|pending| {
-                        pending.request_id == request_id && pending.repository_id == repository_id
-                    })
+                    || !matches!(
+                        self.pending_request,
+                        Some(PendingRequest::OpenWorkspace {
+                            request_id: pending_request,
+                            repository_id: pending_repository,
+                        }) if pending_request == request_id
+                            && pending_repository == repository_id
+                    )
                 {
                     return Vec::new();
                 }
-                self.pending_open = None;
-                self.pending_load = None;
+                self.pending_request = None;
                 let current_note = note
                     .as_ref()
                     .map(|note| note.path().relative().to_path_buf());
@@ -766,6 +789,14 @@ impl App {
             return None;
         };
         workspace.editor.as_mut()
+    }
+
+    fn editor_commands_suppressed(&self) -> bool {
+        self.pending_request.is_some()
+            || self
+                .pending_mutation
+                .as_ref()
+                .is_some_and(|pending| pending.reconciles_editor)
     }
 
     fn record_request_failure(
@@ -875,6 +906,7 @@ impl App {
                 generation,
                 snapshot,
             }),
+            reconciles_editor: false,
         });
         self.status.commit = CommitStatus::Pending;
         vec![AppEffect::ApplyAndCommit {
@@ -902,6 +934,7 @@ impl App {
                 kind: PendingMutationKind::RetryCommit,
                 intent: failure.intent.clone(),
                 save: None,
+                reconciles_editor: false,
             });
             self.status.commit = CommitStatus::Pending;
             return vec![AppEffect::RetryCommit {
@@ -913,14 +946,26 @@ impl App {
         self.save(false)
     }
 
+    fn perform_intent(&mut self, intent: PendingIntent) -> Vec<AppEffect> {
+        match intent {
+            PendingIntent::Navigation(target) => self.perform_navigation(target),
+            PendingIntent::Mutation(action) => self.start_file_mutation(action),
+        }
+    }
+
+    fn discard_editor_changes(&mut self) {
+        if let Some(editor) = self.workspace_editor_mut() {
+            editor.discard_changes();
+        }
+    }
+
     fn perform_navigation(&mut self, target: NavigationAction) -> Vec<AppEffect> {
         match target {
             NavigationAction::Home => {
                 self.screen = Screen::Home;
                 self.overlay = OverlayState::None;
                 self.dialog = None;
-                self.pending_open = None;
-                self.pending_load = None;
+                self.pending_request = None;
                 Vec::new()
             }
             NavigationAction::Repository { repository, note } => {
@@ -957,8 +1002,7 @@ impl App {
             return Vec::new();
         }
         let request_id = self.next_request_id();
-        self.pending_load = None;
-        self.pending_open = Some(PendingOpen {
+        self.pending_request = Some(PendingRequest::OpenWorkspace {
             request_id,
             repository_id: repository.id,
         });
@@ -975,7 +1019,7 @@ impl App {
             Screen::Home => return Vec::new(),
         };
         let request_id = self.next_request_id();
-        self.pending_load = Some(PendingLoad {
+        self.pending_request = Some(PendingRequest::LoadNote {
             request_id,
             repository_id,
             path: path.clone(),
@@ -1112,66 +1156,23 @@ impl App {
         let Some(Dialog::FileAction { kind, target }) = self.dialog.take() else {
             return Vec::new();
         };
-        let Screen::Workspace(workspace) = &self.screen else {
-            return Vec::new();
-        };
-        let operation = match kind {
-            FileActionKind::NewFile => FileOperation::CreateFile {
-                workspace: workspace.workspace.clone(),
-                path: path.clone(),
-            },
-            FileActionKind::NewFolder => FileOperation::CreateFolder {
-                workspace: workspace.workspace.clone(),
-                path: path.clone(),
-            },
+        let action = match kind {
+            FileActionKind::NewFile => FileMutationAction::CreateFile { path },
+            FileActionKind::NewFolder => FileMutationAction::CreateFolder { path },
             FileActionKind::Rename => {
                 let Some(from) = target else {
                     return Vec::new();
                 };
-                FileOperation::Rename {
-                    workspace: workspace.workspace.clone(),
-                    from,
-                    to: path.clone(),
-                }
+                FileMutationAction::Rename { from, to: path }
             }
             FileActionKind::Move => {
                 let Some(from) = target else {
                     return Vec::new();
                 };
-                FileOperation::Move {
-                    workspace: workspace.workspace.clone(),
-                    from,
-                    to: path.clone(),
-                }
+                FileMutationAction::Move { from, to: path }
             }
         };
-        let intent = match &operation {
-            FileOperation::CreateFile { path, .. } | FileOperation::CreateFolder { path, .. } => {
-                CommitIntent::Create(path.clone())
-            }
-            FileOperation::Rename { from, to, .. } | FileOperation::Move { from, to, .. } => {
-                CommitIntent::Move {
-                    from: from.clone(),
-                    to: to.clone(),
-                }
-            }
-            _ => unreachable!("file dialog cannot create this operation"),
-        };
-        let repository_id = workspace.repository.id;
-        self.pending_mutation = Some(PendingMutation {
-            repository_id,
-            kind: PendingMutationKind::File(kind),
-            intent: intent.clone(),
-            save: None,
-        });
-        self.status.commit = CommitStatus::Pending;
-        vec![AppEffect::ApplyAndCommit {
-            repository_id,
-            workspace: workspace.workspace.clone(),
-            git: workspace.git.clone(),
-            operation: Box::new(operation),
-            intent,
-        }]
+        self.request_file_mutation(action)
     }
 
     fn confirm_delete(&mut self) -> Vec<AppEffect> {
@@ -1181,27 +1182,99 @@ impl App {
         let Some(Dialog::ConfirmDelete { path }) = self.dialog.take() else {
             return Vec::new();
         };
+        self.request_file_mutation(FileMutationAction::Delete { path })
+    }
+
+    fn request_file_mutation(&mut self, action: FileMutationAction) -> Vec<AppEffect> {
+        if self.pending_mutation.is_some() {
+            return Vec::new();
+        }
+        let should_guard = match &self.screen {
+            Screen::Workspace(workspace) => {
+                workspace
+                    .editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.is_dirty())
+                    && mutation_reconciles_editor(workspace, &action)
+            }
+            Screen::Home => false,
+        };
+        if should_guard {
+            self.pending_intent = Some(PendingIntent::Mutation(action));
+            self.dialog = Some(Dialog::DirtyNavigation);
+            return Vec::new();
+        }
+        self.start_file_mutation(action)
+    }
+
+    fn start_file_mutation(&mut self, action: FileMutationAction) -> Vec<AppEffect> {
+        if self.pending_mutation.is_some() {
+            return Vec::new();
+        }
         let Screen::Workspace(workspace) = &self.screen else {
             return Vec::new();
         };
-        let intent = CommitIntent::Delete(path.clone());
+        let reconciles_editor = mutation_reconciles_editor(workspace, &action);
+        let effect_workspace = workspace.workspace.clone();
+        let (kind, operation, intent) = match action {
+            FileMutationAction::CreateFile { path } => (
+                PendingMutationKind::File(FileActionKind::NewFile),
+                FileOperation::CreateFile {
+                    workspace: effect_workspace.clone(),
+                    path: path.clone(),
+                },
+                CommitIntent::Create(path),
+            ),
+            FileMutationAction::CreateFolder { path } => (
+                PendingMutationKind::File(FileActionKind::NewFolder),
+                FileOperation::CreateFolder {
+                    workspace: effect_workspace.clone(),
+                    path: path.clone(),
+                },
+                CommitIntent::Create(path),
+            ),
+            FileMutationAction::Rename { from, to } => (
+                PendingMutationKind::File(FileActionKind::Rename),
+                FileOperation::Rename {
+                    workspace: effect_workspace.clone(),
+                    from: from.clone(),
+                    to: to.clone(),
+                },
+                CommitIntent::Move { from, to },
+            ),
+            FileMutationAction::Move { from, to } => (
+                PendingMutationKind::File(FileActionKind::Move),
+                FileOperation::Move {
+                    workspace: effect_workspace.clone(),
+                    from: from.clone(),
+                    to: to.clone(),
+                },
+                CommitIntent::Move { from, to },
+            ),
+            FileMutationAction::Delete { path } => (
+                PendingMutationKind::Delete,
+                FileOperation::Delete {
+                    workspace: effect_workspace.clone(),
+                    path: path.clone(),
+                    confirmed: true,
+                },
+                CommitIntent::Delete(path),
+            ),
+        };
         let repository_id = workspace.repository.id;
         self.pending_mutation = Some(PendingMutation {
             repository_id,
-            kind: PendingMutationKind::Delete,
+            kind,
             intent: intent.clone(),
             save: None,
+            reconciles_editor,
         });
         self.status.commit = CommitStatus::Pending;
         vec![AppEffect::ApplyAndCommit {
             repository_id,
-            workspace: workspace.workspace.clone(),
+            workspace: effect_workspace,
             git: workspace.git.clone(),
-            operation: Box::new(FileOperation::Delete {
-                workspace: workspace.workspace.clone(),
-                path,
-                confirmed: true,
-            }),
+            operation: Box::new(operation),
             intent,
         }]
     }
@@ -1263,4 +1336,51 @@ fn clamp_tree_selection(workspace: &mut WorkspaceState) {
     } else {
         Some(workspace.tree_selection.unwrap_or(0).min(entry_count - 1))
     };
+}
+
+fn rebase_path(
+    path: &std::path::Path,
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if path == from {
+        return Some(to.to_path_buf());
+    }
+    path.strip_prefix(from)
+        .ok()
+        .filter(|suffix| !suffix.as_os_str().is_empty())
+        .map(|suffix| to.join(suffix))
+}
+
+fn mutation_reconciles_editor(workspace: &WorkspaceState, action: &FileMutationAction) -> bool {
+    match action {
+        FileMutationAction::CreateFile { .. } => workspace.editor.is_some(),
+        FileMutationAction::CreateFolder { .. } => false,
+        FileMutationAction::Rename { from, .. } | FileMutationAction::Move { from, .. } => {
+            workspace
+                .current_note
+                .as_deref()
+                .is_some_and(|note| note.starts_with(from))
+        }
+        FileMutationAction::Delete { path } => workspace
+            .current_note
+            .as_deref()
+            .is_some_and(|note| note.starts_with(path)),
+    }
+}
+
+fn is_editor_command_event(event: &AppEvent) -> bool {
+    matches!(
+        event,
+        AppEvent::Action(AppAction::Editor(_))
+            | AppEvent::Action(AppAction::Global(
+                GlobalAction::Undo
+                    | GlobalAction::Redo
+                    | GlobalAction::Copy
+                    | GlobalAction::Cut
+                    | GlobalAction::Paste
+                    | GlobalAction::SelectAll
+            ))
+            | AppEvent::ClipboardRead(Ok(_))
+    )
 }

@@ -1,7 +1,9 @@
 use std::{fs, path::PathBuf};
 
 use carnet::{
-    app::{App, AppAction, AppEffect, AppEvent, DefaultChoiceState, HomeAction, Screen},
+    app::{
+        App, AppAction, AppEffect, AppEvent, DefaultChoiceState, HomeAction, PendingIntent, Screen,
+    },
     catalog::RepoEntry,
     editor::EditorCommand,
     git::GitRepo,
@@ -133,7 +135,323 @@ fn pending_mutations_reject_clean_navigation_quit_and_dirty_discard() {
             .is_empty()
     );
     assert!(!save_app.quit.requested);
-    assert_eq!(save_app.pending_navigation, Some(NavigationAction::Quit));
+    assert_eq!(
+        save_app.pending_intent,
+        Some(PendingIntent::Navigation(NavigationAction::Quit))
+    );
+}
+
+#[test]
+fn dirty_create_file_waits_for_save_success_before_starting_the_create() {
+    use carnet::{
+        app::{Dialog, DirtyChoice, Focus, TreeAction},
+        git::{CommitIntent, CommitOutcome},
+        workspace::FileOperation,
+    };
+
+    let (_sandbox, mut app) = app_with_note(84, "note.md", "base");
+    app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "dirty ".into(),
+    ))));
+    app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::NewFile)));
+
+    let premature_create = app.update(AppEvent::Action(AppAction::SubmitFileAction(
+        PathBuf::from("created.md"),
+    )));
+    assert!(premature_create.is_empty());
+    assert_eq!(app.dialog, Some(Dialog::DirtyNavigation));
+
+    let save = app.update(AppEvent::DirtyChoice(DirtyChoice::Save));
+    assert!(matches!(
+        mutation_parts(&save[0]).1,
+        FileOperation::Save { content, .. } if content == "dirty base"
+    ));
+    let (repository_id, file) = apply_save_effect(save.into_iter().next().unwrap());
+
+    let create = app.update(AppEvent::MutationApplied {
+        repository_id,
+        file,
+        commit: CommitOutcome::NoChanges,
+        tree: Ok(Vec::new()),
+    });
+    assert!(matches!(
+        mutation_parts(&create[0]),
+        (
+            _,
+            FileOperation::CreateFile { path, .. },
+            CommitIntent::Create(intent_path),
+        ) if path == PathBuf::from("created.md").as_path()
+            && intent_path == PathBuf::from("created.md").as_path()
+    ));
+    assert!(!workspace_editor(&app).is_dirty());
+}
+
+#[test]
+fn dirty_create_file_reprompts_when_edits_arrive_during_its_prerequisite_save() {
+    use carnet::{
+        app::{Dialog, DirtyChoice, FileMutationAction, Focus, TreeAction},
+        git::CommitOutcome,
+    };
+
+    let (_sandbox, mut app) = app_with_note(89, "note.md", "base");
+    app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "saved ".into(),
+    ))));
+    app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::NewFile)));
+    app.update(AppEvent::Action(AppAction::SubmitFileAction(
+        PathBuf::from("created.md"),
+    )));
+    let save = app.update(AppEvent::DirtyChoice(DirtyChoice::Save));
+    app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "newer ".into(),
+    ))));
+    let (repository_id, file) = apply_save_effect(save.into_iter().next().unwrap());
+
+    assert!(
+        app.update(AppEvent::MutationApplied {
+            repository_id,
+            file,
+            commit: CommitOutcome::NoChanges,
+            tree: Ok(Vec::new()),
+        })
+        .is_empty()
+    );
+    assert_eq!(app.dialog, Some(Dialog::DirtyNavigation));
+    assert_eq!(
+        app.pending_intent,
+        Some(PendingIntent::Mutation(FileMutationAction::CreateFile {
+            path: PathBuf::from("created.md"),
+        }))
+    );
+    assert_eq!(workspace_editor(&app).text(), "saved newer base");
+    assert!(workspace_editor(&app).is_dirty());
+    assert!(!matches!(
+        app.pending_mutation.as_ref().map(|pending| pending.kind),
+        Some(carnet::app::PendingMutationKind::File(_))
+    ));
+}
+
+#[test]
+fn discarding_dirty_ancestor_rename_abandons_edits_and_blocks_replacement_races() {
+    use carnet::{
+        app::{Dialog, DirtyChoice, EffectExecutor, Focus, TreeAction},
+        git::CommitOutcome,
+        workspace::FileOperation,
+    };
+
+    let (_sandbox, mut app) = app_with_note(85, "folder/note.md", "base");
+    app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "dirty ".into(),
+    ))));
+    app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Rename)));
+    assert!(
+        app.update(AppEvent::Action(AppAction::SubmitFileAction(
+            PathBuf::from("renamed"),
+        )))
+        .is_empty()
+    );
+    assert_eq!(app.dialog, Some(Dialog::DirtyNavigation));
+
+    let rename = app.update(AppEvent::DirtyChoice(DirtyChoice::Discard));
+    assert!(matches!(
+        mutation_parts(&rename[0]).1,
+        FileOperation::Rename { from, to, .. }
+            if from == PathBuf::from("folder").as_path()
+                && to == PathBuf::from("renamed").as_path()
+    ));
+    assert_eq!(workspace_editor(&app).text(), "base");
+    assert!(!workspace_editor(&app).is_dirty());
+
+    assert!(
+        app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+            "blocked during mutation".into(),
+        ))))
+        .is_empty()
+    );
+    assert_eq!(workspace_editor(&app).text(), "base");
+
+    let (repository_id, file, tree) = apply_mutation_effect(rename.into_iter().next().unwrap());
+    let load = app.update(AppEvent::MutationApplied {
+        repository_id,
+        file,
+        commit: CommitOutcome::NoChanges,
+        tree,
+    });
+    assert!(matches!(&load[..], [AppEffect::LoadNote { .. }]));
+
+    app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "blocked during load".into(),
+    ))));
+    assert_eq!(workspace_editor(&app).text(), "base");
+    let loaded = EffectExecutor::default()
+        .execute(load.into_iter().next().unwrap())
+        .unwrap();
+    app.update(loaded);
+    assert_eq!(workspace_editor(&app).text(), "base");
+    let Screen::Workspace(workspace) = &app.screen else {
+        panic!("expected workspace");
+    };
+    assert_eq!(
+        workspace.current_note.as_deref(),
+        Some(PathBuf::from("renamed/note.md").as_path())
+    );
+}
+
+#[test]
+fn cancelling_a_dirty_ancestor_move_keeps_the_note_and_performs_no_mutation() {
+    use carnet::app::{Dialog, DirtyChoice, FileMutationAction, Focus, TreeAction};
+
+    let (sandbox, mut app) = app_with_note(86, "folder/note.md", "base");
+    fs::create_dir(sandbox.path().join("archive")).unwrap();
+    app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "dirty ".into(),
+    ))));
+    app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Move)));
+
+    assert!(
+        app.update(AppEvent::Action(AppAction::SubmitFileAction(
+            PathBuf::from("archive/folder"),
+        )))
+        .is_empty()
+    );
+    assert_eq!(app.dialog, Some(Dialog::DirtyNavigation));
+    assert_eq!(
+        app.pending_intent,
+        Some(PendingIntent::Mutation(FileMutationAction::Move {
+            from: PathBuf::from("folder"),
+            to: PathBuf::from("archive/folder"),
+        }))
+    );
+
+    assert!(
+        app.update(AppEvent::DirtyChoice(DirtyChoice::Cancel))
+            .is_empty()
+    );
+    assert_eq!(app.pending_intent, None);
+    assert_eq!(app.dialog, None);
+    assert_eq!(workspace_editor(&app).text(), "dirty base");
+    assert!(workspace_editor(&app).is_dirty());
+    assert!(sandbox.path().join("folder/note.md").is_file());
+    assert!(!sandbox.path().join("archive/folder").exists());
+}
+
+#[test]
+fn dirty_ancestor_delete_waits_for_save_before_deleting_the_tree() {
+    use carnet::{
+        app::{Dialog, DirtyChoice, FileMutationAction, Focus, TreeAction},
+        git::{CommitIntent, CommitOutcome},
+        workspace::FileOperation,
+    };
+
+    let (_sandbox, mut app) = app_with_note(87, "folder/note.md", "base");
+    app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "dirty ".into(),
+    ))));
+    app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Delete)));
+
+    assert!(
+        app.update(AppEvent::Action(AppAction::ConfirmDelete))
+            .is_empty()
+    );
+    assert_eq!(app.dialog, Some(Dialog::DirtyNavigation));
+    assert_eq!(
+        app.pending_intent,
+        Some(PendingIntent::Mutation(FileMutationAction::Delete {
+            path: PathBuf::from("folder"),
+        }))
+    );
+
+    let save = app.update(AppEvent::DirtyChoice(DirtyChoice::Save));
+    let (repository_id, file) = apply_save_effect(save.into_iter().next().unwrap());
+    let delete = app.update(AppEvent::MutationApplied {
+        repository_id,
+        file,
+        commit: CommitOutcome::NoChanges,
+        tree: Ok(Vec::new()),
+    });
+    assert!(matches!(
+        mutation_parts(&delete[0]),
+        (
+            _,
+            FileOperation::Delete {
+                path,
+                confirmed: true,
+                ..
+            },
+            CommitIntent::Delete(intent_path),
+        ) if path == PathBuf::from("folder").as_path()
+            && intent_path == PathBuf::from("folder").as_path()
+    ));
+    assert!(!workspace_editor(&app).is_dirty());
+}
+
+#[test]
+fn dirty_unrelated_rename_does_not_replace_or_block_the_active_editor() {
+    use carnet::{
+        app::{Focus, TreeAction},
+        git::CommitOutcome,
+    };
+
+    let (sandbox, repository, workspace, git) =
+        workspace_fixture(88, "notes", "active/note.md", "base");
+    fs::create_dir(repository.path.join("unrelated")).unwrap();
+    let tree = workspace.tree().unwrap();
+    let note = workspace
+        .load_note(
+            &workspace
+                .resolve_note(PathBuf::from("active/note.md").as_path())
+                .unwrap(),
+        )
+        .unwrap();
+    let mut app = App::home(vec![repository.clone()], Some(repository.id), None);
+    app.update(AppEvent::Action(AppAction::Home(HomeAction::OpenSelected)));
+    let request_id = app.pending_request.as_ref().unwrap().request_id();
+    app.update(AppEvent::WorkspaceOpened {
+        request_id,
+        repository_id: repository.id,
+        workspace,
+        git,
+        tree,
+        note: Some(note),
+    });
+
+    app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "dirty ".into(),
+    ))));
+    app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Down)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Rename)));
+    let rename = app.update(AppEvent::Action(AppAction::SubmitFileAction(
+        PathBuf::from("renamed-unrelated"),
+    )));
+    assert!(matches!(&rename[..], [AppEffect::ApplyAndCommit { .. }]));
+
+    let (repository_id, file, tree) = apply_mutation_effect(rename.into_iter().next().unwrap());
+    assert!(
+        app.update(AppEvent::MutationApplied {
+            repository_id,
+            file,
+            commit: CommitOutcome::NoChanges,
+            tree,
+        })
+        .is_empty()
+    );
+    assert_eq!(workspace_editor(&app).text(), "dirty base");
+    assert!(workspace_editor(&app).is_dirty());
+    let Screen::Workspace(workspace) = &app.screen else {
+        panic!("expected workspace");
+    };
+    assert_eq!(
+        workspace.current_note.as_deref(),
+        Some(PathBuf::from("active/note.md").as_path())
+    );
+    assert!(!sandbox.path().join("unrelated").exists());
+    assert!(sandbox.path().join("renamed-unrelated").is_dir());
 }
 
 #[test]
@@ -197,7 +515,10 @@ fn dirty_navigation_does_not_resume_when_edits_arrive_after_save_start() {
 
     assert!(effects.is_empty());
     assert!(!app.quit.requested);
-    assert_eq!(app.pending_navigation, Some(NavigationAction::Quit));
+    assert_eq!(
+        app.pending_intent,
+        Some(PendingIntent::Navigation(NavigationAction::Quit))
+    );
     assert!(matches!(app.dialog, Some(Dialog::DirtyNavigation)));
     assert!(workspace_editor(&app).is_dirty());
 }
@@ -215,14 +536,14 @@ fn dirty_navigation_cancel_clears_the_exact_pending_action() {
     let effects = app.update(AppEvent::Action(AppAction::Navigate(target.clone())));
 
     assert!(effects.is_empty());
-    assert_eq!(app.pending_navigation, Some(target));
+    assert_eq!(app.pending_intent, Some(PendingIntent::Navigation(target)));
     assert!(matches!(app.dialog, Some(Dialog::DirtyNavigation)));
 
     assert!(
         app.update(AppEvent::DirtyChoice(DirtyChoice::Cancel))
             .is_empty()
     );
-    assert_eq!(app.pending_navigation, None);
+    assert_eq!(app.pending_intent, None);
     assert_eq!(app.dialog, None);
     assert_eq!(workspace_editor(&app).text(), "dirty base");
 }
@@ -240,12 +561,12 @@ fn dirty_navigation_discard_resumes_the_pending_note_immediately() {
 
     let effects = app.update(AppEvent::DirtyChoice(DirtyChoice::Discard));
 
-    assert_eq!(app.pending_navigation, None);
+    assert_eq!(app.pending_intent, None);
     assert_eq!(app.dialog, None);
     assert_eq!(
-        app.pending_load
+        app.pending_request
             .as_ref()
-            .map(|pending| pending.path.as_path()),
+            .and_then(|pending| pending.path()),
         Some(PathBuf::from("other.md").as_path())
     );
     assert!(matches!(
@@ -278,7 +599,10 @@ fn navigation_models_home_and_exact_cross_repository_targets() {
         note: Some(PathBuf::from("target.md")),
     };
     dirty.update(AppEvent::Action(AppAction::Navigate(target.clone())));
-    assert_eq!(dirty.pending_navigation, Some(target));
+    assert_eq!(
+        dirty.pending_intent,
+        Some(PendingIntent::Navigation(target))
+    );
 
     let effects = dirty.update(AppEvent::DirtyChoice(DirtyChoice::Discard));
     assert!(matches!(
@@ -307,7 +631,7 @@ fn dirty_navigation_save_resumes_only_after_the_confirmed_save_result() {
 
     let save_effects = app.update(AppEvent::DirtyChoice(DirtyChoice::Save));
 
-    assert_eq!(app.pending_navigation, Some(target));
+    assert_eq!(app.pending_intent, Some(PendingIntent::Navigation(target)));
     assert_eq!(app.dialog, None);
     assert_eq!(save_effects.len(), 1);
     let (repository_id, file) = apply_save_effect(save_effects.into_iter().next().unwrap());
@@ -320,7 +644,7 @@ fn dirty_navigation_save_resumes_only_after_the_confirmed_save_result() {
     });
 
     assert_eq!(app.pending_mutation, None);
-    assert_eq!(app.pending_navigation, None);
+    assert_eq!(app.pending_intent, None);
     assert_eq!(app.status.commit, CommitStatus::NoChanges);
     assert!(!workspace_editor(&app).is_dirty());
     assert!(matches!(
@@ -348,7 +672,10 @@ fn global_quit_is_immediate_when_clean_and_uses_the_dirty_prompt_when_changed() 
     ))));
     dirty.update(AppEvent::Action(AppAction::Global(GlobalAction::Quit)));
     assert!(!dirty.quit.requested);
-    assert_eq!(dirty.pending_navigation, Some(NavigationAction::Quit));
+    assert_eq!(
+        dirty.pending_intent,
+        Some(PendingIntent::Navigation(NavigationAction::Quit))
+    );
     assert!(matches!(dirty.dialog, Some(Dialog::DirtyNavigation)));
 
     dirty.update(AppEvent::DirtyChoice(DirtyChoice::Discard));
@@ -456,14 +783,14 @@ fn reloading_an_external_conflict_waits_for_the_load_result_before_replacing_the
         )
         .unwrap();
 
-    let request_id = app.pending_load.as_ref().unwrap().request_id;
+    let request_id = app.pending_request.as_ref().unwrap().request_id();
     app.update(AppEvent::NoteLoaded {
         request_id,
         repository_id: Uuid::from_u128(30),
         note: loaded,
     });
 
-    assert_eq!(app.pending_load, None);
+    assert_eq!(app.pending_request, None);
     assert_eq!(workspace_editor(&app).text(), "external");
     assert!(!workspace_editor(&app).is_dirty());
 }
@@ -611,7 +938,10 @@ fn dirty_navigation_during_commit_failure_prompts_before_saving_newer_edits() {
     let retry = app.update(AppEvent::DirtyChoice(DirtyChoice::Save));
 
     assert!(matches!(&retry[..], [AppEffect::RetryCommit { .. }]));
-    assert_eq!(app.pending_navigation, Some(NavigationAction::Quit));
+    assert_eq!(
+        app.pending_intent,
+        Some(PendingIntent::Navigation(NavigationAction::Quit))
+    );
 
     let save = app.update(AppEvent::CommitRetryApplied {
         repository_id: Uuid::from_u128(36),
@@ -621,7 +951,10 @@ fn dirty_navigation_during_commit_failure_prompts_before_saving_newer_edits() {
     });
 
     assert!(save.is_empty());
-    assert_eq!(app.pending_navigation, Some(NavigationAction::Quit));
+    assert_eq!(
+        app.pending_intent,
+        Some(PendingIntent::Navigation(NavigationAction::Quit))
+    );
     assert!(matches!(app.dialog, Some(Dialog::DirtyNavigation)));
     assert!(workspace_editor(&app).is_dirty());
 
@@ -658,7 +991,10 @@ fn failed_save_stays_on_the_dirty_note_and_marks_a_failure_exit() {
     });
 
     assert_eq!(app.pending_mutation, None);
-    assert_eq!(app.pending_navigation, Some(NavigationAction::Quit));
+    assert_eq!(
+        app.pending_intent,
+        Some(PendingIntent::Navigation(NavigationAction::Quit))
+    );
     assert!(workspace_editor(&app).is_dirty());
     assert_eq!(
         app.failures.write.as_ref().map(|failure| failure.kind),
@@ -745,7 +1081,7 @@ fn tree_focus_routes_navigation_file_actions_and_escape_through_update() {
             note: Some(PathBuf::from("z.md")),
         },
     )));
-    let request_id = app.pending_open.unwrap().request_id;
+    let request_id = app.pending_request.as_ref().unwrap().request_id();
     app.update(AppEvent::WorkspaceOpened {
         request_id,
         repository_id: repository.id,
@@ -834,7 +1170,7 @@ fn dirty_tree_open_uses_the_navigation_prompt_before_loading() {
             note: Some(PathBuf::from("a.md")),
         },
     )));
-    let request_id = app.pending_open.unwrap().request_id;
+    let request_id = app.pending_request.as_ref().unwrap().request_id();
     app.update(AppEvent::WorkspaceOpened {
         request_id,
         repository_id: repository.id,
@@ -852,10 +1188,12 @@ fn dirty_tree_open_uses_the_navigation_prompt_before_loading() {
     let effects = app.update(AppEvent::Action(AppAction::Tree(TreeAction::Open)));
 
     assert!(effects.is_empty());
-    assert_eq!(app.pending_load, None);
+    assert_eq!(app.pending_request, None);
     assert_eq!(
-        app.pending_navigation,
-        Some(NavigationAction::Note(PathBuf::from("b.md")))
+        app.pending_intent,
+        Some(PendingIntent::Navigation(NavigationAction::Note(
+            PathBuf::from("b.md")
+        )))
     );
     assert!(matches!(app.dialog, Some(Dialog::DirtyNavigation)));
     assert_eq!(workspace_editor(&app).text(), "dirty a");
@@ -911,7 +1249,7 @@ fn empty_tree_allows_root_file_and_folder_creation_only() {
     let workspace = Workspace::open(repository.clone()).unwrap();
     let mut app = App::home(vec![repository.clone()], Some(repository.id), None);
     app.update(AppEvent::Action(AppAction::Home(HomeAction::OpenSelected)));
-    let request_id = app.pending_open.unwrap().request_id;
+    let request_id = app.pending_request.as_ref().unwrap().request_id();
     app.update(AppEvent::WorkspaceOpened {
         request_id,
         repository_id: repository.id,
@@ -1111,9 +1449,9 @@ fn mutation_results_reconcile_active_note_and_tree_selection() {
             [AppEffect::LoadNote { path, .. }] if path == destination.as_path()
         ));
         assert_eq!(
-            app.pending_load
+            app.pending_request
                 .as_ref()
-                .map(|pending| pending.path.as_path()),
+                .and_then(|pending| pending.path()),
             Some(destination.as_path())
         );
         assert_eq!(
@@ -1146,6 +1484,119 @@ fn mutation_results_reconcile_active_note_and_tree_selection() {
     assert_eq!(workspace.current_note, None);
     assert!(workspace.editor.is_none());
     assert_eq!(workspace.tree_selection, None);
+}
+
+#[test]
+fn renaming_an_ancestor_reloads_the_active_note_at_its_rebased_path() {
+    use carnet::{
+        app::{Focus, TreeAction},
+        git::CommitOutcome,
+    };
+
+    let (_sandbox, mut app) = app_with_note(81, "folder/sub/note.md", "base");
+    app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Rename)));
+    let effect = app
+        .update(AppEvent::Action(AppAction::SubmitFileAction(
+            PathBuf::from("renamed"),
+        )))
+        .pop()
+        .unwrap();
+    let (repository_id, file, tree) = apply_mutation_effect(effect);
+
+    let follow_up = app.update(AppEvent::MutationApplied {
+        repository_id,
+        file,
+        commit: CommitOutcome::NoChanges,
+        tree,
+    });
+
+    assert!(matches!(
+        &follow_up[..],
+        [AppEffect::LoadNote { path, .. }]
+            if path == PathBuf::from("renamed/sub/note.md").as_path()
+    ));
+    assert_eq!(
+        app.pending_request
+            .as_ref()
+            .and_then(|pending| pending.path()),
+        Some(PathBuf::from("renamed/sub/note.md").as_path())
+    );
+    assert_eq!(selected_tree_path(&app), Some(PathBuf::from("renamed")));
+}
+
+#[test]
+fn moving_an_ancestor_reloads_the_active_note_and_selects_the_nested_destination() {
+    use carnet::{
+        app::{Focus, TreeAction},
+        git::CommitOutcome,
+    };
+
+    let (sandbox, mut app) = app_with_note(82, "folder/sub/note.md", "base");
+    fs::create_dir(sandbox.path().join("archive")).unwrap();
+    app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Move)));
+    let effect = app
+        .update(AppEvent::Action(AppAction::SubmitFileAction(
+            PathBuf::from("archive/folder"),
+        )))
+        .pop()
+        .unwrap();
+    let (repository_id, file, tree) = apply_mutation_effect(effect);
+
+    let follow_up = app.update(AppEvent::MutationApplied {
+        repository_id,
+        file,
+        commit: CommitOutcome::NoChanges,
+        tree,
+    });
+
+    assert!(matches!(
+        &follow_up[..],
+        [AppEffect::LoadNote { path, .. }]
+            if path == PathBuf::from("archive/folder/sub/note.md").as_path()
+    ));
+    assert_eq!(
+        selected_tree_path(&app),
+        Some(PathBuf::from("archive/folder"))
+    );
+}
+
+#[test]
+fn deleting_an_ancestor_clears_the_active_note_and_clamps_tree_selection() {
+    use carnet::{
+        app::{Focus, TreeAction},
+        git::CommitOutcome,
+    };
+
+    let (sandbox, mut app) = app_with_note(83, "folder/sub/note.md", "base");
+    fs::write(sandbox.path().join("remaining.md"), "remaining").unwrap();
+    app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Delete)));
+    let effect = app
+        .update(AppEvent::Action(AppAction::ConfirmDelete))
+        .pop()
+        .unwrap();
+    let (repository_id, file, tree) = apply_mutation_effect(effect);
+
+    assert!(
+        app.update(AppEvent::MutationApplied {
+            repository_id,
+            file,
+            commit: CommitOutcome::NoChanges,
+            tree,
+        })
+        .is_empty()
+    );
+    let Screen::Workspace(workspace) = &app.screen else {
+        panic!("expected workspace");
+    };
+    assert_eq!(workspace.current_note, None);
+    assert!(workspace.editor.is_none());
+    assert_eq!(
+        selected_tree_path(&app),
+        Some(PathBuf::from("remaining.md"))
+    );
 }
 
 #[test]
@@ -1323,7 +1774,7 @@ fn workspace_open_result_resumes_the_pending_note_and_clears_home_resume_state()
         HomeAction::ChooseSelectedAsDefault,
     )));
 
-    let request_id = app.pending_open.unwrap().request_id;
+    let request_id = app.pending_request.as_ref().unwrap().request_id();
     let effects = app.update(AppEvent::WorkspaceOpened {
         request_id,
         repository_id: repository.id,
@@ -1370,7 +1821,11 @@ fn workspace_fixture(
         path: root.clone(),
     };
     let git = GitRepo::initialize(&root).unwrap();
-    fs::write(root.join(note_path), contents).unwrap();
+    let note_path = root.join(note_path);
+    if let Some(parent) = note_path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(note_path, contents).unwrap();
     let workspace = Workspace::open(repository.clone()).unwrap();
     (sandbox, repository, workspace, git)
 }
@@ -1387,7 +1842,7 @@ fn app_with_note(id: u128, note_path: &str, contents: &str) -> (TempDir, App) {
         .unwrap();
     let mut app = App::home(vec![repository.clone()], Some(repository.id), None);
     app.update(AppEvent::Action(AppAction::Home(HomeAction::OpenSelected)));
-    let request_id = app.pending_open.unwrap().request_id;
+    let request_id = app.pending_request.as_ref().unwrap().request_id();
     app.update(AppEvent::WorkspaceOpened {
         request_id,
         repository_id: repository.id,
@@ -1411,7 +1866,7 @@ fn empty_app(id: u128) -> (TempDir, App) {
     let workspace = Workspace::open(repository.clone()).unwrap();
     let mut app = App::home(vec![repository.clone()], Some(repository.id), None);
     app.update(AppEvent::Action(AppAction::Home(HomeAction::OpenSelected)));
-    let request_id = app.pending_open.unwrap().request_id;
+    let request_id = app.pending_request.as_ref().unwrap().request_id();
     app.update(AppEvent::WorkspaceOpened {
         request_id,
         repository_id: repository.id,
