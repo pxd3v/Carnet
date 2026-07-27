@@ -147,6 +147,10 @@ impl GitRepo {
         })
     }
 
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn run<I, S>(&self, operation: &'static str, args: I) -> Result<Output, GitError>
     where
         I: IntoIterator<Item = S>,

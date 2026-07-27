@@ -235,6 +235,11 @@ impl Editor {
         }
     }
 
+    pub(crate) fn accept_saved(&mut self, note: LoadedNote) {
+        debug_assert_eq!(self.buffer.text(), note.text());
+        self.loaded = note;
+    }
+
     fn move_cursor(&mut self, motion: Motion, extend_selection: bool) -> EditorOutcome {
         let before = (self.cursor, self.selection());
         if !extend_selection {

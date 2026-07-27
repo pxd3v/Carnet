@@ -1,0 +1,1011 @@
+use uuid::Uuid;
+
+use crate::{
+    catalog::CatalogError,
+    editor::{ClipboardError, Editor, EditorCommand},
+    git::{CommitIntent, CommitOutcome, GitError, GitRepo, MutationCommitError},
+    workspace::{FileOperation, FileOutcome, LoadedNote, TreeEntry, TreeEntryKind, Workspace},
+};
+
+use super::{
+    App, AppEffect, AppExitStatus, CommitStatus, DefaultChoiceState, Dialog, ExternalConflict,
+    FailureKind, FileActionKind, Focus, NavigationAction, OverlayState, PendingMutation,
+    PendingMutationKind, SavedCommitFailure, Screen, UnresolvedFailure, WorkspaceState,
+};
+use super::{RuntimeError, RuntimeOperation};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HomeAction {
+    Up,
+    Down,
+    OpenSelected,
+    ChooseSelectedAsDefault,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GlobalAction {
+    Save,
+    Find,
+    QuickOpen,
+    ToggleSidebar,
+    Undo,
+    Redo,
+    Copy,
+    Cut,
+    Paste,
+    SelectAll,
+    Quit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirtyChoice {
+    Cancel,
+    Discard,
+    Save,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConflictChoice {
+    Cancel,
+    Overwrite,
+    Reload,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TreeAction {
+    Up,
+    Down,
+    Left,
+    Right,
+    Open,
+    NewFile,
+    NewFolder,
+    Rename,
+    Move,
+    Delete,
+    Escape,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AppAction {
+    Home(HomeAction),
+    Global(GlobalAction),
+    Editor(EditorCommand),
+    Navigate(NavigationAction),
+    Focus(Focus),
+    Tree(TreeAction),
+    Dismiss,
+    SubmitFileAction(std::path::PathBuf),
+    ConfirmDelete,
+    SetSidebarOverlayIntent(bool),
+}
+
+#[derive(Debug)]
+pub enum AppEvent {
+    Action(AppAction),
+    ClipboardRead(Result<String, ClipboardError>),
+    ClipboardWritten(Result<(), ClipboardError>),
+    DefaultRepositoryPersisted {
+        repository_id: Uuid,
+        result: Result<(), CatalogError>,
+    },
+    DirtyChoice(DirtyChoice),
+    ConflictChoice(ConflictChoice),
+    MutationApplied {
+        repository_id: Uuid,
+        file: FileOutcome,
+        commit: CommitOutcome,
+        tree: Result<Vec<TreeEntry>, crate::workspace::FileError>,
+    },
+    MutationConflict {
+        repository_id: Uuid,
+        conflict: ExternalConflict,
+    },
+    MutationSavedCommitFailed {
+        repository_id: Uuid,
+        file: FileOutcome,
+        error: GitError,
+        tree: Result<Vec<TreeEntry>, crate::workspace::FileError>,
+    },
+    MutationFailed {
+        repository_id: Uuid,
+        error: MutationCommitError,
+    },
+    CommitRetryApplied {
+        repository_id: Uuid,
+        commit: CommitOutcome,
+    },
+    CommitRetryFailed {
+        repository_id: Uuid,
+        error: GitError,
+    },
+    WorkspaceOpened {
+        repository_id: Uuid,
+        workspace: Workspace,
+        git: GitRepo,
+        tree: Vec<TreeEntry>,
+        note: Option<LoadedNote>,
+    },
+    NoteLoaded {
+        repository_id: Uuid,
+        note: LoadedNote,
+    },
+    RuntimeFailed {
+        repository_id: Uuid,
+        operation: RuntimeOperation,
+        error: RuntimeError,
+    },
+}
+
+impl App {
+    pub fn update(&mut self, event: AppEvent) -> Vec<AppEffect> {
+        match event {
+            AppEvent::DefaultRepositoryPersisted {
+                repository_id,
+                result,
+            } => {
+                if self.home.default_repository != Some(repository_id) {
+                    return Vec::new();
+                }
+                match result {
+                    Ok(()) => Vec::new(),
+                    Err(error) => {
+                        self.record_runtime_failure(error.to_string());
+                        Vec::new()
+                    }
+                }
+            }
+            AppEvent::ClipboardWritten(Ok(())) => Vec::new(),
+            AppEvent::ClipboardWritten(Err(error)) => {
+                self.record_runtime_failure(error.to_string());
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::Home(HomeAction::Up)) => {
+                if let Some(selected) = self.home.selected {
+                    self.home.selected = Some(selected.saturating_sub(1));
+                }
+                Vec::new()
+            }
+            AppEvent::RuntimeFailed {
+                repository_id: _,
+                operation: _,
+                error,
+            } => {
+                self.pending_load = None;
+                self.record_runtime_failure(error.to_string());
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::ConfirmDelete) => self.confirm_delete(),
+            AppEvent::Action(AppAction::SubmitFileAction(path)) => self.submit_file_action(path),
+            AppEvent::Action(AppAction::Dismiss) => {
+                self.dialog = None;
+                self.overlay = OverlayState::None;
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::Focus(focus)) => {
+                if let Screen::Workspace(workspace) = &mut self.screen {
+                    workspace.focus = focus;
+                }
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::Tree(action)) => self.tree_action(action),
+            AppEvent::MutationFailed {
+                repository_id,
+                error,
+            } => {
+                if self
+                    .pending_mutation
+                    .as_ref()
+                    .map(|pending| pending.repository_id)
+                    != Some(repository_id)
+                {
+                    return Vec::new();
+                }
+                self.pending_mutation = None;
+                let kind = match error {
+                    MutationCommitError::File(_) => FailureKind::Write,
+                    MutationCommitError::WorkspaceMismatch
+                    | MutationCommitError::RepositoryMismatch => FailureKind::Runtime,
+                };
+                let message = error.to_string();
+                self.failure = Some(UnresolvedFailure {
+                    kind,
+                    message: message.clone(),
+                });
+                self.status.commit = CommitStatus::Idle;
+                self.status.message = Some(message.clone());
+                self.dialog = Some(Dialog::Failure { kind, message });
+                Vec::new()
+            }
+            AppEvent::CommitRetryFailed {
+                repository_id,
+                error,
+            } => {
+                if !matches!(
+                    self.pending_mutation.as_ref(),
+                    Some(PendingMutation {
+                        repository_id: pending_repository,
+                        kind: PendingMutationKind::RetryCommit,
+                        ..
+                    }) if *pending_repository == repository_id
+                ) {
+                    return Vec::new();
+                }
+                let pending = self.pending_mutation.take().expect("checked above");
+                let message = error.to_string();
+                self.saved_commit_failure = Some(SavedCommitFailure {
+                    repository_id,
+                    intent: pending.intent,
+                    message: message.clone(),
+                });
+                self.failure = Some(UnresolvedFailure {
+                    kind: FailureKind::Git,
+                    message: message.clone(),
+                });
+                self.status.commit = CommitStatus::SavedCommitFailed {
+                    message: message.clone(),
+                };
+                self.status.message = Some(message.clone());
+                self.dialog = Some(Dialog::SavedCommitFailed { message });
+                Vec::new()
+            }
+            AppEvent::CommitRetryApplied {
+                repository_id,
+                commit,
+            } => {
+                if !matches!(
+                    self.pending_mutation.as_ref(),
+                    Some(PendingMutation {
+                        repository_id: pending_repository,
+                        kind: PendingMutationKind::RetryCommit,
+                        ..
+                    }) if *pending_repository == repository_id
+                ) {
+                    return Vec::new();
+                }
+                self.pending_mutation = None;
+                self.saved_commit_failure = None;
+                self.failure = None;
+                self.dialog = None;
+                self.status.commit = match commit {
+                    CommitOutcome::Committed { revision } => CommitStatus::Committed { revision },
+                    CommitOutcome::NoChanges => CommitStatus::NoChanges,
+                };
+                self.status.message = None;
+                if self.pending_navigation.is_some()
+                    && self
+                        .workspace_editor_mut()
+                        .is_some_and(|editor| editor.is_dirty())
+                {
+                    return self.save(false);
+                }
+                let navigation = self.pending_navigation.take();
+                navigation
+                    .map(|target| self.perform_navigation(target))
+                    .unwrap_or_default()
+            }
+            AppEvent::MutationSavedCommitFailed {
+                repository_id,
+                file,
+                error,
+                tree,
+            } => {
+                if self
+                    .pending_mutation
+                    .as_ref()
+                    .map(|pending| pending.repository_id)
+                    != Some(repository_id)
+                {
+                    return Vec::new();
+                }
+                let pending = self.pending_mutation.take().expect("checked above");
+                if let Screen::Workspace(workspace) = &mut self.screen {
+                    if let Ok(tree) = tree {
+                        workspace.tree = tree;
+                    }
+                    if let (Some(editor), FileOutcome::Saved(note)) = (&mut workspace.editor, file)
+                    {
+                        editor.accept_saved(note);
+                    }
+                }
+                let message = error.to_string();
+                self.saved_commit_failure = Some(SavedCommitFailure {
+                    repository_id,
+                    intent: pending.intent,
+                    message: message.clone(),
+                });
+                self.failure = Some(UnresolvedFailure {
+                    kind: FailureKind::Git,
+                    message: message.clone(),
+                });
+                self.status.commit = CommitStatus::SavedCommitFailed {
+                    message: message.clone(),
+                };
+                self.status.message = Some(message.clone());
+                self.dialog = Some(Dialog::SavedCommitFailed { message });
+                Vec::new()
+            }
+            AppEvent::NoteLoaded {
+                repository_id,
+                note,
+            } => {
+                let Screen::Workspace(workspace) = &mut self.screen else {
+                    return Vec::new();
+                };
+                if workspace.repository.id != repository_id
+                    || self.pending_load.as_deref() != Some(note.path().relative())
+                {
+                    return Vec::new();
+                }
+                workspace.current_note = Some(note.path().relative().to_path_buf());
+                workspace.editor = Some(Editor::from_loaded(note));
+                self.pending_load = None;
+                Vec::new()
+            }
+            AppEvent::ConflictChoice(ConflictChoice::Reload) => {
+                self.dialog = None;
+                self.pending_navigation = None;
+                let path = match &self.screen {
+                    Screen::Workspace(workspace) => workspace.current_note.clone(),
+                    Screen::Home => None,
+                };
+                path.map(|path| self.perform_navigation(NavigationAction::Note(path)))
+                    .unwrap_or_default()
+            }
+            AppEvent::ConflictChoice(ConflictChoice::Overwrite) => {
+                self.dialog = None;
+                self.save(true)
+            }
+            AppEvent::ConflictChoice(ConflictChoice::Cancel) => {
+                self.dialog = None;
+                self.pending_navigation = None;
+                Vec::new()
+            }
+            AppEvent::MutationConflict {
+                repository_id,
+                conflict,
+            } => {
+                if self
+                    .pending_mutation
+                    .as_ref()
+                    .map(|pending| pending.repository_id)
+                    != Some(repository_id)
+                {
+                    return Vec::new();
+                }
+                self.pending_mutation = None;
+                self.status.commit = CommitStatus::Idle;
+                self.status.message = Some("file changed outside Carnet".into());
+                self.dialog = Some(Dialog::ExternalConflict(conflict));
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::Global(GlobalAction::Quit)) => self.update(
+                AppEvent::Action(AppAction::Navigate(NavigationAction::Quit)),
+            ),
+            AppEvent::MutationApplied {
+                repository_id,
+                file,
+                commit,
+                tree,
+            } => {
+                let Some(pending) = self.pending_mutation.as_ref() else {
+                    return Vec::new();
+                };
+                if pending.repository_id != repository_id {
+                    return Vec::new();
+                }
+                let pending = self.pending_mutation.take().expect("checked above");
+                let tree_error = tree.as_ref().err().map(ToString::to_string);
+                if let Screen::Workspace(workspace) = &mut self.screen {
+                    if let Ok(tree) = tree {
+                        workspace.tree = tree;
+                    }
+                    if let (Some(editor), FileOutcome::Saved(note)) = (&mut workspace.editor, file)
+                    {
+                        editor.accept_saved(note);
+                    }
+                }
+                self.status.commit = match commit {
+                    CommitOutcome::Committed { revision } => CommitStatus::Committed { revision },
+                    CommitOutcome::NoChanges => CommitStatus::NoChanges,
+                };
+                if self
+                    .failure
+                    .as_ref()
+                    .is_some_and(|failure| failure.kind == FailureKind::Write)
+                {
+                    self.failure = None;
+                }
+                self.status.message = None;
+                if let Some(message) = tree_error {
+                    self.failure = Some(UnresolvedFailure {
+                        kind: FailureKind::Runtime,
+                        message: message.clone(),
+                    });
+                    self.status.message = Some(message.clone());
+                    self.dialog = Some(Dialog::Failure {
+                        kind: FailureKind::Runtime,
+                        message,
+                    });
+                    return Vec::new();
+                }
+                if matches!(pending.kind, PendingMutationKind::Save { .. }) {
+                    let navigation = self.pending_navigation.take();
+                    return navigation
+                        .map(|target| self.perform_navigation(target))
+                        .unwrap_or_default();
+                }
+                Vec::new()
+            }
+            AppEvent::DirtyChoice(DirtyChoice::Save) => {
+                self.dialog = None;
+                self.global_save()
+            }
+            AppEvent::DirtyChoice(DirtyChoice::Discard) => {
+                let target = self.pending_navigation.take();
+                self.dialog = None;
+                target
+                    .map(|target| self.perform_navigation(target))
+                    .unwrap_or_default()
+            }
+            AppEvent::DirtyChoice(DirtyChoice::Cancel) => {
+                self.pending_navigation = None;
+                self.dialog = None;
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::Navigate(target)) => {
+                if self
+                    .workspace_editor_mut()
+                    .is_some_and(|editor| editor.is_dirty())
+                {
+                    self.pending_navigation = Some(target);
+                    self.dialog = Some(Dialog::DirtyNavigation);
+                    Vec::new()
+                } else {
+                    self.perform_navigation(target)
+                }
+            }
+            AppEvent::Action(AppAction::Global(GlobalAction::Save)) => self.global_save(),
+            AppEvent::ClipboardRead(Ok(text)) => {
+                if let Some(editor) = self.workspace_editor_mut() {
+                    editor.apply(EditorCommand::BracketedPaste(text));
+                }
+                Vec::new()
+            }
+            AppEvent::ClipboardRead(Err(error)) => {
+                self.record_runtime_failure(error.to_string());
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::Editor(EditorCommand::Copy)) => {
+                self.update(AppEvent::Action(AppAction::Global(GlobalAction::Copy)))
+            }
+            AppEvent::Action(AppAction::Editor(EditorCommand::Cut)) => {
+                self.update(AppEvent::Action(AppAction::Global(GlobalAction::Cut)))
+            }
+            AppEvent::Action(AppAction::Editor(EditorCommand::Paste)) => {
+                self.update(AppEvent::Action(AppAction::Global(GlobalAction::Paste)))
+            }
+            AppEvent::Action(AppAction::Editor(command)) => {
+                if let Some(editor) = self.workspace_editor_mut() {
+                    editor.apply(command);
+                }
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::Global(GlobalAction::Undo)) => {
+                if let Some(editor) = self.workspace_editor_mut() {
+                    editor.apply(EditorCommand::Undo);
+                }
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::Global(GlobalAction::Redo)) => {
+                if let Some(editor) = self.workspace_editor_mut() {
+                    editor.apply(EditorCommand::Redo);
+                }
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::Global(GlobalAction::SelectAll)) => {
+                if let Some(editor) = self.workspace_editor_mut() {
+                    editor.apply(EditorCommand::SelectAll);
+                }
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::Global(GlobalAction::Copy)) => self
+                .workspace_editor_mut()
+                .and_then(|editor| editor.selected_text())
+                .map(|text| vec![AppEffect::WriteClipboard { text }])
+                .unwrap_or_default(),
+            AppEvent::Action(AppAction::Global(GlobalAction::Cut)) => {
+                let Some(editor) = self.workspace_editor_mut() else {
+                    return Vec::new();
+                };
+                let Some(text) = editor.selected_text() else {
+                    return Vec::new();
+                };
+                editor.apply(EditorCommand::Insert(String::new()));
+                vec![AppEffect::WriteClipboard { text }]
+            }
+            AppEvent::Action(AppAction::Global(GlobalAction::Paste)) => {
+                (self.workspace_editor_mut().is_some())
+                    .then_some(AppEffect::ReadClipboard)
+                    .into_iter()
+                    .collect()
+            }
+            AppEvent::Action(AppAction::Global(GlobalAction::Find)) => {
+                self.overlay = OverlayState::Search {
+                    query: String::new(),
+                };
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::Global(GlobalAction::QuickOpen)) => {
+                self.overlay = OverlayState::QuickOpen {
+                    query: String::new(),
+                    selected: None,
+                };
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::Global(GlobalAction::ToggleSidebar)) => {
+                self.sidebar.visible = !self.sidebar.visible;
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::SetSidebarOverlayIntent(overlay_intent)) => {
+                self.sidebar.overlay_intent = overlay_intent;
+                Vec::new()
+            }
+            AppEvent::WorkspaceOpened {
+                repository_id,
+                workspace,
+                git,
+                tree,
+                note,
+            } => {
+                if workspace.repo().id != repository_id {
+                    return Vec::new();
+                }
+                let current_note = note
+                    .as_ref()
+                    .map(|note| note.path().relative().to_path_buf());
+                let repository = workspace.repo().clone();
+                let tree_selection = (!tree.is_empty()).then_some(0);
+                self.screen = Screen::Workspace(Box::new(WorkspaceState {
+                    repository,
+                    workspace,
+                    git,
+                    tree,
+                    current_note,
+                    editor: note.map(Editor::from_loaded),
+                    focus: Focus::Editor,
+                    tree_selection,
+                    expanded: Default::default(),
+                }));
+                if matches!(
+                    self.home.default_choice,
+                    DefaultChoiceState::ResumingPendingNote {
+                        repository_id: expected,
+                        ..
+                    } if expected == repository_id
+                ) {
+                    self.home.pending_note = None;
+                    self.home.default_choice = DefaultChoiceState::NotNeeded;
+                }
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::Home(HomeAction::Down)) => {
+                if let Some(selected) = self.home.selected {
+                    self.home.selected = Some(
+                        selected
+                            .saturating_add(1)
+                            .min(self.home.repositories.len().saturating_sub(1)),
+                    );
+                }
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::Home(HomeAction::OpenSelected)) => {
+                let Some(repository) = self
+                    .home
+                    .selected
+                    .and_then(|selected| self.home.repositories.get(selected))
+                    .cloned()
+                else {
+                    return Vec::new();
+                };
+                let note = self.home.pending_note.clone();
+                if let Some(note) = &note {
+                    self.home.default_choice = DefaultChoiceState::ResumingPendingNote {
+                        repository_id: repository.id,
+                        note: note.clone(),
+                    };
+                }
+                vec![AppEffect::OpenWorkspace { repository, note }]
+            }
+            AppEvent::Action(AppAction::Home(HomeAction::ChooseSelectedAsDefault)) => {
+                let Some(repository) = self
+                    .home
+                    .selected
+                    .and_then(|selected| self.home.repositories.get(selected))
+                    .cloned()
+                else {
+                    return Vec::new();
+                };
+                let Some(note) = self.home.pending_note.clone() else {
+                    return Vec::new();
+                };
+                self.home.default_repository = Some(repository.id);
+                self.home.default_choice = super::DefaultChoiceState::ResumingPendingNote {
+                    repository_id: repository.id,
+                    note: note.clone(),
+                };
+                vec![
+                    AppEffect::SetDefaultRepository {
+                        repository_id: repository.id,
+                    },
+                    AppEffect::OpenWorkspace {
+                        repository,
+                        note: Some(note),
+                    },
+                ]
+            }
+        }
+    }
+
+    fn workspace_editor_mut(&mut self) -> Option<&mut Editor> {
+        let Screen::Workspace(workspace) = &mut self.screen else {
+            return None;
+        };
+        workspace.editor.as_mut()
+    }
+
+    fn record_runtime_failure(&mut self, message: String) {
+        self.failure = Some(UnresolvedFailure {
+            kind: FailureKind::Runtime,
+            message: message.clone(),
+        });
+        self.status.message = Some(message.clone());
+        self.dialog = Some(Dialog::Failure {
+            kind: FailureKind::Runtime,
+            message,
+        });
+    }
+
+    fn save(&mut self, overwrite: bool) -> Vec<AppEffect> {
+        if self.pending_mutation.is_some() {
+            return Vec::new();
+        }
+        let Screen::Workspace(workspace) = &self.screen else {
+            return Vec::new();
+        };
+        let Some(editor) = &workspace.editor else {
+            return Vec::new();
+        };
+        if !editor.is_dirty() {
+            return Vec::new();
+        }
+        let operation = editor.save_operation(overwrite);
+        let (path, is_saved) = match &operation {
+            FileOperation::Save { note, .. } => {
+                (note.path().relative().to_path_buf(), note.is_saved())
+            }
+            _ => unreachable!("the editor only creates save operations"),
+        };
+        let intent = if is_saved {
+            CommitIntent::Update(path)
+        } else {
+            CommitIntent::Create(path)
+        };
+        let repository_id = workspace.repository.id;
+        self.pending_mutation = Some(PendingMutation {
+            repository_id,
+            kind: PendingMutationKind::Save { overwrite },
+            intent: intent.clone(),
+        });
+        self.status.commit = CommitStatus::Pending;
+        vec![AppEffect::ApplyAndCommit {
+            repository_id,
+            workspace: workspace.workspace.clone(),
+            git: workspace.git.clone(),
+            operation: Box::new(operation),
+            intent,
+        }]
+    }
+
+    fn global_save(&mut self) -> Vec<AppEffect> {
+        if self.pending_mutation.is_some() {
+            return Vec::new();
+        }
+        if let Some(failure) = self.saved_commit_failure.clone() {
+            let Screen::Workspace(workspace) = &self.screen else {
+                return Vec::new();
+            };
+            if workspace.repository.id != failure.repository_id {
+                return Vec::new();
+            }
+            self.pending_mutation = Some(PendingMutation {
+                repository_id: failure.repository_id,
+                kind: PendingMutationKind::RetryCommit,
+                intent: failure.intent.clone(),
+            });
+            self.status.commit = CommitStatus::Pending;
+            return vec![AppEffect::RetryCommit {
+                repository_id: failure.repository_id,
+                git: workspace.git.clone(),
+                intent: failure.intent,
+            }];
+        }
+        self.save(false)
+    }
+
+    fn perform_navigation(&mut self, target: NavigationAction) -> Vec<AppEffect> {
+        match target {
+            NavigationAction::Home => {
+                self.screen = Screen::Home;
+                self.overlay = OverlayState::None;
+                self.dialog = None;
+                self.pending_load = None;
+                Vec::new()
+            }
+            NavigationAction::Repository { repository, note } => {
+                vec![AppEffect::OpenWorkspace { repository, note }]
+            }
+            NavigationAction::Note(path) => {
+                let Screen::Workspace(workspace) = &self.screen else {
+                    return Vec::new();
+                };
+                self.pending_load = Some(path.clone());
+                vec![AppEffect::LoadNote {
+                    repository_id: workspace.repository.id,
+                    workspace: workspace.workspace.clone(),
+                    path,
+                }]
+            }
+            NavigationAction::Quit => {
+                self.quit.requested = true;
+                self.quit.final_status = Some(if self.failure.is_some() {
+                    AppExitStatus::Failure
+                } else {
+                    AppExitStatus::Success
+                });
+                Vec::new()
+            }
+        }
+    }
+
+    fn tree_action(&mut self, action: TreeAction) -> Vec<AppEffect> {
+        if self.pending_mutation.is_some()
+            && matches!(
+                action,
+                TreeAction::NewFile
+                    | TreeAction::NewFolder
+                    | TreeAction::Rename
+                    | TreeAction::Move
+                    | TreeAction::Delete
+            )
+        {
+            return Vec::new();
+        }
+        let (focus, entries, selected) = match &self.screen {
+            Screen::Workspace(workspace) => (
+                workspace.focus,
+                visible_tree(&workspace.tree, &workspace.expanded),
+                workspace.tree_selection,
+            ),
+            Screen::Home => return Vec::new(),
+        };
+        if focus != Focus::Tree {
+            return Vec::new();
+        }
+        if action == TreeAction::Escape {
+            if let Screen::Workspace(workspace) = &mut self.screen {
+                workspace.focus = Focus::Editor;
+            }
+            if self.sidebar.overlay_intent {
+                self.sidebar.visible = false;
+            }
+            return Vec::new();
+        }
+        let Some(selected) = selected.filter(|selected| *selected < entries.len()) else {
+            return Vec::new();
+        };
+        match action {
+            TreeAction::Up => {
+                if let Screen::Workspace(workspace) = &mut self.screen {
+                    workspace.tree_selection = Some(selected.saturating_sub(1));
+                }
+            }
+            TreeAction::Down => {
+                if let Screen::Workspace(workspace) = &mut self.screen {
+                    workspace.tree_selection = Some((selected + 1).min(entries.len() - 1));
+                }
+            }
+            TreeAction::Right => {
+                if entries[selected].kind == TreeEntryKind::Directory
+                    && let Screen::Workspace(workspace) = &mut self.screen
+                {
+                    workspace.expanded.insert(entries[selected].path.clone());
+                }
+            }
+            TreeAction::Left => {
+                if let Screen::Workspace(workspace) = &mut self.screen {
+                    if entries[selected].kind == TreeEntryKind::Directory
+                        && workspace.expanded.remove(&entries[selected].path)
+                    {
+                        return Vec::new();
+                    }
+                    if let Some(parent) = &entries[selected].parent
+                        && let Some(parent_index) = entries
+                            .iter()
+                            .position(|entry| entry.path.as_path() == parent.as_path())
+                    {
+                        workspace.tree_selection = Some(parent_index);
+                    }
+                }
+            }
+            TreeAction::Open => {
+                if entries[selected].kind == TreeEntryKind::Directory {
+                    if let Screen::Workspace(workspace) = &mut self.screen
+                        && !workspace.expanded.remove(&entries[selected].path)
+                    {
+                        workspace.expanded.insert(entries[selected].path.clone());
+                    }
+                } else if entries[selected].enabled {
+                    return self.perform_navigation(NavigationAction::Note(
+                        entries[selected].path.clone(),
+                    ));
+                }
+            }
+            TreeAction::NewFile | TreeAction::NewFolder | TreeAction::Rename | TreeAction::Move => {
+                let kind = match action {
+                    TreeAction::NewFile => FileActionKind::NewFile,
+                    TreeAction::NewFolder => FileActionKind::NewFolder,
+                    TreeAction::Rename => FileActionKind::Rename,
+                    TreeAction::Move => FileActionKind::Move,
+                    _ => unreachable!(),
+                };
+                self.dialog = Some(Dialog::FileAction {
+                    kind,
+                    target: Some(entries[selected].path.clone()),
+                });
+            }
+            TreeAction::Delete => {
+                self.dialog = Some(Dialog::ConfirmDelete {
+                    path: entries[selected].path.clone(),
+                });
+            }
+            TreeAction::Escape => unreachable!("handled before selection"),
+        }
+        Vec::new()
+    }
+
+    fn submit_file_action(&mut self, path: std::path::PathBuf) -> Vec<AppEffect> {
+        if self.pending_mutation.is_some() {
+            return Vec::new();
+        }
+        let Some(Dialog::FileAction { kind, target }) = self.dialog.take() else {
+            return Vec::new();
+        };
+        let Screen::Workspace(workspace) = &self.screen else {
+            return Vec::new();
+        };
+        let operation = match kind {
+            FileActionKind::NewFile => FileOperation::CreateFile {
+                workspace: workspace.workspace.clone(),
+                path: path.clone(),
+            },
+            FileActionKind::NewFolder => FileOperation::CreateFolder {
+                workspace: workspace.workspace.clone(),
+                path: path.clone(),
+            },
+            FileActionKind::Rename => {
+                let Some(from) = target else {
+                    return Vec::new();
+                };
+                FileOperation::Rename {
+                    workspace: workspace.workspace.clone(),
+                    from,
+                    to: path.clone(),
+                }
+            }
+            FileActionKind::Move => {
+                let Some(from) = target else {
+                    return Vec::new();
+                };
+                FileOperation::Move {
+                    workspace: workspace.workspace.clone(),
+                    from,
+                    to: path.clone(),
+                }
+            }
+        };
+        let intent = match &operation {
+            FileOperation::CreateFile { path, .. } | FileOperation::CreateFolder { path, .. } => {
+                CommitIntent::Create(path.clone())
+            }
+            FileOperation::Rename { from, to, .. } | FileOperation::Move { from, to, .. } => {
+                CommitIntent::Move {
+                    from: from.clone(),
+                    to: to.clone(),
+                }
+            }
+            _ => unreachable!("file dialog cannot create this operation"),
+        };
+        let repository_id = workspace.repository.id;
+        self.pending_mutation = Some(PendingMutation {
+            repository_id,
+            kind: PendingMutationKind::File(kind),
+            intent: intent.clone(),
+        });
+        self.status.commit = CommitStatus::Pending;
+        vec![AppEffect::ApplyAndCommit {
+            repository_id,
+            workspace: workspace.workspace.clone(),
+            git: workspace.git.clone(),
+            operation: Box::new(operation),
+            intent,
+        }]
+    }
+
+    fn confirm_delete(&mut self) -> Vec<AppEffect> {
+        if self.pending_mutation.is_some() {
+            return Vec::new();
+        }
+        let Some(Dialog::ConfirmDelete { path }) = self.dialog.take() else {
+            return Vec::new();
+        };
+        let Screen::Workspace(workspace) = &self.screen else {
+            return Vec::new();
+        };
+        let intent = CommitIntent::Delete(path.clone());
+        let repository_id = workspace.repository.id;
+        self.pending_mutation = Some(PendingMutation {
+            repository_id,
+            kind: PendingMutationKind::Delete,
+            intent: intent.clone(),
+        });
+        self.status.commit = CommitStatus::Pending;
+        vec![AppEffect::ApplyAndCommit {
+            repository_id,
+            workspace: workspace.workspace.clone(),
+            git: workspace.git.clone(),
+            operation: Box::new(FileOperation::Delete {
+                workspace: workspace.workspace.clone(),
+                path,
+                confirmed: true,
+            }),
+            intent,
+        }]
+    }
+}
+
+#[derive(Clone)]
+struct VisibleTreeEntry {
+    path: std::path::PathBuf,
+    kind: TreeEntryKind,
+    enabled: bool,
+    parent: Option<std::path::PathBuf>,
+}
+
+fn visible_tree(
+    entries: &[TreeEntry],
+    expanded: &std::collections::BTreeSet<std::path::PathBuf>,
+) -> Vec<VisibleTreeEntry> {
+    fn collect(
+        output: &mut Vec<VisibleTreeEntry>,
+        entries: &[TreeEntry],
+        expanded: &std::collections::BTreeSet<std::path::PathBuf>,
+        parent: Option<&std::path::Path>,
+    ) {
+        for entry in entries {
+            output.push(VisibleTreeEntry {
+                path: entry.path().to_path_buf(),
+                kind: entry.kind(),
+                enabled: entry.is_enabled(),
+                parent: parent.map(std::path::Path::to_path_buf),
+            });
+            if entry.kind() == TreeEntryKind::Directory && expanded.contains(entry.path()) {
+                collect(output, entry.children(), expanded, Some(entry.path()));
+            }
+        }
+    }
+
+    let mut output = Vec::new();
+    collect(&mut output, entries, expanded, None);
+    output
+}

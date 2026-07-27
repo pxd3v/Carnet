@@ -1,5 +1,6 @@
 //! Carnet core library.
 
+pub mod app;
 pub mod catalog;
 pub mod cli;
 pub mod editor;
