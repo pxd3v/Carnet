@@ -2,7 +2,8 @@ use std::{fs, path::PathBuf};
 
 use carnet::{
     app::{
-        App, AppAction, AppEffect, AppEvent, DefaultChoiceState, HomeAction, PendingIntent, Screen,
+        App, AppAction, AppEffect, AppEvent, DefaultChoiceState, HomeAction, PendingFileMutation,
+        PendingIntent, Screen,
     },
     catalog::RepoEntry,
     editor::EditorCommand,
@@ -225,12 +226,13 @@ fn dirty_create_file_reprompts_when_edits_arrive_during_its_prerequisite_save() 
         .is_empty()
     );
     assert_eq!(app.dialog, Some(Dialog::DirtyNavigation));
-    assert_eq!(
-        app.pending_intent,
-        Some(PendingIntent::Mutation(FileMutationAction::CreateFile {
-            path: PathBuf::from("created.md"),
-        }))
-    );
+    assert!(matches!(
+        app.pending_intent.as_ref(),
+        Some(PendingIntent::Mutation(PendingFileMutation {
+            action: FileMutationAction::CreateFile { path },
+            ..
+        })) if path == PathBuf::from("created.md").as_path()
+    ));
     assert_eq!(workspace_editor(&app).text(), "saved newer base");
     assert!(workspace_editor(&app).is_dirty());
     assert!(!matches!(
@@ -328,13 +330,14 @@ fn cancelling_a_dirty_ancestor_move_keeps_the_note_and_performs_no_mutation() {
         .is_empty()
     );
     assert_eq!(app.dialog, Some(Dialog::DirtyNavigation));
-    assert_eq!(
-        app.pending_intent,
-        Some(PendingIntent::Mutation(FileMutationAction::Move {
-            from: PathBuf::from("folder"),
-            to: PathBuf::from("archive/folder"),
-        }))
-    );
+    assert!(matches!(
+        app.pending_intent.as_ref(),
+        Some(PendingIntent::Mutation(PendingFileMutation {
+            action: FileMutationAction::Move { from, to },
+            ..
+        })) if from == PathBuf::from("folder").as_path()
+            && to == PathBuf::from("archive/folder").as_path()
+    ));
 
     assert!(
         app.update(AppEvent::DirtyChoice(DirtyChoice::Cancel))
@@ -368,12 +371,13 @@ fn dirty_ancestor_delete_waits_for_save_before_deleting_the_tree() {
             .is_empty()
     );
     assert_eq!(app.dialog, Some(Dialog::DirtyNavigation));
-    assert_eq!(
-        app.pending_intent,
-        Some(PendingIntent::Mutation(FileMutationAction::Delete {
-            path: PathBuf::from("folder"),
-        }))
-    );
+    assert!(matches!(
+        app.pending_intent.as_ref(),
+        Some(PendingIntent::Mutation(PendingFileMutation {
+            action: FileMutationAction::Delete { path },
+            ..
+        })) if path == PathBuf::from("folder").as_path()
+    ));
 
     let save = app.update(AppEvent::DirtyChoice(DirtyChoice::Save));
     let (mutation_id, repository_id, repository_root, file) =
@@ -472,7 +476,7 @@ fn dirty_unrelated_rename_does_not_replace_or_block_the_active_editor() {
 #[test]
 fn pending_load_blocks_unrelated_and_active_mutations_until_the_load_resolves() {
     use carnet::{
-        app::{Dialog, EffectExecutor, FileActionKind, Focus, NavigationAction, TreeAction},
+        app::{EffectExecutor, Focus, NavigationAction, TreeAction},
         workspace::FileOperation,
     };
 
@@ -492,13 +496,7 @@ fn pending_load_blocks_unrelated_and_active_mutations_until_the_load_resolves() 
             )))
             .is_empty()
     );
-    assert!(matches!(
-        unrelated.dialog,
-        Some(Dialog::FileAction {
-            kind: FileActionKind::NewFolder,
-            ..
-        })
-    ));
+    assert_eq!(unrelated.dialog, None);
 
     let (_sandbox, mut active) = app_with_note(91, "note.md", "base");
     let active_load = active
@@ -516,16 +514,11 @@ fn pending_load_blocks_unrelated_and_active_mutations_until_the_load_resolves() 
             )))
             .is_empty()
     );
-    assert!(matches!(
-        active.dialog,
-        Some(Dialog::FileAction {
-            kind: FileActionKind::Rename,
-            ..
-        })
-    ));
+    assert_eq!(active.dialog, None);
 
     unrelated.update(EffectExecutor::default().execute(unrelated_load).unwrap());
     active.update(EffectExecutor::default().execute(active_load).unwrap());
+    active.update(AppEvent::Action(AppAction::Tree(TreeAction::Rename)));
     let rename = active.update(AppEvent::Action(AppAction::SubmitFileAction(
         PathBuf::from("renamed.md"),
     )));
@@ -539,7 +532,7 @@ fn pending_load_blocks_unrelated_and_active_mutations_until_the_load_resolves() 
 
 #[test]
 fn pending_workspace_open_blocks_mutation_start_in_the_old_visible_repository() {
-    use carnet::app::{Dialog, FileActionKind, Focus, NavigationAction, TreeAction};
+    use carnet::app::{Focus, NavigationAction, TreeAction};
 
     let (_sandbox, mut app) = app_with_note(92, "note.md", "base");
     let repository_b = repository(93, "repository-b");
@@ -559,19 +552,249 @@ fn pending_workspace_open_blocks_mutation_start_in_the_old_visible_repository() 
         )))
         .is_empty()
     );
-    assert!(matches!(
-        app.dialog,
-        Some(Dialog::FileAction {
-            kind: FileActionKind::NewFolder,
-            ..
-        })
-    ));
+    assert_eq!(app.dialog, None);
     assert!(app.pending_mutation.is_none());
 }
 
 #[test]
+fn workspace_open_invalidates_a_rename_dialog_from_the_previous_repository() {
+    use carnet::app::{
+        Dialog, EffectExecutor, FileActionKind, Focus, NavigationAction, TreeAction,
+    };
+
+    let (_sandbox_a, mut app) = app_with_note(100, "note.md", "a");
+    let (sandbox_b, repository_b, _workspace_b, _git_b) =
+        workspace_fixture(101, "repository-b", "note.md", "b");
+    app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Rename)));
+    assert!(matches!(
+        app.dialog,
+        Some(Dialog::FileAction {
+            kind: FileActionKind::Rename,
+            ..
+        })
+    ));
+
+    let open = app
+        .update(AppEvent::Action(AppAction::Navigate(
+            NavigationAction::Repository {
+                repository: repository_b.clone(),
+                note: None,
+            },
+        )))
+        .pop()
+        .unwrap();
+    assert!(
+        app.update(AppEvent::Action(AppAction::SubmitFileAction(
+            PathBuf::from("renamed.md"),
+        )))
+        .is_empty()
+    );
+    assert!(app.dialog.is_some());
+
+    app.update(EffectExecutor::default().execute(open).unwrap());
+    let Screen::Workspace(workspace) = &app.screen else {
+        panic!("expected repository B workspace");
+    };
+    assert_eq!(workspace.repository.id, repository_b.id);
+    assert_eq!(app.dialog, None);
+    assert!(
+        app.update(AppEvent::Action(AppAction::SubmitFileAction(
+            PathBuf::from("renamed.md"),
+        )))
+        .is_empty()
+    );
+    assert!(app.pending_mutation.is_none());
+    assert!(sandbox_b.path().join("note.md").is_file());
+    assert!(!sandbox_b.path().join("renamed.md").exists());
+}
+
+#[test]
+fn workspace_open_invalidates_delete_confirmation_from_the_previous_repository() {
+    use carnet::app::{Dialog, EffectExecutor, Focus, NavigationAction, TreeAction};
+
+    let (_sandbox_a, mut app) = app_with_note(102, "note.md", "a");
+    let (sandbox_b, repository_b, _workspace_b, _git_b) =
+        workspace_fixture(103, "repository-b", "note.md", "b");
+    app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Delete)));
+    assert!(matches!(app.dialog, Some(Dialog::ConfirmDelete { .. })));
+
+    let open = app
+        .update(AppEvent::Action(AppAction::Navigate(
+            NavigationAction::Repository {
+                repository: repository_b.clone(),
+                note: None,
+            },
+        )))
+        .pop()
+        .unwrap();
+    assert!(
+        app.update(AppEvent::Action(AppAction::ConfirmDelete))
+            .is_empty()
+    );
+    assert!(app.dialog.is_some());
+
+    app.update(EffectExecutor::default().execute(open).unwrap());
+    assert_eq!(app.dialog, None);
+    assert!(
+        app.update(AppEvent::Action(AppAction::ConfirmDelete))
+            .is_empty()
+    );
+    assert!(app.pending_mutation.is_none());
+    assert!(sandbox_b.path().join("note.md").is_file());
+}
+
+#[test]
+fn forged_dialog_origins_are_rejected_at_submit_and_confirm() {
+    use carnet::app::{Dialog, Focus, TreeAction};
+
+    let (rename_sandbox, mut rename) = app_with_note(104, "note.md", "base");
+    rename.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    rename.update(AppEvent::Action(AppAction::Tree(TreeAction::Rename)));
+    let Some(Dialog::FileAction { origin, .. }) = &mut rename.dialog else {
+        panic!("expected rename dialog");
+    };
+    origin.repository_id = Uuid::from_u128(999);
+
+    assert!(
+        rename
+            .update(AppEvent::Action(AppAction::SubmitFileAction(
+                PathBuf::from("renamed.md"),
+            )))
+            .is_empty()
+    );
+    assert_eq!(rename.dialog, None);
+    assert!(rename.pending_mutation.is_none());
+    assert!(rename_sandbox.path().join("note.md").is_file());
+    assert!(!rename_sandbox.path().join("renamed.md").exists());
+
+    let (delete_sandbox, mut delete) = app_with_note(105, "note.md", "base");
+    delete.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    delete.update(AppEvent::Action(AppAction::Tree(TreeAction::Delete)));
+    let Some(Dialog::ConfirmDelete { origin, .. }) = &mut delete.dialog else {
+        panic!("expected delete confirmation");
+    };
+    origin.repository_root = PathBuf::from("/forged/root");
+
+    assert!(
+        delete
+            .update(AppEvent::Action(AppAction::ConfirmDelete))
+            .is_empty()
+    );
+    assert_eq!(delete.dialog, None);
+    assert!(delete.pending_mutation.is_none());
+    assert!(delete_sandbox.path().join("note.md").is_file());
+}
+
+#[test]
+fn same_workspace_load_retains_dialog_origin_and_original_rename_target() {
+    use carnet::{
+        app::{Dialog, EffectExecutor, FileActionKind, Focus, NavigationAction, TreeAction},
+        workspace::FileOperation,
+    };
+
+    let (_sandbox, mut app) = app_with_note(106, "folder/note.md", "base");
+    app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Rename)));
+    let Some(Dialog::FileAction {
+        origin,
+        kind: FileActionKind::Rename,
+        target: Some(target),
+    }) = app.dialog.clone()
+    else {
+        panic!("expected scoped rename dialog");
+    };
+    assert_eq!(target, PathBuf::from("folder"));
+
+    let load = app
+        .update(AppEvent::Action(AppAction::Navigate(
+            NavigationAction::Note(PathBuf::from("folder/note.md")),
+        )))
+        .pop()
+        .unwrap();
+    assert!(
+        app.update(AppEvent::Action(AppAction::SubmitFileAction(
+            PathBuf::from("renamed"),
+        )))
+        .is_empty()
+    );
+    assert!(app.dialog.is_some());
+    app.update(EffectExecutor::default().execute(load).unwrap());
+
+    assert_eq!(
+        app.dialog,
+        Some(Dialog::FileAction {
+            origin: origin.clone(),
+            kind: FileActionKind::Rename,
+            target: Some(PathBuf::from("folder")),
+        })
+    );
+    let rename = app.update(AppEvent::Action(AppAction::SubmitFileAction(
+        PathBuf::from("renamed"),
+    )));
+    assert!(matches!(
+        mutation_parts(&rename[0]).1,
+        FileOperation::Rename { from, to, .. }
+            if from == PathBuf::from("folder").as_path()
+                && to == PathBuf::from("renamed").as_path()
+    ));
+    let (_, repository_id, repository_root) = mutation_identity(&rename[0]);
+    assert_eq!(repository_id, origin.repository_id);
+    assert_eq!(repository_root, origin.repository_root);
+}
+
+#[test]
+fn workspace_open_clears_old_deferred_file_intent_but_keeps_global_dialog() {
+    use carnet::app::{
+        Dialog, EffectExecutor, FailureKind, FileMutationAction, Focus, NavigationAction,
+        TreeAction,
+    };
+
+    let (_sandbox_a, mut app) = app_with_note(107, "note.md", "a");
+    let (_sandbox_b, repository_b, _workspace_b, _git_b) =
+        workspace_fixture(108, "repository-b", "note.md", "b");
+    app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Rename)));
+    let Some(Dialog::FileAction { origin, .. }) = app.dialog.clone() else {
+        panic!("expected repository A dialog origin");
+    };
+    let open = app
+        .update(AppEvent::Action(AppAction::Navigate(
+            NavigationAction::Repository {
+                repository: repository_b,
+                note: None,
+            },
+        )))
+        .pop()
+        .unwrap();
+
+    app.pending_intent = Some(PendingIntent::Mutation(PendingFileMutation {
+        origin,
+        action: FileMutationAction::Rename {
+            from: PathBuf::from("note.md"),
+            to: PathBuf::from("renamed.md"),
+        },
+    }));
+    app.dialog = Some(Dialog::Failure {
+        kind: FailureKind::Runtime,
+        message: "global failure".into(),
+    });
+    app.update(EffectExecutor::default().execute(open).unwrap());
+
+    assert_eq!(app.pending_intent, None);
+    assert_eq!(
+        app.dialog,
+        Some(Dialog::Failure {
+            kind: FailureKind::Runtime,
+            message: "global failure".into(),
+        })
+    );
+}
+
+#[test]
 fn navigation_cannot_overwrite_a_deferred_dirty_mutation_intent() {
-    use carnet::app::{Dialog, FileMutationAction, Focus, NavigationAction, TreeAction};
+    use carnet::app::{Dialog, Focus, NavigationAction, TreeAction};
 
     let (_sandbox, mut app) = app_with_note(99, "note.md", "base");
     app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
@@ -582,10 +805,7 @@ fn navigation_cannot_overwrite_a_deferred_dirty_mutation_intent() {
     app.update(AppEvent::Action(AppAction::SubmitFileAction(
         PathBuf::from("created.md"),
     )));
-    let deferred = PendingIntent::Mutation(FileMutationAction::CreateFile {
-        path: PathBuf::from("created.md"),
-    });
-    assert_eq!(app.pending_intent, Some(deferred.clone()));
+    let deferred = app.pending_intent.clone().unwrap();
 
     assert!(
         app.update(AppEvent::Action(AppAction::Navigate(
@@ -1442,7 +1662,7 @@ fn tree_refresh_failure_after_save_preserves_the_saved_result_and_reports_runtim
 
 #[test]
 fn tree_focus_routes_navigation_file_actions_and_escape_through_update() {
-    use carnet::app::{Dialog, FileActionKind, Focus, TreeAction};
+    use carnet::app::{Dialog, EffectExecutor, FileActionKind, Focus, TreeAction};
 
     let (_sandbox, mut app) = app_with_note(34, "z.md", "z");
     let (repository, workspace, git) = {
@@ -1503,6 +1723,11 @@ fn tree_focus_routes_navigation_file_actions_and_escape_through_update() {
         &opened[..],
         [AppEffect::LoadNote { path, .. }] if path == PathBuf::from("folder/child.md").as_path()
     ));
+    app.update(
+        EffectExecutor::default()
+            .execute(opened.into_iter().next().unwrap())
+            .unwrap(),
+    );
 
     for (action, kind) in [
         (TreeAction::NewFile, FileActionKind::NewFile),
@@ -1521,7 +1746,7 @@ fn tree_focus_routes_navigation_file_actions_and_escape_through_update() {
     app.update(AppEvent::Action(AppAction::Tree(TreeAction::Delete)));
     assert!(matches!(
         &app.dialog,
-        Some(Dialog::ConfirmDelete { path }) if path == PathBuf::from("folder/child.md").as_path()
+        Some(Dialog::ConfirmDelete { path, .. }) if path == PathBuf::from("folder/child.md").as_path()
     ));
     app.update(AppEvent::Action(AppAction::Dismiss));
 
@@ -1652,22 +1877,24 @@ fn empty_tree_allows_root_file_and_folder_creation_only() {
     app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
 
     app.update(AppEvent::Action(AppAction::Tree(TreeAction::NewFile)));
-    assert_eq!(
+    assert!(matches!(
         app.dialog,
         Some(Dialog::FileAction {
             kind: FileActionKind::NewFile,
             target: None,
+            ..
         })
-    );
+    ));
     app.update(AppEvent::Action(AppAction::Dismiss));
     app.update(AppEvent::Action(AppAction::Tree(TreeAction::NewFolder)));
-    assert_eq!(
+    assert!(matches!(
         app.dialog,
         Some(Dialog::FileAction {
             kind: FileActionKind::NewFolder,
             target: None,
+            ..
         })
-    );
+    ));
     app.update(AppEvent::Action(AppAction::Dismiss));
 
     for action in [

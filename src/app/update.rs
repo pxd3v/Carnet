@@ -10,8 +10,9 @@ use crate::{
 use super::{
     App, AppEffect, AppExitStatus, CommitStatus, DefaultChoiceState, Dialog, ExternalConflict,
     FailureKind, FileActionKind, FileMutationAction, Focus, MutationId, NavigationAction,
-    OverlayState, PendingIntent, PendingMutation, PendingMutationKind, PendingRequest, PendingSave,
-    RequestId, RuntimeFailure, SavedCommitFailure, Screen, UnresolvedFailure, WorkspaceState,
+    OverlayState, PendingFileMutation, PendingIntent, PendingMutation, PendingMutationKind,
+    PendingRequest, PendingSave, RequestId, RuntimeFailure, SavedCommitFailure, Screen,
+    UnresolvedFailure, WorkspaceOrigin, WorkspaceState,
 };
 use super::{RuntimeError, RuntimeOperation};
 
@@ -702,6 +703,10 @@ impl App {
                 let current_note = note
                     .as_ref()
                     .map(|note| note.path().relative().to_path_buf());
+                let opened_origin = WorkspaceOrigin {
+                    repository_id,
+                    repository_root: workspace.root().to_path_buf(),
+                };
                 let repository = workspace.repo().clone();
                 let tree_selection = (!tree.is_empty()).then_some(0);
                 self.screen = Screen::Workspace(Box::new(WorkspaceState {
@@ -715,6 +720,7 @@ impl App {
                     tree_selection,
                     expanded: Default::default(),
                 }));
+                self.invalidate_workspace_bound_state(&opened_origin);
                 if matches!(
                     self.home.default_choice,
                     DefaultChoiceState::ResumingPendingNote {
@@ -822,6 +828,35 @@ impl App {
             Screen::Home => false,
         };
         pending_matches && workspace_matches
+    }
+
+    fn workspace_origin_matches(&self, origin: &WorkspaceOrigin) -> bool {
+        match &self.screen {
+            Screen::Workspace(workspace) => {
+                workspace.repository.id == origin.repository_id
+                    && workspace.workspace.root() == origin.repository_root
+            }
+            Screen::Home => false,
+        }
+    }
+
+    fn invalidate_workspace_bound_state(&mut self, current: &WorkspaceOrigin) {
+        if matches!(
+            &self.dialog,
+            Some(Dialog::FileAction { origin, .. } | Dialog::ConfirmDelete { origin, .. })
+                if origin != current
+        ) {
+            self.dialog = None;
+        }
+        if matches!(
+            &self.pending_intent,
+            Some(PendingIntent::Mutation(pending)) if pending.origin != *current
+        ) {
+            self.pending_intent = None;
+            if matches!(self.dialog, Some(Dialog::DirtyNavigation)) {
+                self.dialog = None;
+            }
+        }
     }
 
     fn record_request_failure(
@@ -1089,6 +1124,18 @@ impl App {
     }
 
     fn tree_action(&mut self, action: TreeAction) -> Vec<AppEffect> {
+        if self.pending_request.is_some()
+            && matches!(
+                action,
+                TreeAction::NewFile
+                    | TreeAction::NewFolder
+                    | TreeAction::Rename
+                    | TreeAction::Move
+                    | TreeAction::Delete
+            )
+        {
+            return Vec::new();
+        }
         if self.pending_mutation.is_some()
             && matches!(
                 action,
@@ -1101,9 +1148,10 @@ impl App {
         {
             return Vec::new();
         }
-        let (focus, entries, selected) = match &self.screen {
+        let (focus, origin, entries, selected) = match &self.screen {
             Screen::Workspace(workspace) => (
                 workspace.focus,
+                workspace_origin(workspace),
                 visible_tree(&workspace.tree, &workspace.expanded),
                 workspace.tree_selection,
             ),
@@ -1128,7 +1176,11 @@ impl App {
                 _ => None,
             };
             if let Some(kind) = kind {
-                self.dialog = Some(Dialog::FileAction { kind, target: None });
+                self.dialog = Some(Dialog::FileAction {
+                    origin,
+                    kind,
+                    target: None,
+                });
             }
             return Vec::new();
         }
@@ -1191,12 +1243,14 @@ impl App {
                     _ => unreachable!(),
                 };
                 self.dialog = Some(Dialog::FileAction {
+                    origin,
                     kind,
                     target: Some(entries[selected].path.clone()),
                 });
             }
             TreeAction::Delete => {
                 self.dialog = Some(Dialog::ConfirmDelete {
+                    origin,
                     path: entries[selected].path.clone(),
                 });
             }
@@ -1209,9 +1263,17 @@ impl App {
         if self.pending_mutation.is_some() || self.pending_request.is_some() {
             return Vec::new();
         }
-        let Some(Dialog::FileAction { kind, target }) = self.dialog.take() else {
+        let Some(Dialog::FileAction {
+            origin,
+            kind,
+            target,
+        }) = self.dialog.take()
+        else {
             return Vec::new();
         };
+        if !self.workspace_origin_matches(&origin) {
+            return Vec::new();
+        }
         let action = match kind {
             FileActionKind::NewFile => FileMutationAction::CreateFile { path },
             FileActionKind::NewFolder => FileMutationAction::CreateFolder { path },
@@ -1228,21 +1290,30 @@ impl App {
                 FileMutationAction::Move { from, to: path }
             }
         };
-        self.request_file_mutation(action)
+        self.request_file_mutation(PendingFileMutation { origin, action })
     }
 
     fn confirm_delete(&mut self) -> Vec<AppEffect> {
         if self.pending_mutation.is_some() || self.pending_request.is_some() {
             return Vec::new();
         }
-        let Some(Dialog::ConfirmDelete { path }) = self.dialog.take() else {
+        let Some(Dialog::ConfirmDelete { origin, path }) = self.dialog.take() else {
             return Vec::new();
         };
-        self.request_file_mutation(FileMutationAction::Delete { path })
+        if !self.workspace_origin_matches(&origin) {
+            return Vec::new();
+        }
+        self.request_file_mutation(PendingFileMutation {
+            origin,
+            action: FileMutationAction::Delete { path },
+        })
     }
 
-    fn request_file_mutation(&mut self, action: FileMutationAction) -> Vec<AppEffect> {
+    fn request_file_mutation(&mut self, pending: PendingFileMutation) -> Vec<AppEffect> {
         if self.pending_mutation.is_some() || self.pending_request.is_some() {
+            return Vec::new();
+        }
+        if !self.workspace_origin_matches(&pending.origin) {
             return Vec::new();
         }
         let should_guard = match &self.screen {
@@ -1251,25 +1322,29 @@ impl App {
                     .editor
                     .as_ref()
                     .is_some_and(|editor| editor.is_dirty())
-                    && mutation_reconciles_editor(workspace, &action)
+                    && mutation_reconciles_editor(workspace, &pending.action)
             }
             Screen::Home => false,
         };
         if should_guard {
-            self.pending_intent = Some(PendingIntent::Mutation(action));
+            self.pending_intent = Some(PendingIntent::Mutation(pending));
             self.dialog = Some(Dialog::DirtyNavigation);
             return Vec::new();
         }
-        self.start_file_mutation(action)
+        self.start_file_mutation(pending)
     }
 
-    fn start_file_mutation(&mut self, action: FileMutationAction) -> Vec<AppEffect> {
+    fn start_file_mutation(&mut self, pending: PendingFileMutation) -> Vec<AppEffect> {
         if self.pending_mutation.is_some() || self.pending_request.is_some() {
+            return Vec::new();
+        }
+        if !self.workspace_origin_matches(&pending.origin) {
             return Vec::new();
         }
         let Screen::Workspace(workspace) = &self.screen else {
             return Vec::new();
         };
+        let action = pending.action;
         let reconciles_editor = mutation_reconciles_editor(workspace, &action);
         let repository_root = workspace.workspace.root().to_path_buf();
         let effect_workspace = workspace.workspace.clone();
@@ -1429,6 +1504,13 @@ fn mutation_reconciles_editor(workspace: &WorkspaceState, action: &FileMutationA
             .current_note
             .as_deref()
             .is_some_and(|note| note.starts_with(path)),
+    }
+}
+
+fn workspace_origin(workspace: &WorkspaceState) -> WorkspaceOrigin {
+    WorkspaceOrigin {
+        repository_id: workspace.repository.id,
+        repository_root: workspace.workspace.root().to_path_buf(),
     }
 }
 

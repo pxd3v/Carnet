@@ -170,9 +170,21 @@ pub enum FileMutationAction {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceOrigin {
+    pub repository_id: Uuid,
+    pub repository_root: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingFileMutation {
+    pub origin: WorkspaceOrigin,
+    pub action: FileMutationAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PendingIntent {
     Navigation(NavigationAction),
-    Mutation(FileMutationAction),
+    Mutation(PendingFileMutation),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,10 +199,12 @@ pub enum Dialog {
         message: String,
     },
     FileAction {
+        origin: WorkspaceOrigin,
         kind: FileActionKind,
         target: Option<PathBuf>,
     },
     ConfirmDelete {
+        origin: WorkspaceOrigin,
         path: PathBuf,
     },
 }
