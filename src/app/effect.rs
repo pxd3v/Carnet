@@ -40,7 +40,10 @@ pub enum AppEffect {
     UnregisterRepository {
         repository_id: Uuid,
     },
-    ReadClipboard,
+    ReadClipboard {
+        request_id: super::ClipboardRequestId,
+        origin: super::EditorOrigin,
+    },
     WriteClipboard {
         text: String,
     },
@@ -166,7 +169,7 @@ impl EffectExecutor {
             | AppEffect::RegisterRepository { .. }
             | AppEffect::RenameRepository { .. }
             | AppEffect::UnregisterRepository { .. }
-            | AppEffect::ReadClipboard
+            | AppEffect::ReadClipboard { .. }
             | AppEffect::WriteClipboard { .. }) => Err(EffectExecutionError {
                 effect: Box::new(effect),
             }),

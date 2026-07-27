@@ -260,6 +260,8 @@ fn a_failed_commit_keeps_saved_bytes_and_runtime_retry_recovers_clean_exit() {
     assert!(harness.runtime.app().failures.git.is_none());
     assert_eq!(git_subject(&root), "carnet: update note.md");
     harness.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::Quit)));
+    let status = harness.runtime.finalize_quit(Duration::from_secs(1));
+    assert_eq!(status, AppExitStatus::Success);
     assert_eq!(
         harness.runtime.app().quit.final_status,
         Some(AppExitStatus::Success)

@@ -36,6 +36,47 @@ impl MutationId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ClipboardRequestId(pub(crate) u64);
+
+impl ClipboardRequestId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct EditorInstanceId(pub(crate) u64);
+
+impl EditorInstanceId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EditorOrigin {
+    pub repository_id: Uuid,
+    pub repository_root: PathBuf,
+    pub note_path: PathBuf,
+    pub instance_id: EditorInstanceId,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingClipboardRead {
+    pub request_id: ClipboardRequestId,
+    pub origin: EditorOrigin,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PendingRequest {
     OpenWorkspace {
@@ -79,6 +120,8 @@ pub struct WorkspaceState {
     pub tree: Vec<TreeEntry>,
     pub current_note: Option<PathBuf>,
     pub editor: Option<Editor>,
+    pub editor_instance_id: Option<EditorInstanceId>,
+    pub editor_revision: u64,
     pub focus: Focus,
     pub tree_selection: Option<usize>,
     pub expanded: BTreeSet<PathBuf>,
@@ -371,6 +414,7 @@ pub struct RuntimeFailure {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FailureState {
     pub runtime: Vec<RuntimeFailure>,
+    pub runtime_driver: Option<UnresolvedFailure>,
     pub write: Option<UnresolvedFailure>,
     pub git: Option<UnresolvedFailure>,
     pub clipboard: Option<UnresolvedFailure>,
@@ -380,6 +424,7 @@ pub struct FailureState {
 impl FailureState {
     pub fn is_empty(&self) -> bool {
         self.runtime.is_empty()
+            && self.runtime_driver.is_none()
             && self.write.is_none()
             && self.git.is_none()
             && self.clipboard.is_none()
@@ -403,6 +448,7 @@ pub struct App {
     pub pending_intent: Option<PendingIntent>,
     pub pending_request: Option<PendingRequest>,
     pub pending_catalog: Option<PendingCatalogOperation>,
+    pub pending_clipboard_read: Option<PendingClipboardRead>,
     pub dialog: Option<Dialog>,
     pub dialog_input: String,
     pub repository_form: RepositoryFormState,
@@ -413,6 +459,8 @@ pub struct App {
     pub(crate) next_request_id: u64,
     pub(crate) next_mutation_id: u64,
     pub(crate) next_save_generation: u64,
+    pub(crate) next_clipboard_request_id: u64,
+    pub(crate) next_editor_instance_id: u64,
 }
 
 impl App {
@@ -440,6 +488,7 @@ impl App {
             pending_intent: None,
             pending_request: None,
             pending_catalog: None,
+            pending_clipboard_read: None,
             dialog: None,
             dialog_input: String::new(),
             repository_form: RepositoryFormState::default(),
@@ -450,6 +499,8 @@ impl App {
             next_request_id: 1,
             next_mutation_id: 1,
             next_save_generation: 1,
+            next_clipboard_request_id: 1,
+            next_editor_instance_id: 1,
             home: HomeState {
                 repositories,
                 repository_availability,

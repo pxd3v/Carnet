@@ -7,13 +7,14 @@ use crate::{
 };
 
 use super::{
-    App, AppEffect, AppExitStatus, CatalogSnapshot, CommitStatus, DefaultChoiceState, Dialog,
-    ExternalConflict, FailureKind, FileActionKind, FileMutationAction, Focus, MutationId,
-    NavigationAction, OverlayState, PendingCatalogOperation, PendingDefaultIntent,
-    PendingFileMutation, PendingIntent, PendingMutation, PendingMutationKind, PendingRequest,
-    PendingSave, RepositoryActionKind, RepositoryAvailability, RepositoryFormField,
-    RepositoryFormState, RequestId, RuntimeFailure, SavedCommitFailure, Screen, UnresolvedFailure,
-    WorkspaceOrigin, WorkspaceState,
+    App, AppEffect, AppExitStatus, CatalogSnapshot, ClipboardRequestId, CommitStatus,
+    DefaultChoiceState, Dialog, EditorInstanceId, EditorOrigin, ExternalConflict, FailureKind,
+    FileActionKind, FileMutationAction, Focus, MutationId, NavigationAction, OverlayState,
+    PendingCatalogOperation, PendingClipboardRead, PendingDefaultIntent, PendingFileMutation,
+    PendingIntent, PendingMutation, PendingMutationKind, PendingRequest, PendingSave,
+    RepositoryActionKind, RepositoryAvailability, RepositoryFormField, RepositoryFormState,
+    RequestId, RuntimeFailure, SavedCommitFailure, Screen, UnresolvedFailure, WorkspaceOrigin,
+    WorkspaceState,
 };
 use super::{RuntimeError, RuntimeOperation};
 
@@ -99,12 +100,20 @@ pub enum AppAction {
 #[derive(Debug)]
 pub enum AppEvent {
     Action(AppAction),
-    ClipboardRead(Result<String, ClipboardError>),
+    ClipboardRead {
+        request_id: ClipboardRequestId,
+        origin: EditorOrigin,
+        result: Result<String, ClipboardError>,
+    },
     ClipboardWritten(Result<(), ClipboardError>),
     RepositoryCatalogChanged(CatalogSnapshot),
     RepositoryCatalogFailed {
         message: String,
     },
+    RuntimeFinalizationFailed {
+        message: String,
+    },
+    QuitFinalized,
     DirtyChoice(DirtyChoice),
     ConflictChoice(ConflictChoice),
     MutationApplied {
@@ -259,6 +268,29 @@ impl App {
                 self.record_outer_failure(FailureKind::Runtime, message, false);
                 Vec::new()
             }
+            AppEvent::RuntimeFinalizationFailed { message } => {
+                let failure = UnresolvedFailure {
+                    kind: FailureKind::Runtime,
+                    message: message.clone(),
+                };
+                self.failures.runtime_driver = Some(failure);
+                self.status.message = Some(message.clone());
+                self.dialog = Some(Dialog::Failure {
+                    kind: FailureKind::Runtime,
+                    message,
+                });
+                Vec::new()
+            }
+            AppEvent::QuitFinalized => {
+                if self.quit.requested && self.quit.final_status.is_none() {
+                    self.quit.final_status = Some(if self.failures.is_empty() {
+                        AppExitStatus::Success
+                    } else {
+                        AppExitStatus::Failure
+                    });
+                }
+                Vec::new()
+            }
             AppEvent::ClipboardWritten(Ok(())) => {
                 self.failures.clipboard = None;
                 Vec::new()
@@ -364,14 +396,13 @@ impl App {
                 self.confirm_repository_action()
             }
             AppEvent::Action(AppAction::SetOverlayQuery(query)) => {
+                let mut editor_query = None;
                 match &mut self.overlay {
                     OverlayState::Search {
                         query: current_query,
                     } => {
                         *current_query = query.clone();
-                        if let Some(editor) = self.workspace_editor_mut() {
-                            editor.apply(EditorCommand::SetFindQuery(query));
-                        }
+                        editor_query = Some(query);
                     }
                     OverlayState::QuickOpen {
                         query: current_query,
@@ -382,6 +413,9 @@ impl App {
                         *selected = (matches > 0).then_some(0);
                     }
                     OverlayState::None => {}
+                }
+                if let Some(query) = editor_query {
+                    self.apply_editor_command(EditorCommand::SetFindQuery(query));
                 }
                 Vec::new()
             }
@@ -589,6 +623,7 @@ impl App {
                 ) {
                     return Vec::new();
                 }
+                let editor_instance_id = self.next_editor_instance_id();
                 let Screen::Workspace(workspace) = &mut self.screen else {
                     return Vec::new();
                 };
@@ -597,6 +632,9 @@ impl App {
                 }
                 workspace.current_note = Some(note.path().relative().to_path_buf());
                 workspace.editor = Some(Editor::from_loaded(note));
+                workspace.editor_instance_id = Some(editor_instance_id);
+                workspace.editor_revision = 0;
+                self.pending_clipboard_read = None;
                 self.pending_request = None;
                 self.clear_runtime_failures(repository_id, RuntimeOperation::LoadNote);
                 Vec::new()
@@ -696,6 +734,8 @@ impl App {
                             {
                                 workspace.current_note = None;
                                 workspace.editor = None;
+                                workspace.editor_instance_id = None;
+                                workspace.editor_revision = 0;
                             }
                             clamp_tree_selection(workspace);
                         }
@@ -764,6 +804,7 @@ impl App {
                 Vec::new()
             }
             AppEvent::Action(AppAction::Navigate(target)) => {
+                self.pending_clipboard_read = None;
                 if self.pending_mutation.is_some()
                     || matches!(self.pending_intent, Some(PendingIntent::Mutation(_)))
                 {
@@ -781,14 +822,28 @@ impl App {
                 }
             }
             AppEvent::Action(AppAction::Global(GlobalAction::Save)) => self.global_save(),
-            AppEvent::ClipboardRead(Ok(text)) => {
-                self.failures.clipboard = None;
-                if let Some(editor) = self.workspace_editor_mut() {
-                    editor.apply(EditorCommand::BracketedPaste(text));
+            AppEvent::ClipboardRead {
+                request_id,
+                origin,
+                result: Ok(text),
+            } => {
+                if !self.clipboard_read_is_current(request_id, &origin) {
+                    return Vec::new();
                 }
+                self.pending_clipboard_read = None;
+                self.failures.clipboard = None;
+                self.apply_editor_command(EditorCommand::BracketedPaste(text));
                 Vec::new()
             }
-            AppEvent::ClipboardRead(Err(error)) => {
+            AppEvent::ClipboardRead {
+                request_id,
+                origin,
+                result: Err(error),
+            } => {
+                if !self.clipboard_read_is_current(request_id, &origin) {
+                    return Vec::new();
+                }
+                self.pending_clipboard_read = None;
                 self.record_outer_failure(FailureKind::Runtime, error.to_string(), true);
                 Vec::new()
             }
@@ -802,35 +857,30 @@ impl App {
                 self.update(AppEvent::Action(AppAction::Global(GlobalAction::Paste)))
             }
             AppEvent::Action(AppAction::Editor(command)) => {
-                if let Some(editor) = self.workspace_editor_mut() {
-                    editor.apply(command);
-                }
+                self.apply_editor_command(command);
                 Vec::new()
             }
             AppEvent::Action(AppAction::Global(GlobalAction::Undo)) => {
-                if let Some(editor) = self.workspace_editor_mut() {
-                    editor.apply(EditorCommand::Undo);
-                }
+                self.apply_editor_command(EditorCommand::Undo);
                 Vec::new()
             }
             AppEvent::Action(AppAction::Global(GlobalAction::Redo)) => {
-                if let Some(editor) = self.workspace_editor_mut() {
-                    editor.apply(EditorCommand::Redo);
-                }
+                self.apply_editor_command(EditorCommand::Redo);
                 Vec::new()
             }
             AppEvent::Action(AppAction::Global(GlobalAction::SelectAll)) => {
-                if let Some(editor) = self.workspace_editor_mut() {
-                    editor.apply(EditorCommand::SelectAll);
-                }
+                self.apply_editor_command(EditorCommand::SelectAll);
                 Vec::new()
             }
-            AppEvent::Action(AppAction::Global(GlobalAction::Copy)) => self
-                .workspace_editor_mut()
-                .and_then(|editor| editor.selected_text())
-                .map(|text| vec![AppEffect::WriteClipboard { text }])
-                .unwrap_or_default(),
+            AppEvent::Action(AppAction::Global(GlobalAction::Copy)) => {
+                self.invalidate_clipboard_read_for_editor_action();
+                self.workspace_editor_mut()
+                    .and_then(|editor| editor.selected_text())
+                    .map(|text| vec![AppEffect::WriteClipboard { text }])
+                    .unwrap_or_default()
+            }
             AppEvent::Action(AppAction::Global(GlobalAction::Cut)) => {
+                self.invalidate_clipboard_read_for_editor_action();
                 let Some(editor) = self.workspace_editor_mut() else {
                     return Vec::new();
                 };
@@ -841,10 +891,15 @@ impl App {
                 vec![AppEffect::WriteClipboard { text }]
             }
             AppEvent::Action(AppAction::Global(GlobalAction::Paste)) => {
-                (self.workspace_editor_mut().is_some())
-                    .then_some(AppEffect::ReadClipboard)
-                    .into_iter()
-                    .collect()
+                let Some(origin) = self.current_editor_origin() else {
+                    return Vec::new();
+                };
+                let request_id = self.next_clipboard_request_id();
+                self.pending_clipboard_read = Some(PendingClipboardRead {
+                    request_id,
+                    origin: origin.clone(),
+                });
+                vec![AppEffect::ReadClipboard { request_id, origin }]
             }
             AppEvent::Action(AppAction::Global(GlobalAction::Find)) => {
                 self.overlay = OverlayState::Search {
@@ -923,6 +978,7 @@ impl App {
                 let current_note = note
                     .as_ref()
                     .map(|note| note.path().relative().to_path_buf());
+                let editor_instance_id = note.as_ref().map(|_| self.next_editor_instance_id());
                 let opened_origin = WorkspaceOrigin {
                     repository_id,
                     repository_root: workspace.root().to_path_buf(),
@@ -936,6 +992,8 @@ impl App {
                     tree,
                     current_note,
                     editor: note.map(Editor::from_loaded),
+                    editor_instance_id,
+                    editor_revision: 0,
                     focus: Focus::Editor,
                     tree_selection,
                     expanded: Default::default(),
@@ -1219,6 +1277,51 @@ impl App {
         workspace.editor.as_mut()
     }
 
+    fn current_editor_origin(&self) -> Option<EditorOrigin> {
+        let Screen::Workspace(workspace) = &self.screen else {
+            return None;
+        };
+        workspace.editor.as_ref()?;
+        Some(EditorOrigin {
+            repository_id: workspace.repository.id,
+            repository_root: workspace.workspace.root().to_path_buf(),
+            note_path: workspace.current_note.clone()?,
+            instance_id: workspace.editor_instance_id?,
+            revision: workspace.editor_revision,
+        })
+    }
+
+    fn clipboard_read_is_current(
+        &self,
+        request_id: ClipboardRequestId,
+        origin: &EditorOrigin,
+    ) -> bool {
+        self.pending_clipboard_read.as_ref().is_some_and(|pending| {
+            pending.request_id == request_id
+                && pending.origin == *origin
+                && self.current_editor_origin().as_ref() == Some(origin)
+        })
+    }
+
+    fn invalidate_clipboard_read_for_editor_action(&mut self) {
+        self.pending_clipboard_read = None;
+        if let Screen::Workspace(workspace) = &mut self.screen
+            && workspace.editor.is_some()
+        {
+            workspace.editor_revision = workspace
+                .editor_revision
+                .checked_add(1)
+                .expect("editor revision overflow");
+        }
+    }
+
+    fn apply_editor_command(&mut self, command: EditorCommand) {
+        self.invalidate_clipboard_read_for_editor_action();
+        if let Some(editor) = self.workspace_editor_mut() {
+            editor.apply(command);
+        }
+    }
+
     fn editor_commands_suppressed(&self) -> bool {
         self.pending_request.is_some()
             || self
@@ -1452,6 +1555,7 @@ impl App {
     }
 
     fn discard_editor_changes(&mut self) {
+        self.invalidate_clipboard_read_for_editor_action();
         if let Some(editor) = self.workspace_editor_mut() {
             editor.discard_changes();
         }
@@ -1460,6 +1564,7 @@ impl App {
     fn perform_navigation(&mut self, target: NavigationAction) -> Vec<AppEffect> {
         match target {
             NavigationAction::Home => {
+                self.pending_clipboard_read = None;
                 self.screen = Screen::Home;
                 self.overlay = OverlayState::None;
                 self.dialog = None;
@@ -1472,11 +1577,7 @@ impl App {
             NavigationAction::Note(path) => self.request_note_load(path),
             NavigationAction::Quit => {
                 self.quit.requested = true;
-                self.quit.final_status = Some(if !self.failures.is_empty() {
-                    AppExitStatus::Failure
-                } else {
-                    AppExitStatus::Success
-                });
+                self.quit.final_status = None;
                 Vec::new()
             }
         }
@@ -1500,6 +1601,24 @@ impl App {
         mutation_id
     }
 
+    fn next_clipboard_request_id(&mut self) -> ClipboardRequestId {
+        let request_id = ClipboardRequestId(self.next_clipboard_request_id);
+        self.next_clipboard_request_id = self
+            .next_clipboard_request_id
+            .checked_add(1)
+            .expect("clipboard request ID overflow");
+        request_id
+    }
+
+    fn next_editor_instance_id(&mut self) -> EditorInstanceId {
+        let instance_id = EditorInstanceId(self.next_editor_instance_id);
+        self.next_editor_instance_id = self
+            .next_editor_instance_id
+            .checked_add(1)
+            .expect("editor instance ID overflow");
+        instance_id
+    }
+
     fn request_open_workspace(
         &mut self,
         repository: crate::catalog::RepoEntry,
@@ -1510,6 +1629,7 @@ impl App {
         {
             return Vec::new();
         }
+        self.pending_clipboard_read = None;
         let request_id = self.next_request_id();
         self.pending_request = Some(PendingRequest::OpenWorkspace {
             request_id,
@@ -1524,6 +1644,7 @@ impl App {
     }
 
     fn request_note_load(&mut self, path: std::path::PathBuf) -> Vec<AppEffect> {
+        self.pending_clipboard_read = None;
         let (repository_id, workspace) = match &self.screen {
             Screen::Workspace(workspace) => (workspace.repository.id, workspace.workspace.clone()),
             Screen::Home => return Vec::new(),
@@ -1955,6 +2076,6 @@ fn is_editor_command_event(event: &AppEvent) -> bool {
                     | GlobalAction::Paste
                     | GlobalAction::SelectAll
             ))
-            | AppEvent::ClipboardRead(Ok(_))
+            | AppEvent::ClipboardRead { result: Ok(_), .. }
     )
 }

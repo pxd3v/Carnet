@@ -1254,6 +1254,8 @@ fn global_quit_is_immediate_when_clean_and_uses_the_dirty_prompt_when_changed() 
             .is_empty()
     );
     assert!(clean.quit.requested);
+    assert_eq!(clean.quit.final_status, None);
+    clean.update(AppEvent::QuitFinalized);
     assert_eq!(clean.quit.final_status, Some(AppExitStatus::Success));
 
     let (_dirty_sandbox, mut dirty) = app_with_note(27, "note.md", "base");
@@ -1270,6 +1272,8 @@ fn global_quit_is_immediate_when_clean_and_uses_the_dirty_prompt_when_changed() 
 
     dirty.update(AppEvent::DirtyChoice(DirtyChoice::Discard));
     assert!(dirty.quit.requested);
+    assert_eq!(dirty.quit.final_status, None);
+    dirty.update(AppEvent::QuitFinalized);
     assert_eq!(dirty.quit.final_status, Some(AppExitStatus::Success));
 }
 
@@ -1527,6 +1531,8 @@ fn git_recovery_clears_only_git_failure_and_unrelated_failure_keeps_exit_one() {
     assert_eq!(app.failures.git, None);
     assert!(app.failures.clipboard.is_some());
     app.update(AppEvent::Action(AppAction::Global(GlobalAction::Quit)));
+    assert_eq!(app.quit.final_status, None);
+    app.update(AppEvent::QuitFinalized);
     assert_eq!(app.quit.final_status, Some(AppExitStatus::Failure));
 }
 
@@ -1634,6 +1640,8 @@ fn failed_save_stays_on_the_dirty_note_and_marks_a_failure_exit() {
         }),
     });
     app.update(AppEvent::DirtyChoice(DirtyChoice::Discard));
+    assert_eq!(app.quit.final_status, None);
+    app.update(AppEvent::QuitFinalized);
     assert_eq!(app.quit.final_status, Some(AppExitStatus::Failure));
 }
 
@@ -2274,10 +2282,194 @@ fn global_editor_shortcuts_are_pure_and_clipboard_work_is_effect_driven() {
     assert_eq!(workspace_editor(&app).text(), "");
 
     let paste = app.update(AppEvent::Action(AppAction::Global(GlobalAction::Paste)));
-    assert!(matches!(&paste[..], [AppEffect::ReadClipboard]));
+    let [AppEffect::ReadClipboard { request_id, origin }] = &paste[..] else {
+        panic!("paste did not emit one identified clipboard read");
+    };
+    let request_id = *request_id;
+    let origin = origin.clone();
     assert_eq!(workspace_editor(&app).text(), "");
-    app.update(AppEvent::ClipboardRead(Ok("pasted".into())));
+    app.update(AppEvent::ClipboardRead {
+        request_id,
+        origin,
+        result: Ok("pasted".into()),
+    });
     assert_eq!(workspace_editor(&app).text(), "pasted");
+}
+
+#[test]
+fn clipboard_read_requires_the_unchanged_editor_origin_and_applies_only_once() {
+    use carnet::app::GlobalAction;
+
+    let (_sandbox, mut app) = app_with_note(95, "note.md", "base");
+    let effect = app.update(AppEvent::Action(AppAction::Global(GlobalAction::Paste)));
+    let [AppEffect::ReadClipboard { request_id, origin }] = &effect[..] else {
+        panic!("paste did not emit one identified clipboard read");
+    };
+    let completion = AppEvent::ClipboardRead {
+        request_id: *request_id,
+        origin: origin.clone(),
+        result: Ok("once ".into()),
+    };
+
+    app.update(completion);
+    assert_eq!(workspace_editor(&app).text(), "once base");
+    assert!(app.pending_clipboard_read.is_none());
+}
+
+#[test]
+fn clipboard_read_is_invalidated_by_navigation_or_editor_revision_changes() {
+    use carnet::{
+        app::{GlobalAction, NavigationAction},
+        editor::Motion,
+    };
+
+    let (_sandbox, mut navigation_app) = app_with_note(96, "note.md", "base");
+    let effect = navigation_app.update(AppEvent::Action(AppAction::Global(GlobalAction::Paste)));
+    let [AppEffect::ReadClipboard { request_id, origin }] = &effect[..] else {
+        panic!("paste did not emit one identified clipboard read");
+    };
+    let request_id = *request_id;
+    let origin = origin.clone();
+    navigation_app.update(AppEvent::Action(AppAction::Navigate(
+        NavigationAction::Note(PathBuf::from("other.md")),
+    )));
+    navigation_app.update(AppEvent::ClipboardRead {
+        request_id,
+        origin,
+        result: Ok("stale ".into()),
+    });
+    assert_eq!(workspace_editor(&navigation_app).text(), "base");
+    assert!(navigation_app.pending_clipboard_read.is_none());
+
+    let (_sandbox, mut editor_app) = app_with_note(97, "note.md", "base");
+    let effect = editor_app.update(AppEvent::Action(AppAction::Global(GlobalAction::Paste)));
+    let [AppEffect::ReadClipboard { request_id, origin }] = &effect[..] else {
+        panic!("paste did not emit one identified clipboard read");
+    };
+    let request_id = *request_id;
+    let origin = origin.clone();
+    editor_app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Move {
+        motion: Motion::Right,
+        extend_selection: false,
+    })));
+    editor_app.update(AppEvent::ClipboardRead {
+        request_id,
+        origin,
+        result: Ok("stale ".into()),
+    });
+    assert_eq!(workspace_editor(&editor_app).text(), "base");
+    assert!(editor_app.pending_clipboard_read.is_none());
+}
+
+#[test]
+fn newest_clipboard_read_wins_without_a_stale_completion_clearing_it() {
+    use carnet::app::GlobalAction;
+
+    let (_sandbox, mut app) = app_with_note(98, "note.md", "base");
+    let first = app.update(AppEvent::Action(AppAction::Global(GlobalAction::Paste)));
+    let [
+        AppEffect::ReadClipboard {
+            request_id: first_id,
+            origin: first_origin,
+        },
+    ] = &first[..]
+    else {
+        panic!("first paste did not emit one identified clipboard read");
+    };
+    let first_id = *first_id;
+    let first_origin = first_origin.clone();
+    let second = app.update(AppEvent::Action(AppAction::Global(GlobalAction::Paste)));
+    let [
+        AppEffect::ReadClipboard {
+            request_id: second_id,
+            origin: second_origin,
+        },
+    ] = &second[..]
+    else {
+        panic!("second paste did not emit one identified clipboard read");
+    };
+    let second_id = *second_id;
+    let second_origin = second_origin.clone();
+    assert_ne!(first_id, second_id);
+
+    app.update(AppEvent::ClipboardRead {
+        request_id: first_id,
+        origin: first_origin,
+        result: Ok("first ".into()),
+    });
+    assert_eq!(workspace_editor(&app).text(), "base");
+    assert_eq!(
+        app.pending_clipboard_read
+            .as_ref()
+            .map(|pending| pending.request_id),
+        Some(second_id)
+    );
+
+    app.update(AppEvent::ClipboardRead {
+        request_id: second_id,
+        origin: second_origin,
+        result: Ok("second ".into()),
+    });
+    assert_eq!(workspace_editor(&app).text(), "second base");
+    assert!(app.pending_clipboard_read.is_none());
+}
+
+#[test]
+fn quit_navigation_invalidates_a_pending_clipboard_read() {
+    use carnet::app::GlobalAction;
+
+    let (_sandbox, mut app) = app_with_note(99, "note.md", "base");
+    let effect = app.update(AppEvent::Action(AppAction::Global(GlobalAction::Paste)));
+    assert!(matches!(
+        effect.as_slice(),
+        [AppEffect::ReadClipboard { .. }]
+    ));
+    assert!(app.pending_clipboard_read.is_some());
+
+    app.update(AppEvent::Action(AppAction::Global(GlobalAction::Quit)));
+
+    assert!(app.quit.requested);
+    assert!(app.pending_clipboard_read.is_none());
+}
+
+#[test]
+fn find_editor_action_invalidates_a_pending_clipboard_read() {
+    use carnet::app::GlobalAction;
+
+    let (_sandbox, mut app) = app_with_note(100, "note.md", "base");
+    app.update(AppEvent::Action(AppAction::Global(GlobalAction::Paste)));
+    assert!(app.pending_clipboard_read.is_some());
+    app.update(AppEvent::Action(AppAction::Global(GlobalAction::Find)));
+
+    app.update(AppEvent::Action(AppAction::SetOverlayQuery("base".into())));
+
+    assert!(app.pending_clipboard_read.is_none());
+}
+
+#[test]
+fn discarding_editor_changes_invalidates_a_pending_clipboard_read() {
+    use carnet::app::{DirtyChoice, GlobalAction};
+
+    let (_sandbox, mut app) = app_with_note(101, "note.md", "base");
+    app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "mine ".into(),
+    ))));
+    let effect = app.update(AppEvent::Action(AppAction::Global(GlobalAction::Paste)));
+    let [AppEffect::ReadClipboard { request_id, origin }] = &effect[..] else {
+        panic!("paste did not emit one identified clipboard read");
+    };
+    let request_id = *request_id;
+    let origin = origin.clone();
+
+    app.update(AppEvent::DirtyChoice(DirtyChoice::Discard));
+    app.update(AppEvent::ClipboardRead {
+        request_id,
+        origin,
+        result: Ok("stale ".into()),
+    });
+
+    assert_eq!(workspace_editor(&app).text(), "base");
+    assert!(app.pending_clipboard_read.is_none());
 }
 
 #[test]

@@ -10,16 +10,16 @@ use std::{
 };
 
 use carnet::{
-    app::{AppAction, AppEvent, AppExitStatus, GlobalAction, HomeAction, Screen},
+    app::{AppAction, AppEvent, AppExitStatus, GlobalAction, HomeAction, NavigationAction, Screen},
     catalog::{Catalog, CatalogError},
     cli::{Cli, route},
-    editor::{Clipboard, ClipboardError, EditorCommand},
+    editor::{Clipboard, ClipboardError, EditorCommand, Motion},
     git::GitRepo,
     runtime::{Runtime, WorkerHook, WorkerKind},
     ui::{map_key, render},
 };
 use clap::Parser;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
 use tempfile::tempdir;
 
@@ -162,6 +162,105 @@ fn editor_and_render_continue_while_clipboard_worker_is_blocked() {
 }
 
 #[test]
+fn blocked_clipboard_read_does_not_paste_after_note_navigation() {
+    let sandbox = tempdir().unwrap();
+    let root = sandbox.path().join("notes");
+    GitRepo::initialize(&root).unwrap();
+    fs::write(root.join("a.md"), "A").unwrap();
+    fs::write(root.join("b.md"), "B").unwrap();
+    let mut catalog = Catalog::create_at(sandbox.path().join("catalog.toml"));
+    catalog.register("notes", &root).unwrap();
+    let launch = route(Cli::try_parse_from(["carnet", "a.md"]).unwrap(), &catalog).unwrap();
+    let (hook, entered, release) = BlockingHook::new(WorkerKind::ClipboardRead);
+    let mut runtime = Runtime::with_clipboard_and_hook(
+        catalog,
+        launch,
+        Box::new(FixedClipboard::new("stale ")),
+        hook,
+    );
+    runtime.wait_for_idle(Duration::from_secs(3)).unwrap();
+
+    runtime.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::Paste)));
+    entered.recv_timeout(Duration::from_secs(1)).unwrap();
+    runtime.dispatch(AppEvent::Action(AppAction::Navigate(
+        NavigationAction::Note("b.md".into()),
+    )));
+    release.send(()).unwrap();
+    runtime.wait_for_idle(Duration::from_secs(3)).unwrap();
+
+    assert_eq!(editor_text(&runtime), "B");
+}
+
+#[test]
+fn blocked_clipboard_read_does_not_paste_after_cursor_moves() {
+    let sandbox = tempdir().unwrap();
+    let (catalog, launch) = launched_note(&sandbox, "note.md", "base");
+    let (hook, entered, release) = BlockingHook::new(WorkerKind::ClipboardRead);
+    let mut runtime = Runtime::with_clipboard_and_hook(
+        catalog,
+        launch,
+        Box::new(FixedClipboard::new("stale ")),
+        hook,
+    );
+    runtime.wait_for_idle(Duration::from_secs(3)).unwrap();
+
+    runtime.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::Paste)));
+    entered.recv_timeout(Duration::from_secs(1)).unwrap();
+    runtime.dispatch(AppEvent::Action(AppAction::Editor(EditorCommand::Move {
+        motion: Motion::Right,
+        extend_selection: false,
+    })));
+    release.send(()).unwrap();
+    runtime.wait_for_idle(Duration::from_secs(3)).unwrap();
+
+    assert_eq!(editor_text(&runtime), "base");
+}
+
+#[test]
+fn blocked_clipboard_read_pastes_once_when_editor_origin_is_unchanged() {
+    let sandbox = tempdir().unwrap();
+    let (catalog, launch) = launched_note(&sandbox, "note.md", "base");
+    let (hook, entered, release) = BlockingHook::new(WorkerKind::ClipboardRead);
+    let mut runtime = Runtime::with_clipboard_and_hook(
+        catalog,
+        launch,
+        Box::new(FixedClipboard::new("once ")),
+        hook,
+    );
+    runtime.wait_for_idle(Duration::from_secs(3)).unwrap();
+
+    runtime.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::Paste)));
+    entered.recv_timeout(Duration::from_secs(1)).unwrap();
+    release.send(()).unwrap();
+    runtime.wait_for_idle(Duration::from_secs(3)).unwrap();
+
+    assert_eq!(editor_text(&runtime), "once base");
+}
+
+#[test]
+fn stale_first_clipboard_read_cannot_clear_or_apply_over_the_second() {
+    let sandbox = tempdir().unwrap();
+    let (catalog, launch) = launched_note(&sandbox, "note.md", "base");
+    let (hook, entered, release) = BlockingHook::new(WorkerKind::ClipboardRead);
+    let mut runtime = Runtime::with_clipboard_and_hook(
+        catalog,
+        launch,
+        Box::new(FixedClipboard::new("once ")),
+        hook,
+    );
+    runtime.wait_for_idle(Duration::from_secs(3)).unwrap();
+
+    runtime.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::Paste)));
+    entered.recv_timeout(Duration::from_secs(1)).unwrap();
+    runtime.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::Paste)));
+    release.send(()).unwrap();
+    runtime.wait_for_idle(Duration::from_secs(3)).unwrap();
+
+    assert_eq!(editor_text(&runtime), "once base");
+    assert!(runtime.app().pending_clipboard_read.is_none());
+}
+
+#[test]
 fn panicking_open_worker_clears_pending_and_produces_failure_exit() {
     let sandbox = tempdir().unwrap();
     let root = sandbox.path().join("notes");
@@ -185,10 +284,120 @@ fn panicking_open_worker_clears_pending_and_produces_failure_exit() {
     assert!(runtime.app().pending_request.is_none());
     assert!(!runtime.app().failures.runtime.is_empty());
     runtime.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::Quit)));
+    let status = runtime.finalize_quit(Duration::from_secs(1));
+    assert_eq!(status, AppExitStatus::Failure);
     assert_eq!(
         runtime.app().quit.final_status,
         Some(AppExitStatus::Failure)
     );
+}
+
+#[test]
+fn ctrl_q_drains_a_racing_worker_panic_before_deriving_failure() {
+    let sandbox = tempdir().unwrap();
+    let (catalog, launch) = launched_note(&sandbox, "note.md", "base");
+    let (hook, entered, release) = BlockingThenPanicHook::new(WorkerKind::OpenWorkspace);
+    let mut runtime =
+        Runtime::with_clipboard_and_hook(catalog, launch, Box::new(FailingClipboard), hook);
+    entered.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    let ctrl_q = map_key(
+        runtime.app(),
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+    )
+    .unwrap();
+    runtime.dispatch(ctrl_q);
+    assert!(runtime.app().quit.requested);
+    assert_eq!(runtime.app().quit.final_status, None);
+    release.send(()).unwrap();
+
+    assert_eq!(
+        runtime.finalize_quit(Duration::from_secs(1)),
+        AppExitStatus::Failure
+    );
+    assert!(!runtime.app().failures.runtime.is_empty());
+}
+
+#[test]
+fn ctrl_q_reports_a_panicking_clipboard_read_even_after_origin_invalidation() {
+    let sandbox = tempdir().unwrap();
+    let (catalog, launch) = launched_note(&sandbox, "note.md", "base");
+    let (hook, entered, release) = BlockingThenPanicHook::new(WorkerKind::ClipboardRead);
+    let mut runtime = Runtime::with_clipboard_and_hook(
+        catalog,
+        launch,
+        Box::new(FixedClipboard::new("unused")),
+        hook,
+    );
+    runtime.wait_for_idle(Duration::from_secs(1)).unwrap();
+    runtime.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::Paste)));
+    entered.recv_timeout(Duration::from_secs(1)).unwrap();
+    runtime.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::Quit)));
+    assert!(runtime.app().pending_clipboard_read.is_none());
+    release.send(()).unwrap();
+    runtime.wait_for_idle(Duration::from_secs(1)).unwrap();
+
+    assert_eq!(
+        runtime.finalize_quit(Duration::from_secs(1)),
+        AppExitStatus::Failure
+    );
+    assert!(runtime.app().failures.runtime_driver.is_some());
+}
+
+#[test]
+fn blocked_worker_times_out_and_runtime_drop_stays_bounded() {
+    let sandbox = tempdir().unwrap();
+    let (catalog, launch) = launched_note(&sandbox, "note.md", "base");
+    let (hook, entered) = StuckHook::new(WorkerKind::OpenWorkspace);
+    let mut runtime =
+        Runtime::with_clipboard_and_hook(catalog, launch, Box::new(FailingClipboard), hook);
+    entered.recv_timeout(Duration::from_secs(1)).unwrap();
+    runtime.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::Quit)));
+
+    let started = Instant::now();
+    let status = runtime.finalize_quit(Duration::from_millis(40));
+    assert!(runtime.app().failures.runtime_driver.is_some());
+    drop(runtime);
+
+    assert_eq!(status, AppExitStatus::Failure);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "bounded finalization and drop took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn clean_in_flight_completion_is_applied_before_quit_success() {
+    let sandbox = tempdir().unwrap();
+    let (catalog, launch) = launched_note(&sandbox, "note.md", "base");
+    let (hook, entered, release) = BlockingHook::new(WorkerKind::OpenWorkspace);
+    let mut runtime =
+        Runtime::with_clipboard_and_hook(catalog, launch, Box::new(FailingClipboard), hook);
+    entered.recv_timeout(Duration::from_secs(1)).unwrap();
+    runtime.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::Quit)));
+    release.send(()).unwrap();
+
+    assert_eq!(
+        runtime.finalize_quit(Duration::from_secs(1)),
+        AppExitStatus::Success
+    );
+    assert_eq!(editor_text(&runtime), "base");
+}
+
+#[test]
+fn quit_with_no_active_work_finalizes_immediately_and_cleanly() {
+    let sandbox = tempdir().unwrap();
+    let catalog = Catalog::create_at(sandbox.path().join("catalog.toml"));
+    let launch = route(Cli::try_parse_from(["carnet"]).unwrap(), &catalog).unwrap();
+    let mut runtime = Runtime::with_clipboard(catalog, launch, Box::new(FailingClipboard));
+    runtime.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::Quit)));
+
+    let started = Instant::now();
+    let status = runtime.finalize_quit(Duration::from_secs(1));
+
+    assert_eq!(status, AppExitStatus::Success);
+    assert!(started.elapsed() < Duration::from_millis(200));
 }
 
 #[test]
@@ -318,6 +527,24 @@ fn catalog_without_default(config: &Path, sandbox: &Path, chosen: &Path) -> Cata
     catalog
 }
 
+fn launched_note(
+    sandbox: &tempfile::TempDir,
+    note_path: &str,
+    text: &str,
+) -> (Catalog, carnet::cli::Launch) {
+    let root = sandbox.path().join("notes");
+    GitRepo::initialize(&root).unwrap();
+    fs::write(root.join(note_path), text).unwrap();
+    let mut catalog = Catalog::create_at(sandbox.path().join("catalog.toml"));
+    catalog.register("notes", &root).unwrap();
+    let launch = route(
+        Cli::try_parse_from(["carnet", note_path]).unwrap(),
+        &catalog,
+    )
+    .unwrap();
+    (catalog, launch)
+}
+
 fn render_once(runtime: &Runtime) {
     let backend = TestBackend::new(100, 24);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -376,6 +603,71 @@ struct PanicOnce {
     fired: AtomicBool,
 }
 
+struct BlockingThenPanicHook {
+    target: WorkerKind,
+    entered: SyncSender<()>,
+    release: Mutex<Receiver<()>>,
+    fired: AtomicBool,
+}
+
+impl BlockingThenPanicHook {
+    fn new(target: WorkerKind) -> (Arc<Self>, Receiver<()>, SyncSender<()>) {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        (
+            Arc::new(Self {
+                target,
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+                fired: AtomicBool::new(false),
+            }),
+            entered_rx,
+            release_tx,
+        )
+    }
+}
+
+impl WorkerHook for BlockingThenPanicHook {
+    fn before_execute(&self, kind: WorkerKind) {
+        if kind == self.target && !self.fired.swap(true, Ordering::SeqCst) {
+            self.entered.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            panic!("injected racing {kind:?} panic");
+        }
+    }
+}
+
+struct StuckHook {
+    target: WorkerKind,
+    entered: SyncSender<()>,
+    fired: AtomicBool,
+}
+
+impl StuckHook {
+    fn new(target: WorkerKind) -> (Arc<Self>, Receiver<()>) {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        (
+            Arc::new(Self {
+                target,
+                entered: entered_tx,
+                fired: AtomicBool::new(false),
+            }),
+            entered_rx,
+        )
+    }
+}
+
+impl WorkerHook for StuckHook {
+    fn before_execute(&self, kind: WorkerKind) {
+        if kind == self.target && !self.fired.swap(true, Ordering::SeqCst) {
+            self.entered.send(()).unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+}
+
 impl PanicOnce {
     fn new(target: WorkerKind) -> Self {
         Self {
@@ -402,5 +694,25 @@ impl Clipboard for FailingClipboard {
 
     fn write_text(&mut self, _text: &str) -> Result<(), ClipboardError> {
         Err(ClipboardError::Unavailable)
+    }
+}
+
+struct FixedClipboard {
+    text: String,
+}
+
+impl FixedClipboard {
+    fn new(text: &str) -> Self {
+        Self { text: text.into() }
+    }
+}
+
+impl Clipboard for FixedClipboard {
+    fn read_text(&mut self) -> Result<String, ClipboardError> {
+        Ok(self.text.clone())
+    }
+
+    fn write_text(&mut self, _text: &str) -> Result<(), ClipboardError> {
+        Ok(())
     }
 }

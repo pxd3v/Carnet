@@ -23,8 +23,9 @@ use uuid::Uuid;
 
 use crate::{
     app::{
-        App, AppAction, AppEffect, AppEvent, CatalogSnapshot, EffectExecutor, Focus, MutationId,
-        NavigationAction, OverlayState, RequestId, RuntimeError, RuntimeOperation, Screen,
+        App, AppAction, AppEffect, AppEvent, AppExitStatus, CatalogSnapshot, ClipboardRequestId,
+        EditorOrigin, EffectExecutor, Focus, MutationId, NavigationAction, OverlayState, RequestId,
+        RuntimeError, RuntimeOperation, Screen,
     },
     catalog::{Catalog, CatalogError},
     cli::Launch,
@@ -144,6 +145,8 @@ pub enum RuntimeDriverError {
     CompletionChannelClosed,
 }
 
+pub const DEFAULT_QUIT_GRACE: Duration = Duration::from_secs(2);
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct JobId(u64);
 
@@ -168,7 +171,10 @@ enum WorkerOrigin {
         repository_root: PathBuf,
     },
     Catalog,
-    ClipboardRead,
+    ClipboardRead {
+        request_id: ClipboardRequestId,
+        origin: EditorOrigin,
+    },
     ClipboardWrite,
 }
 
@@ -211,7 +217,10 @@ impl WorkerOrigin {
                 repository_id: *repository_id,
                 repository_root: repository_root.clone(),
             },
-            AppEffect::ReadClipboard => Self::ClipboardRead,
+            AppEffect::ReadClipboard { request_id, origin } => Self::ClipboardRead {
+                request_id: *request_id,
+                origin: origin.clone(),
+            },
             AppEffect::WriteClipboard { .. } => Self::ClipboardWrite,
             AppEffect::SetDefaultRepository { .. }
             | AppEffect::CreateRepository { .. }
@@ -228,7 +237,7 @@ impl WorkerOrigin {
             Self::Mutation { .. } => WorkerKind::Mutation,
             Self::RetryCommit { .. } => WorkerKind::RetryCommit,
             Self::Catalog => WorkerKind::Catalog,
-            Self::ClipboardRead => WorkerKind::ClipboardRead,
+            Self::ClipboardRead { .. } => WorkerKind::ClipboardRead,
             Self::ClipboardWrite => WorkerKind::ClipboardWrite,
         }
     }
@@ -284,7 +293,11 @@ impl WorkerOrigin {
             Self::Catalog => AppEvent::RepositoryCatalogFailed {
                 message: "background catalog worker panicked".into(),
             },
-            Self::ClipboardRead => AppEvent::ClipboardRead(Err(ClipboardError::Unavailable)),
+            Self::ClipboardRead { request_id, origin } => AppEvent::ClipboardRead {
+                request_id: *request_id,
+                origin: origin.clone(),
+                result: Err(ClipboardError::Unavailable),
+            },
             Self::ClipboardWrite => AppEvent::ClipboardWritten(Err(ClipboardError::Unavailable)),
         }
     }
@@ -299,6 +312,7 @@ struct WorkerJob {
 struct WorkerCompletion {
     id: JobId,
     event: AppEvent,
+    panicked: bool,
 }
 
 pub struct Runtime {
@@ -413,6 +427,39 @@ impl Runtime {
         Ok(())
     }
 
+    pub fn finalize_quit(&mut self, grace: Duration) -> AppExitStatus {
+        if let Some(status) = self.app.quit.final_status {
+            return status;
+        }
+
+        let deadline = Instant::now() + grace;
+        while !self.jobs.is_empty() {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                self.record_finalization_timeout();
+                break;
+            };
+            match self.completion_rx.recv_timeout(remaining) {
+                Ok(completion) => self.finish_job(completion),
+                Err(RecvTimeoutError::Timeout) => {
+                    self.record_finalization_timeout();
+                    break;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.dispatch(AppEvent::RuntimeFinalizationFailed {
+                        message: "background completion channel closed during quit finalization"
+                            .into(),
+                    });
+                    break;
+                }
+            }
+        }
+
+        self.dispatch(AppEvent::QuitFinalized);
+        self.close_service_inputs();
+        self.join_services_until(deadline);
+        self.app.quit.final_status.unwrap_or(AppExitStatus::Failure)
+    }
+
     fn queue_effect(&mut self, effect: AppEffect) {
         let origin = WorkerOrigin::for_effect(&effect);
         let id = JobId(self.next_job_id);
@@ -443,19 +490,47 @@ impl Runtime {
 
     fn finish_job(&mut self, completion: WorkerCompletion) {
         if self.jobs.remove(&completion.id).is_some() {
+            if completion.panicked && self.app.quit.requested {
+                self.dispatch(AppEvent::RuntimeFinalizationFailed {
+                    message: "background worker panicked during quit finalization".into(),
+                });
+            }
             self.dispatch(completion.event);
         }
+    }
+
+    fn record_finalization_timeout(&mut self) {
+        self.dispatch(AppEvent::RuntimeFinalizationFailed {
+            message: format!("timed out finalizing {} background job(s)", self.jobs.len()),
+        });
+    }
+
+    fn close_service_inputs(&mut self) {
+        self.catalog_tx.take();
+        self.clipboard_tx.take();
+        self.effect_tx.take();
+    }
+
+    fn join_services_until(&mut self, deadline: Instant) {
+        while !self.service_handles.is_empty() {
+            join_finished(&mut self.service_handles);
+            if self.service_handles.is_empty() {
+                return;
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            thread::sleep(remaining.min(Duration::from_millis(1)));
+        }
+        self.service_handles.clear();
     }
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        self.catalog_tx.take();
-        self.clipboard_tx.take();
-        self.effect_tx.take();
-        for handle in self.service_handles.drain(..) {
-            let _ = handle.join();
-        }
+        self.close_service_inputs();
+        join_finished(&mut self.service_handles);
+        self.service_handles.clear();
     }
 }
 
@@ -523,7 +598,11 @@ fn spawn_clipboard_service(
         .spawn(move || {
             for job in receiver {
                 let completion_message = supervise(job, &hook, |effect| match effect {
-                    AppEffect::ReadClipboard => AppEvent::ClipboardRead(clipboard.read_text()),
+                    AppEffect::ReadClipboard { request_id, origin } => AppEvent::ClipboardRead {
+                        request_id,
+                        origin,
+                        result: clipboard.read_text(),
+                    },
                     AppEffect::WriteClipboard { text } => {
                         AppEvent::ClipboardWritten(clipboard.write_text(&text))
                     }
@@ -570,6 +649,7 @@ fn spawn_effect_service(
                         let _ = completion.send(WorkerCompletion {
                             id: failed_id,
                             event: failed_event,
+                            panicked: true,
                         });
                     }
                 }
@@ -600,12 +680,19 @@ fn supervise(
 ) -> WorkerCompletion {
     let id = job.id;
     let origin = job.origin;
-    let event = catch_unwind(AssertUnwindSafe(|| {
+    let result = catch_unwind(AssertUnwindSafe(|| {
         hook.before_execute(origin.kind());
         operation(job.effect)
-    }))
-    .unwrap_or_else(|_| origin.panic_event());
-    WorkerCompletion { id, event }
+    }));
+    let (event, panicked) = match result {
+        Ok(event) => (event, false),
+        Err(_) => (origin.panic_event(), true),
+    };
+    WorkerCompletion {
+        id,
+        event,
+        panicked,
+    }
 }
 
 trait UnsupportedEffectFailure {

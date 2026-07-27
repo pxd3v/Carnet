@@ -2,8 +2,9 @@ use std::{fs, path::PathBuf, process::Command};
 
 use carnet::{
     app::{
-        App, AppAction, AppEffect, AppEvent, EffectExecutor, ExternalConflict, FailureKind,
-        HomeAction, MutationId, NavigationAction, RequestId, RuntimeError, RuntimeOperation,
+        App, AppAction, AppEffect, AppEvent, ClipboardRequestId, EditorInstanceId, EditorOrigin,
+        EffectExecutor, ExternalConflict, FailureKind, HomeAction, MutationId, NavigationAction,
+        RequestId, RuntimeError, RuntimeOperation,
     },
     catalog::RepoEntry,
     git::{CommitIntent, CommitOutcome, GitRepo},
@@ -282,9 +283,27 @@ fn load_failures_return_typed_runtime_events_and_leave_app_state_retryable() {
 #[test]
 fn executor_returns_outer_runtime_effects_intact() {
     let executor = EffectExecutor::default();
-    let error = executor.execute(AppEffect::ReadClipboard).unwrap_err();
+    let origin = EditorOrigin {
+        repository_id: Uuid::from_u128(1),
+        repository_root: PathBuf::from("/repos/notes"),
+        note_path: PathBuf::from("note.md"),
+        instance_id: EditorInstanceId::new(1),
+        revision: 0,
+    };
+    let error = executor
+        .execute(AppEffect::ReadClipboard {
+            request_id: ClipboardRequestId::new(1),
+            origin: origin.clone(),
+        })
+        .unwrap_err();
 
-    assert!(matches!(error.into_effect(), AppEffect::ReadClipboard));
+    assert!(matches!(
+        error.into_effect(),
+        AppEffect::ReadClipboard {
+            request_id,
+            origin: returned_origin,
+        } if request_id == ClipboardRequestId::new(1) && returned_origin == origin
+    ));
 
     let error = executor
         .execute(AppEffect::CreateRepository {

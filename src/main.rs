@@ -4,7 +4,9 @@ use carnet::{
     app::AppExitStatus,
     catalog::Catalog,
     cli::{Cli, route},
-    runtime::{CrosstermLifecycle, RestorationGuard, Runtime, map_terminal_event},
+    runtime::{
+        CrosstermLifecycle, DEFAULT_QUIT_GRACE, RestorationGuard, Runtime, map_terminal_event,
+    },
     ui,
 };
 use clap::Parser;
@@ -58,11 +60,7 @@ fn drive_terminal(
         terminal.draw(|frame| ui::render(frame, runtime.app()))?;
 
         if runtime.app().quit.requested {
-            return Ok(runtime
-                .app()
-                .quit
-                .final_status
-                .unwrap_or(AppExitStatus::Failure));
+            return Ok(runtime.finalize_quit(DEFAULT_QUIT_GRACE));
         }
 
         if event::poll(Duration::from_millis(50))?
