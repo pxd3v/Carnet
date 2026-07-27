@@ -236,7 +236,6 @@ impl Editor {
     }
 
     pub(crate) fn accept_saved(&mut self, note: LoadedNote) {
-        debug_assert_eq!(self.buffer.text(), note.text());
         self.loaded = note;
     }
 

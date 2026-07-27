@@ -9,8 +9,9 @@ use crate::{
 
 use super::{
     App, AppEffect, AppExitStatus, CommitStatus, DefaultChoiceState, Dialog, ExternalConflict,
-    FailureKind, FileActionKind, Focus, NavigationAction, OverlayState, PendingMutation,
-    PendingMutationKind, SavedCommitFailure, Screen, UnresolvedFailure, WorkspaceState,
+    FailureKind, FileActionKind, Focus, NavigationAction, OverlayState, PendingLoad,
+    PendingMutation, PendingMutationKind, PendingOpen, PendingSave, RequestId, RuntimeFailure,
+    SavedCommitFailure, Screen, UnresolvedFailure, WorkspaceState,
 };
 use super::{RuntimeError, RuntimeOperation};
 
@@ -120,6 +121,7 @@ pub enum AppEvent {
         error: GitError,
     },
     WorkspaceOpened {
+        request_id: RequestId,
         repository_id: Uuid,
         workspace: Workspace,
         git: GitRepo,
@@ -127,10 +129,12 @@ pub enum AppEvent {
         note: Option<LoadedNote>,
     },
     NoteLoaded {
+        request_id: RequestId,
         repository_id: Uuid,
         note: LoadedNote,
     },
     RuntimeFailed {
+        request_id: RequestId,
         repository_id: Uuid,
         operation: RuntimeOperation,
         error: RuntimeError,
@@ -148,16 +152,22 @@ impl App {
                     return Vec::new();
                 }
                 match result {
-                    Ok(()) => Vec::new(),
+                    Ok(()) => {
+                        self.failures.catalog = None;
+                        Vec::new()
+                    }
                     Err(error) => {
-                        self.record_runtime_failure(error.to_string());
+                        self.record_outer_failure(FailureKind::Runtime, error.to_string(), false);
                         Vec::new()
                     }
                 }
             }
-            AppEvent::ClipboardWritten(Ok(())) => Vec::new(),
+            AppEvent::ClipboardWritten(Ok(())) => {
+                self.failures.clipboard = None;
+                Vec::new()
+            }
             AppEvent::ClipboardWritten(Err(error)) => {
-                self.record_runtime_failure(error.to_string());
+                self.record_outer_failure(FailureKind::Runtime, error.to_string(), true);
                 Vec::new()
             }
             AppEvent::Action(AppAction::Home(HomeAction::Up)) => {
@@ -167,12 +177,37 @@ impl App {
                 Vec::new()
             }
             AppEvent::RuntimeFailed {
-                repository_id: _,
-                operation: _,
+                request_id,
+                repository_id,
+                operation,
                 error,
             } => {
-                self.pending_load = None;
-                self.record_runtime_failure(error.to_string());
+                let current = match operation {
+                    RuntimeOperation::OpenWorkspace => self.pending_open.is_some_and(|pending| {
+                        pending.request_id == request_id && pending.repository_id == repository_id
+                    }),
+                    RuntimeOperation::LoadNote => {
+                        self.pending_load.as_ref().is_some_and(|pending| {
+                            pending.request_id == request_id
+                                && pending.repository_id == repository_id
+                        })
+                    }
+                    RuntimeOperation::Mutation | RuntimeOperation::RefreshTree => false,
+                };
+                if !current {
+                    return Vec::new();
+                }
+                match operation {
+                    RuntimeOperation::OpenWorkspace => self.pending_open = None,
+                    RuntimeOperation::LoadNote => self.pending_load = None,
+                    RuntimeOperation::Mutation | RuntimeOperation::RefreshTree => {}
+                }
+                self.record_request_failure(
+                    request_id,
+                    repository_id,
+                    operation,
+                    error.to_string(),
+                );
                 Vec::new()
             }
             AppEvent::Action(AppAction::ConfirmDelete) => self.confirm_delete(),
@@ -208,10 +243,19 @@ impl App {
                     | MutationCommitError::RepositoryMismatch => FailureKind::Runtime,
                 };
                 let message = error.to_string();
-                self.failure = Some(UnresolvedFailure {
+                let failure = UnresolvedFailure {
                     kind,
                     message: message.clone(),
-                });
+                };
+                match kind {
+                    FailureKind::Write => self.failures.write = Some(failure),
+                    FailureKind::Runtime => self.record_unscoped_runtime_failure(
+                        repository_id,
+                        RuntimeOperation::Mutation,
+                        message.clone(),
+                    ),
+                    FailureKind::Git => unreachable!("mutation errors are write or runtime"),
+                }
                 self.status.commit = CommitStatus::Idle;
                 self.status.message = Some(message.clone());
                 self.dialog = Some(Dialog::Failure { kind, message });
@@ -238,7 +282,7 @@ impl App {
                     intent: pending.intent,
                     message: message.clone(),
                 });
-                self.failure = Some(UnresolvedFailure {
+                self.failures.git = Some(UnresolvedFailure {
                     kind: FailureKind::Git,
                     message: message.clone(),
                 });
@@ -265,8 +309,10 @@ impl App {
                 }
                 self.pending_mutation = None;
                 self.saved_commit_failure = None;
-                self.failure = None;
-                self.dialog = None;
+                self.failures.git = None;
+                if matches!(self.dialog, Some(Dialog::SavedCommitFailed { .. })) {
+                    self.dialog = None;
+                }
                 self.status.commit = match commit {
                     CommitOutcome::Committed { revision } => CommitStatus::Committed { revision },
                     CommitOutcome::NoChanges => CommitStatus::NoChanges,
@@ -277,7 +323,8 @@ impl App {
                         .workspace_editor_mut()
                         .is_some_and(|editor| editor.is_dirty())
                 {
-                    return self.save(false);
+                    self.dialog = Some(Dialog::DirtyNavigation);
+                    return Vec::new();
                 }
                 let navigation = self.pending_navigation.take();
                 navigation
@@ -314,7 +361,7 @@ impl App {
                     intent: pending.intent,
                     message: message.clone(),
                 });
-                self.failure = Some(UnresolvedFailure {
+                self.failures.git = Some(UnresolvedFailure {
                     kind: FailureKind::Git,
                     message: message.clone(),
                 });
@@ -326,20 +373,27 @@ impl App {
                 Vec::new()
             }
             AppEvent::NoteLoaded {
+                request_id,
                 repository_id,
                 note,
             } => {
+                if !self.pending_load.as_ref().is_some_and(|pending| {
+                    pending.request_id == request_id
+                        && pending.repository_id == repository_id
+                        && pending.path.as_path() == note.path().relative()
+                }) {
+                    return Vec::new();
+                }
                 let Screen::Workspace(workspace) = &mut self.screen else {
                     return Vec::new();
                 };
-                if workspace.repository.id != repository_id
-                    || self.pending_load.as_deref() != Some(note.path().relative())
-                {
+                if workspace.repository.id != repository_id {
                     return Vec::new();
                 }
                 workspace.current_note = Some(note.path().relative().to_path_buf());
                 workspace.editor = Some(Editor::from_loaded(note));
                 self.pending_load = None;
+                self.clear_runtime_failures(repository_id, RuntimeOperation::LoadNote);
                 Vec::new()
             }
             AppEvent::ConflictChoice(ConflictChoice::Reload) => {
@@ -396,52 +450,95 @@ impl App {
                 }
                 let pending = self.pending_mutation.take().expect("checked above");
                 let tree_error = tree.as_ref().err().map(ToString::to_string);
+                let tree_refreshed = tree.is_ok();
+                let mut editor_has_newer_edits = false;
+                let mut note_to_load = None;
                 if let Screen::Workspace(workspace) = &mut self.screen {
                     if let Ok(tree) = tree {
                         workspace.tree = tree;
                     }
-                    if let (Some(editor), FileOutcome::Saved(note)) = (&mut workspace.editor, file)
-                    {
-                        editor.accept_saved(note);
+                    match file {
+                        FileOutcome::Saved(note) => {
+                            if let Some(editor) = &mut workspace.editor {
+                                editor_has_newer_edits = pending
+                                    .save
+                                    .as_ref()
+                                    .is_some_and(|save| editor.text() != save.snapshot);
+                                editor.accept_saved(note);
+                                editor_has_newer_edits |= editor.is_dirty();
+                            }
+                            clamp_tree_selection(workspace);
+                        }
+                        FileOutcome::CreatedFile(note) => {
+                            let path = note.relative().to_path_buf();
+                            select_tree_path(workspace, &path);
+                            note_to_load = Some(path);
+                        }
+                        FileOutcome::CreatedFolder(path) => {
+                            select_tree_path(workspace, &path);
+                        }
+                        FileOutcome::Renamed { from, to } | FileOutcome::Moved { from, to } => {
+                            select_tree_path(workspace, &to);
+                            if workspace.current_note.as_ref() == Some(&from) {
+                                note_to_load = Some(to);
+                            }
+                        }
+                        FileOutcome::Deleted(path) => {
+                            if workspace.current_note.as_ref() == Some(&path) {
+                                workspace.current_note = None;
+                                workspace.editor = None;
+                            }
+                            clamp_tree_selection(workspace);
+                        }
                     }
                 }
                 self.status.commit = match commit {
                     CommitOutcome::Committed { revision } => CommitStatus::Committed { revision },
                     CommitOutcome::NoChanges => CommitStatus::NoChanges,
                 };
-                if self
-                    .failure
-                    .as_ref()
-                    .is_some_and(|failure| failure.kind == FailureKind::Write)
-                {
-                    self.failure = None;
+                self.failures.write = None;
+                self.clear_runtime_failures(repository_id, RuntimeOperation::Mutation);
+                if tree_refreshed {
+                    self.clear_runtime_failures(repository_id, RuntimeOperation::RefreshTree);
                 }
                 self.status.message = None;
                 if let Some(message) = tree_error {
-                    self.failure = Some(UnresolvedFailure {
-                        kind: FailureKind::Runtime,
-                        message: message.clone(),
-                    });
-                    self.status.message = Some(message.clone());
-                    self.dialog = Some(Dialog::Failure {
-                        kind: FailureKind::Runtime,
+                    self.record_unscoped_runtime_failure(
+                        repository_id,
+                        RuntimeOperation::RefreshTree,
                         message,
-                    });
-                    return Vec::new();
+                    );
+                    return note_to_load
+                        .map(|path| self.request_note_load(path))
+                        .unwrap_or_default();
                 }
                 if matches!(pending.kind, PendingMutationKind::Save { .. }) {
+                    if editor_has_newer_edits {
+                        if self.pending_navigation.is_some() {
+                            self.dialog = Some(Dialog::DirtyNavigation);
+                        }
+                        return Vec::new();
+                    }
                     let navigation = self.pending_navigation.take();
                     return navigation
                         .map(|target| self.perform_navigation(target))
                         .unwrap_or_default();
                 }
-                Vec::new()
+                note_to_load
+                    .map(|path| self.request_note_load(path))
+                    .unwrap_or_default()
             }
             AppEvent::DirtyChoice(DirtyChoice::Save) => {
+                if self.pending_mutation.is_some() {
+                    return Vec::new();
+                }
                 self.dialog = None;
                 self.global_save()
             }
             AppEvent::DirtyChoice(DirtyChoice::Discard) => {
+                if self.pending_mutation.is_some() {
+                    return Vec::new();
+                }
                 let target = self.pending_navigation.take();
                 self.dialog = None;
                 target
@@ -449,11 +546,17 @@ impl App {
                     .unwrap_or_default()
             }
             AppEvent::DirtyChoice(DirtyChoice::Cancel) => {
+                if self.pending_mutation.is_some() {
+                    return Vec::new();
+                }
                 self.pending_navigation = None;
                 self.dialog = None;
                 Vec::new()
             }
             AppEvent::Action(AppAction::Navigate(target)) => {
+                if self.pending_mutation.is_some() {
+                    return Vec::new();
+                }
                 if self
                     .workspace_editor_mut()
                     .is_some_and(|editor| editor.is_dirty())
@@ -467,13 +570,14 @@ impl App {
             }
             AppEvent::Action(AppAction::Global(GlobalAction::Save)) => self.global_save(),
             AppEvent::ClipboardRead(Ok(text)) => {
+                self.failures.clipboard = None;
                 if let Some(editor) = self.workspace_editor_mut() {
                     editor.apply(EditorCommand::BracketedPaste(text));
                 }
                 Vec::new()
             }
             AppEvent::ClipboardRead(Err(error)) => {
-                self.record_runtime_failure(error.to_string());
+                self.record_outer_failure(FailureKind::Runtime, error.to_string(), true);
                 Vec::new()
             }
             AppEvent::Action(AppAction::Editor(EditorCommand::Copy)) => {
@@ -552,15 +656,22 @@ impl App {
                 Vec::new()
             }
             AppEvent::WorkspaceOpened {
+                request_id,
                 repository_id,
                 workspace,
                 git,
                 tree,
                 note,
             } => {
-                if workspace.repo().id != repository_id {
+                if workspace.repo().id != repository_id
+                    || !self.pending_open.is_some_and(|pending| {
+                        pending.request_id == request_id && pending.repository_id == repository_id
+                    })
+                {
                     return Vec::new();
                 }
+                self.pending_open = None;
+                self.pending_load = None;
                 let current_note = note
                     .as_ref()
                     .map(|note| note.path().relative().to_path_buf());
@@ -587,6 +698,7 @@ impl App {
                     self.home.pending_note = None;
                     self.home.default_choice = DefaultChoiceState::NotNeeded;
                 }
+                self.clear_runtime_failures(repository_id, RuntimeOperation::OpenWorkspace);
                 Vec::new()
             }
             AppEvent::Action(AppAction::Home(HomeAction::Down)) => {
@@ -615,9 +727,12 @@ impl App {
                         note: note.clone(),
                     };
                 }
-                vec![AppEffect::OpenWorkspace { repository, note }]
+                self.request_open_workspace(repository, note)
             }
             AppEvent::Action(AppAction::Home(HomeAction::ChooseSelectedAsDefault)) => {
+                if self.pending_mutation.is_some() {
+                    return Vec::new();
+                }
                 let Some(repository) = self
                     .home
                     .selected
@@ -634,15 +749,14 @@ impl App {
                     repository_id: repository.id,
                     note: note.clone(),
                 };
-                vec![
+                let mut effects = self.request_open_workspace(repository.clone(), Some(note));
+                effects.insert(
+                    0,
                     AppEffect::SetDefaultRepository {
                         repository_id: repository.id,
                     },
-                    AppEffect::OpenWorkspace {
-                        repository,
-                        note: Some(note),
-                    },
-                ]
+                );
+                effects
             }
         }
     }
@@ -654,9 +768,20 @@ impl App {
         workspace.editor.as_mut()
     }
 
-    fn record_runtime_failure(&mut self, message: String) {
-        self.failure = Some(UnresolvedFailure {
-            kind: FailureKind::Runtime,
+    fn record_request_failure(
+        &mut self,
+        request_id: RequestId,
+        repository_id: Uuid,
+        operation: RuntimeOperation,
+        message: String,
+    ) {
+        self.failures.runtime.retain(|failure| {
+            failure.repository_id != repository_id || failure.operation != operation
+        });
+        self.failures.runtime.push(RuntimeFailure {
+            request_id: Some(request_id),
+            repository_id,
+            operation,
             message: message.clone(),
         });
         self.status.message = Some(message.clone());
@@ -664,6 +789,48 @@ impl App {
             kind: FailureKind::Runtime,
             message,
         });
+    }
+
+    fn record_unscoped_runtime_failure(
+        &mut self,
+        repository_id: Uuid,
+        operation: RuntimeOperation,
+        message: String,
+    ) {
+        self.failures.runtime.retain(|failure| {
+            failure.repository_id != repository_id || failure.operation != operation
+        });
+        self.failures.runtime.push(RuntimeFailure {
+            request_id: None,
+            repository_id,
+            operation,
+            message: message.clone(),
+        });
+        self.status.message = Some(message.clone());
+        self.dialog = Some(Dialog::Failure {
+            kind: FailureKind::Runtime,
+            message,
+        });
+    }
+
+    fn clear_runtime_failures(&mut self, repository_id: Uuid, operation: RuntimeOperation) {
+        self.failures.runtime.retain(|failure| {
+            failure.repository_id != repository_id || failure.operation != operation
+        });
+    }
+
+    fn record_outer_failure(&mut self, kind: FailureKind, message: String, clipboard: bool) {
+        let failure = UnresolvedFailure {
+            kind,
+            message: message.clone(),
+        };
+        if clipboard {
+            self.failures.clipboard = Some(failure);
+        } else {
+            self.failures.catalog = Some(failure);
+        }
+        self.status.message = Some(message.clone());
+        self.dialog = Some(Dialog::Failure { kind, message });
     }
 
     fn save(&mut self, overwrite: bool) -> Vec<AppEffect> {
@@ -692,16 +859,28 @@ impl App {
             CommitIntent::Create(path)
         };
         let repository_id = workspace.repository.id;
+        let effect_workspace = workspace.workspace.clone();
+        let effect_git = workspace.git.clone();
+        let snapshot = editor.text();
+        let generation = self.next_save_generation;
+        self.next_save_generation = self
+            .next_save_generation
+            .checked_add(1)
+            .expect("save generation overflow");
         self.pending_mutation = Some(PendingMutation {
             repository_id,
             kind: PendingMutationKind::Save { overwrite },
             intent: intent.clone(),
+            save: Some(PendingSave {
+                generation,
+                snapshot,
+            }),
         });
         self.status.commit = CommitStatus::Pending;
         vec![AppEffect::ApplyAndCommit {
             repository_id,
-            workspace: workspace.workspace.clone(),
-            git: workspace.git.clone(),
+            workspace: effect_workspace,
+            git: effect_git,
             operation: Box::new(operation),
             intent,
         }]
@@ -722,6 +901,7 @@ impl App {
                 repository_id: failure.repository_id,
                 kind: PendingMutationKind::RetryCommit,
                 intent: failure.intent.clone(),
+                save: None,
             });
             self.status.commit = CommitStatus::Pending;
             return vec![AppEffect::RetryCommit {
@@ -739,26 +919,17 @@ impl App {
                 self.screen = Screen::Home;
                 self.overlay = OverlayState::None;
                 self.dialog = None;
+                self.pending_open = None;
                 self.pending_load = None;
                 Vec::new()
             }
             NavigationAction::Repository { repository, note } => {
-                vec![AppEffect::OpenWorkspace { repository, note }]
+                self.request_open_workspace(repository, note)
             }
-            NavigationAction::Note(path) => {
-                let Screen::Workspace(workspace) = &self.screen else {
-                    return Vec::new();
-                };
-                self.pending_load = Some(path.clone());
-                vec![AppEffect::LoadNote {
-                    repository_id: workspace.repository.id,
-                    workspace: workspace.workspace.clone(),
-                    path,
-                }]
-            }
+            NavigationAction::Note(path) => self.request_note_load(path),
             NavigationAction::Quit => {
                 self.quit.requested = true;
-                self.quit.final_status = Some(if self.failure.is_some() {
+                self.quit.final_status = Some(if !self.failures.is_empty() {
                     AppExitStatus::Failure
                 } else {
                     AppExitStatus::Success
@@ -766,6 +937,55 @@ impl App {
                 Vec::new()
             }
         }
+    }
+
+    fn next_request_id(&mut self) -> RequestId {
+        let request_id = RequestId(self.next_request_id);
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .expect("application request ID overflow");
+        request_id
+    }
+
+    fn request_open_workspace(
+        &mut self,
+        repository: crate::catalog::RepoEntry,
+        note: Option<std::path::PathBuf>,
+    ) -> Vec<AppEffect> {
+        if self.pending_mutation.is_some() {
+            return Vec::new();
+        }
+        let request_id = self.next_request_id();
+        self.pending_load = None;
+        self.pending_open = Some(PendingOpen {
+            request_id,
+            repository_id: repository.id,
+        });
+        vec![AppEffect::OpenWorkspace {
+            request_id,
+            repository,
+            note,
+        }]
+    }
+
+    fn request_note_load(&mut self, path: std::path::PathBuf) -> Vec<AppEffect> {
+        let (repository_id, workspace) = match &self.screen {
+            Screen::Workspace(workspace) => (workspace.repository.id, workspace.workspace.clone()),
+            Screen::Home => return Vec::new(),
+        };
+        let request_id = self.next_request_id();
+        self.pending_load = Some(PendingLoad {
+            request_id,
+            repository_id,
+            path: path.clone(),
+        });
+        vec![AppEffect::LoadNote {
+            request_id,
+            repository_id,
+            workspace,
+            path,
+        }]
     }
 
     fn tree_action(&mut self, action: TreeAction) -> Vec<AppEffect> {
@@ -798,6 +1018,17 @@ impl App {
             }
             if self.sidebar.overlay_intent {
                 self.sidebar.visible = false;
+            }
+            return Vec::new();
+        }
+        if entries.is_empty() {
+            let kind = match action {
+                TreeAction::NewFile => Some(FileActionKind::NewFile),
+                TreeAction::NewFolder => Some(FileActionKind::NewFolder),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                self.dialog = Some(Dialog::FileAction { kind, target: None });
             }
             return Vec::new();
         }
@@ -846,9 +1077,9 @@ impl App {
                         workspace.expanded.insert(entries[selected].path.clone());
                     }
                 } else if entries[selected].enabled {
-                    return self.perform_navigation(NavigationAction::Note(
-                        entries[selected].path.clone(),
-                    ));
+                    return self.update(AppEvent::Action(AppAction::Navigate(
+                        NavigationAction::Note(entries[selected].path.clone()),
+                    )));
                 }
             }
             TreeAction::NewFile | TreeAction::NewFolder | TreeAction::Rename | TreeAction::Move => {
@@ -931,6 +1162,7 @@ impl App {
             repository_id,
             kind: PendingMutationKind::File(kind),
             intent: intent.clone(),
+            save: None,
         });
         self.status.commit = CommitStatus::Pending;
         vec![AppEffect::ApplyAndCommit {
@@ -958,6 +1190,7 @@ impl App {
             repository_id,
             kind: PendingMutationKind::Delete,
             intent: intent.clone(),
+            save: None,
         });
         self.status.commit = CommitStatus::Pending;
         vec![AppEffect::ApplyAndCommit {
@@ -1008,4 +1241,26 @@ fn visible_tree(
     let mut output = Vec::new();
     collect(&mut output, entries, expanded, None);
     output
+}
+
+fn select_tree_path(workspace: &mut WorkspaceState, path: &std::path::Path) {
+    let mut parent = path.parent();
+    while let Some(directory) = parent.filter(|directory| !directory.as_os_str().is_empty()) {
+        workspace.expanded.insert(directory.to_path_buf());
+        parent = directory.parent();
+    }
+    let entries = visible_tree(&workspace.tree, &workspace.expanded);
+    workspace.tree_selection = entries
+        .iter()
+        .position(|entry| entry.path == path)
+        .or_else(|| (!entries.is_empty()).then_some(entries.len() - 1));
+}
+
+fn clamp_tree_selection(workspace: &mut WorkspaceState) {
+    let entry_count = visible_tree(&workspace.tree, &workspace.expanded).len();
+    workspace.tree_selection = if entry_count == 0 {
+        None
+    } else {
+        Some(workspace.tree_selection.unwrap_or(0).min(entry_count - 1))
+    };
 }

@@ -2,12 +2,39 @@ use std::{collections::BTreeSet, path::PathBuf};
 
 use uuid::Uuid;
 
+use super::effect::RuntimeOperation;
 use crate::{
     catalog::RepoEntry,
     editor::Editor,
     git::{CommitIntent, GitRepo},
     workspace::{TreeEntry, Workspace},
 };
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RequestId(pub(crate) u64);
+
+impl RequestId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingOpen {
+    pub request_id: RequestId,
+    pub repository_id: Uuid,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingLoad {
+    pub request_id: RequestId,
+    pub repository_id: Uuid,
+    pub path: PathBuf,
+}
 
 pub enum Screen {
     Home,
@@ -80,6 +107,13 @@ pub struct PendingMutation {
     pub repository_id: Uuid,
     pub kind: PendingMutationKind,
     pub intent: CommitIntent,
+    pub save: Option<PendingSave>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingSave {
+    pub generation: u64,
+    pub snapshot: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -182,6 +216,33 @@ pub struct UnresolvedFailure {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeFailure {
+    pub request_id: Option<RequestId>,
+    pub repository_id: Uuid,
+    pub operation: RuntimeOperation,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FailureState {
+    pub runtime: Vec<RuntimeFailure>,
+    pub write: Option<UnresolvedFailure>,
+    pub git: Option<UnresolvedFailure>,
+    pub clipboard: Option<UnresolvedFailure>,
+    pub catalog: Option<UnresolvedFailure>,
+}
+
+impl FailureState {
+    pub fn is_empty(&self) -> bool {
+        self.runtime.is_empty()
+            && self.write.is_none()
+            && self.git.is_none()
+            && self.clipboard.is_none()
+            && self.catalog.is_none()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SavedCommitFailure {
     pub repository_id: Uuid,
     pub intent: CommitIntent,
@@ -195,12 +256,15 @@ pub struct App {
     pub overlay: OverlayState,
     pub pending_mutation: Option<PendingMutation>,
     pub pending_navigation: Option<NavigationAction>,
-    pub pending_load: Option<PathBuf>,
+    pub pending_open: Option<PendingOpen>,
+    pub pending_load: Option<PendingLoad>,
     pub dialog: Option<Dialog>,
     pub status: StatusState,
     pub quit: QuitState,
-    pub failure: Option<UnresolvedFailure>,
+    pub failures: FailureState,
     pub saved_commit_failure: Option<SavedCommitFailure>,
+    pub(crate) next_request_id: u64,
+    pub(crate) next_save_generation: u64,
 }
 
 impl App {
@@ -225,12 +289,15 @@ impl App {
             overlay: OverlayState::None,
             pending_mutation: None,
             pending_navigation: None,
+            pending_open: None,
             pending_load: None,
             dialog: None,
             status: StatusState::default(),
             quit: QuitState::default(),
-            failure: None,
+            failures: FailureState::default(),
             saved_commit_failure: None,
+            next_request_id: 1,
+            next_save_generation: 1,
             home: HomeState {
                 repositories,
                 selected,

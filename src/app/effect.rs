@@ -18,6 +18,7 @@ use uuid::Uuid;
 #[derive(Debug)]
 pub enum AppEffect {
     OpenWorkspace {
+        request_id: super::RequestId,
         repository: RepoEntry,
         note: Option<PathBuf>,
     },
@@ -36,6 +37,7 @@ pub enum AppEffect {
         intent: CommitIntent,
     },
     LoadNote {
+        request_id: super::RequestId,
         repository_id: Uuid,
         workspace: Workspace,
         path: PathBuf,
@@ -51,6 +53,8 @@ pub enum AppEffect {
 pub enum RuntimeOperation {
     OpenWorkspace,
     LoadNote,
+    Mutation,
+    RefreshTree,
 }
 
 #[derive(Debug, Error)]
@@ -85,14 +89,17 @@ pub struct EffectExecutor {
 impl EffectExecutor {
     pub fn execute(&self, effect: AppEffect) -> Result<super::AppEvent, EffectExecutionError> {
         match effect {
-            AppEffect::OpenWorkspace { repository, note } => {
-                Ok(self.open_workspace(repository, note))
-            }
+            AppEffect::OpenWorkspace {
+                request_id,
+                repository,
+                note,
+            } => Ok(self.open_workspace(request_id, repository, note)),
             AppEffect::LoadNote {
+                request_id,
                 repository_id,
                 workspace,
                 path,
-            } => Ok(self.load_note(repository_id, workspace, path)),
+            } => Ok(self.load_note(request_id, repository_id, workspace, path)),
             AppEffect::ApplyAndCommit {
                 repository_id,
                 workspace,
@@ -113,9 +120,15 @@ impl EffectExecutor {
         }
     }
 
-    fn open_workspace(&self, repository: RepoEntry, note_path: Option<PathBuf>) -> super::AppEvent {
+    fn open_workspace(
+        &self,
+        request_id: super::RequestId,
+        repository: RepoEntry,
+        note_path: Option<PathBuf>,
+    ) -> super::AppEvent {
         let repository_id = repository.id;
-        let result = (|| {
+        let root = repository.path.clone();
+        let result = self.run_serialized(&root, || {
             let workspace = Workspace::open(repository)?;
             let git = GitRepo::open(workspace.root())?;
             let tree = workspace.tree()?;
@@ -126,9 +139,10 @@ impl EffectExecutor {
                 })
                 .transpose()?;
             Ok::<_, RuntimeError>((workspace, git, tree, note))
-        })();
+        });
         match result {
             Ok((workspace, git, tree, note)) => super::AppEvent::WorkspaceOpened {
+                request_id,
                 repository_id,
                 workspace,
                 git,
@@ -136,6 +150,7 @@ impl EffectExecutor {
                 note,
             },
             Err(error) => super::AppEvent::RuntimeFailed {
+                request_id,
                 repository_id,
                 operation: RuntimeOperation::OpenWorkspace,
                 error,
@@ -145,20 +160,26 @@ impl EffectExecutor {
 
     fn load_note(
         &self,
+        request_id: super::RequestId,
         repository_id: Uuid,
         workspace: Workspace,
         path: PathBuf,
     ) -> super::AppEvent {
-        let result = workspace
-            .resolve_note(&path)
-            .map_err(RuntimeError::from)
-            .and_then(|path| workspace.load_note(&path).map_err(RuntimeError::from));
+        let root = workspace.root().to_path_buf();
+        let result = self.run_serialized(&root, || {
+            workspace
+                .resolve_note(&path)
+                .map_err(RuntimeError::from)
+                .and_then(|path| workspace.load_note(&path).map_err(RuntimeError::from))
+        });
         match result {
             Ok(note) => super::AppEvent::NoteLoaded {
+                request_id,
                 repository_id,
                 note,
             },
             Err(error) => super::AppEvent::RuntimeFailed {
+                request_id,
                 repository_id,
                 operation: RuntimeOperation::LoadNote,
                 error,
