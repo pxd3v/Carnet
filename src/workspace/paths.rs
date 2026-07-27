@@ -26,6 +26,10 @@ impl NotePath {
         &self.relative
     }
 
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub(crate) fn directory(&self) -> &Arc<Dir> {
         &self.directory
     }

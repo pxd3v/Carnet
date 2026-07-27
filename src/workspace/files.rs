@@ -85,6 +85,19 @@ pub enum FileOperation {
     },
 }
 
+impl FileOperation {
+    pub(crate) fn workspace_root(&self) -> &Path {
+        match self {
+            Self::Save { note, .. } => note.path.root(),
+            Self::CreateFile { workspace, .. }
+            | Self::CreateFolder { workspace, .. }
+            | Self::Rename { workspace, .. }
+            | Self::Move { workspace, .. }
+            | Self::Delete { workspace, .. } => workspace.root(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum FileOutcome {
     Saved(LoadedNote),

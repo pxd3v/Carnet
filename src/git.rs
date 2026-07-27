@@ -48,6 +48,16 @@ pub enum MutationCommitOutcome {
 }
 
 #[derive(Debug, Error)]
+pub enum MutationCommitError {
+    #[error(transparent)]
+    File(#[from] FileError),
+    #[error("file operation belongs to a different workspace")]
+    WorkspaceMismatch,
+    #[error("Git repository belongs to a different workspace")]
+    RepositoryMismatch,
+}
+
+#[derive(Debug, Error)]
 pub enum GitError {
     #[error("could not run git {operation}: {source}")]
     Io {
@@ -159,11 +169,17 @@ impl GitRepo {
 }
 
 pub fn apply_and_commit(
-    _workspace: &Workspace,
+    workspace: &Workspace,
     repo: &GitRepo,
     operation: FileOperation,
     intent: CommitIntent,
-) -> Result<MutationCommitOutcome, FileError> {
+) -> Result<MutationCommitOutcome, MutationCommitError> {
+    if operation.workspace_root() != workspace.root() {
+        return Err(MutationCommitError::WorkspaceMismatch);
+    }
+    if repo.root != workspace.root() {
+        return Err(MutationCommitError::RepositoryMismatch);
+    }
     let file = Workspace::apply(operation)?;
     Ok(match repo.commit_all(intent) {
         Ok(commit) => MutationCommitOutcome::Applied { file, commit },

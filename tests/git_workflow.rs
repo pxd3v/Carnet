@@ -4,7 +4,10 @@ use std::{
     process::{Command, Output},
 };
 
-use carnet::git::{CommitIntent, CommitOutcome, GitRepo, MutationCommitOutcome, apply_and_commit};
+use carnet::git::{
+    CommitIntent, CommitOutcome, GitRepo, MutationCommitError, MutationCommitOutcome,
+    apply_and_commit,
+};
 use carnet::{
     catalog::RepoEntry,
     workspace::{FileOperation, Workspace},
@@ -325,6 +328,63 @@ fn a_filesystem_conflict_is_an_error_and_does_not_attempt_a_commit() {
     assert_eq!(repo.status(), " M note.md\n");
 }
 
+#[test]
+fn rejects_an_operation_from_another_workspace_before_mutating_or_staging_either_repo() {
+    let repo_a = TestRepo::initialized_with_commit("a.md");
+    let repo_b = TestRepo::initialized_with_commit("b.md");
+    let workspace_a = open_workspace(repo_a.path());
+    let workspace_b = open_workspace(repo_b.path());
+
+    let result = apply_and_commit(
+        &workspace_a,
+        &repo_a.git,
+        FileOperation::CreateFile {
+            workspace: workspace_b,
+            path: PathBuf::from("wrong-repo.md"),
+        },
+        CommitIntent::Create(PathBuf::from("wrong-repo.md")),
+    );
+
+    assert!(matches!(
+        result,
+        Err(MutationCommitError::WorkspaceMismatch)
+    ));
+    assert!(!repo_a.path().join("wrong-repo.md").exists());
+    assert!(!repo_b.path().join("wrong-repo.md").exists());
+    assert_eq!(repo_a.status(), "");
+    assert_eq!(repo_b.status(), "");
+    assert_eq!(repo_a.subjects(), vec!["carnet: create a.md"]);
+    assert_eq!(repo_b.subjects(), vec!["carnet: create b.md"]);
+}
+
+#[test]
+fn rejects_a_git_repo_from_another_workspace_before_mutating_or_staging_either_repo() {
+    let repo_a = TestRepo::initialized_with_commit("a.md");
+    let repo_b = TestRepo::initialized_with_commit("b.md");
+    let workspace_a = open_workspace(repo_a.path());
+
+    let result = apply_and_commit(
+        &workspace_a,
+        &repo_b.git,
+        FileOperation::CreateFile {
+            workspace: workspace_a.clone(),
+            path: PathBuf::from("wrong-repo.md"),
+        },
+        CommitIntent::Create(PathBuf::from("wrong-repo.md")),
+    );
+
+    assert!(matches!(
+        result,
+        Err(MutationCommitError::RepositoryMismatch)
+    ));
+    assert!(!repo_a.path().join("wrong-repo.md").exists());
+    assert!(!repo_b.path().join("wrong-repo.md").exists());
+    assert_eq!(repo_a.status(), "");
+    assert_eq!(repo_b.status(), "");
+    assert_eq!(repo_a.subjects(), vec!["carnet: create a.md"]);
+    assert_eq!(repo_b.subjects(), vec!["carnet: create b.md"]);
+}
+
 struct TestRepo {
     _temp: TempDir,
     git: GitRepo,
@@ -346,6 +406,15 @@ impl TestRepo {
         let repo = Self { _temp: temp, git };
         repo.git_ok(["config", "user.name", "Carnet Test"]);
         repo.git_ok(["config", "user.email", "carnet@example.test"]);
+        repo
+    }
+
+    fn initialized_with_commit(path: &str) -> Self {
+        let repo = Self::initialized();
+        fs::write(repo.path().join(path), "baseline\n").unwrap();
+        repo.git
+            .commit_all(CommitIntent::Create(PathBuf::from(path)))
+            .unwrap();
         repo
     }
 
