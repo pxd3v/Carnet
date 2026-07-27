@@ -26,6 +26,9 @@ pub fn map_key(app: &App, key: KeyEvent) -> Option<AppEvent> {
         Screen::Workspace(workspace) if workspace.focus == Focus::Tree => {
             tree_action(key).map(|action| AppEvent::Action(AppAction::Tree(action)))
         }
+        Screen::Workspace(_) if key.code == KeyCode::Esc => {
+            Some(AppEvent::Action(AppAction::BrowseFiles))
+        }
         Screen::Workspace(_) => {
             editor_action(key).map(|action| AppEvent::Action(AppAction::Editor(action)))
         }
@@ -253,7 +256,15 @@ fn tree_action(key: KeyEvent) -> Option<TreeAction> {
 
 fn editor_action(key: KeyEvent) -> Option<EditorCommand> {
     let extend_selection = key.modifiers.contains(KeyModifiers::SHIFT);
+    let command = key.modifiers.contains(KeyModifiers::SUPER);
+    let option = key.modifiers.contains(KeyModifiers::ALT);
     let motion = match key.code {
+        KeyCode::Left if command => Some(Motion::LineStart),
+        KeyCode::Right if command => Some(Motion::LineEnd),
+        KeyCode::Up if command => Some(Motion::DocumentStart),
+        KeyCode::Down if command => Some(Motion::DocumentEnd),
+        KeyCode::Left if option => Some(Motion::WordLeft),
+        KeyCode::Right if option => Some(Motion::WordRight),
         KeyCode::Left => Some(Motion::Left),
         KeyCode::Right => Some(Motion::Right),
         KeyCode::Up => Some(Motion::Up),
@@ -277,7 +288,7 @@ fn editor_action(key: KeyEvent) -> Option<EditorCommand> {
         KeyCode::Char(character)
             if !key
                 .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
         {
             Some(EditorCommand::Insert(character.to_string()))
         }

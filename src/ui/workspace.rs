@@ -64,7 +64,7 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &App, workspace: &WorkspaceStat
     ])
     .areas(frame.area());
     let geometry = workspace_geometry(main, app.sidebar.visible);
-    render_editor(frame, geometry.editor, workspace);
+    render_editor(frame, geometry.editor, app, workspace);
     if let Some(tree) = geometry.tree {
         if geometry.tree_is_overlay {
             frame.render_widget(Clear, tree);
@@ -86,12 +86,12 @@ fn render_shortcuts(frame: &mut Frame<'_>, area: Rect, focus: Focus) {
         shortcut_line(
             "Files",
             focus == Focus::Tree,
-            "↑↓ Select  ←→ Fold  Enter Open  n New File  N New Folder  r Rename  m Move  Del Delete  Esc Editor",
+            "↑↓ Preview  →/Enter Folder  ← Parent  Enter Edit  n File  N Folder  r Rename  m Move  Del Delete",
         ),
         shortcut_line(
             "Editor",
             focus == Focus::Editor,
-            "Arrows Move  S-Arrows Select  Enter Newline  Tab Indent  S-Tab Outdent  Home/End Line Start/End",
+            "Esc Files  ⌥←→ Word  ⌘←→ Line  ⌘↑↓ Doc  Enter/S-Enter Newline  Tab/S-Tab Indent",
         ),
     ];
     frame.render_widget(Paragraph::new(lines), area);
@@ -109,7 +109,7 @@ fn shortcut_line(label: &'static str, active: bool, shortcuts: &'static str) -> 
 }
 
 fn render_tree(frame: &mut Frame<'_>, area: Rect, workspace: &WorkspaceState, overlay: bool) {
-    let entries = visible_tree(&workspace.tree, &workspace.expanded);
+    let entries = visible_tree(&workspace.tree, &workspace.browser_directory);
     let viewport = selection_viewport(
         entries.len(),
         workspace.tree_selection,
@@ -123,7 +123,6 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, workspace: &WorkspaceState, ov
         .map(|(index, entry)| {
             let selected = workspace.tree_selection == Some(index);
             let icon = match entry.kind {
-                TreeEntryKind::Directory if workspace.expanded.contains(&entry.path) => "▾",
                 TreeEntryKind::Directory => "▸",
                 TreeEntryKind::File if entry.enabled => "•",
                 TreeEntryKind::File => "×",
@@ -142,10 +141,7 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, workspace: &WorkspaceState, ov
             if selected {
                 style = style.bg(Color::Blue).fg(Color::White);
             }
-            ListItem::new(Line::styled(
-                format!("{}{} {name}", "  ".repeat(entry.depth), icon),
-                style,
-            ))
+            ListItem::new(Line::styled(format!("{icon} {name}"), style))
         })
         .collect::<Vec<_>>();
     let focused = workspace.focus == Focus::Tree;
@@ -154,10 +150,15 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, workspace: &WorkspaceState, ov
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let title = if overlay {
-        " Files · overlay "
+    let directory = if workspace.browser_directory.as_os_str().is_empty() {
+        "/".to_owned()
     } else {
-        " Files "
+        workspace.browser_directory.display().to_string()
+    };
+    let title = if overlay {
+        format!(" Files · {directory} · overlay ")
+    } else {
+        format!(" Files · {directory} ")
     };
     frame.render_widget(
         List::new(items).block(
@@ -170,18 +171,18 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, workspace: &WorkspaceState, ov
     );
 }
 
-fn render_editor(frame: &mut Frame<'_>, area: Rect, workspace: &WorkspaceState) {
+fn render_editor(frame: &mut Frame<'_>, area: Rect, app: &App, workspace: &WorkspaceState) {
     let focused = workspace.focus == Focus::Editor;
     let border_style = if focused {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let title = workspace
-        .current_note
-        .as_deref()
-        .map(|path| format!(" {} ", path.display()))
-        .unwrap_or_else(|| " Editor ".into());
+    let mode = if focused { "Editing" } else { "Preview" };
+    let title = workspace.current_note.as_deref().map_or_else(
+        || format!(" {mode} "),
+        |path| format!(" {mode} · {} ", path.display()),
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
@@ -199,10 +200,18 @@ fn render_editor(frame: &mut Frame<'_>, area: Rect, workspace: &WorkspaceState) 
         .unwrap_or_default();
     let content = workspace.editor.as_ref().map_or_else(
         || {
+            let loading = matches!(
+                app.pending_request,
+                Some(crate::app::PendingRequest::LoadNote { .. })
+            );
             Text::from(vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  Select a text file from the tree to begin.",
+                    if loading {
+                        "  Loading preview…"
+                    } else {
+                        "  Select a text file from Files to preview it."
+                    },
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
@@ -395,33 +404,15 @@ struct VisibleTreeEntry {
     path: PathBuf,
     kind: TreeEntryKind,
     enabled: bool,
-    depth: usize,
 }
 
-fn visible_tree(
-    entries: &[TreeEntry],
-    expanded: &std::collections::BTreeSet<PathBuf>,
-) -> Vec<VisibleTreeEntry> {
-    fn collect(
-        output: &mut Vec<VisibleTreeEntry>,
-        entries: &[TreeEntry],
-        expanded: &std::collections::BTreeSet<PathBuf>,
-        depth: usize,
-    ) {
-        for entry in entries {
-            output.push(VisibleTreeEntry {
-                path: entry.path().to_path_buf(),
-                kind: entry.kind(),
-                enabled: entry.is_enabled(),
-                depth,
-            });
-            if entry.kind() == TreeEntryKind::Directory && expanded.contains(entry.path()) {
-                collect(output, entry.children(), expanded, depth + 1);
-            }
-        }
-    }
-
-    let mut output = Vec::new();
-    collect(&mut output, entries, expanded, 0);
-    output
+fn visible_tree(entries: &[TreeEntry], directory: &std::path::Path) -> Vec<VisibleTreeEntry> {
+    crate::app::directory_entries(entries, directory)
+        .iter()
+        .map(|entry| VisibleTreeEntry {
+            path: entry.path().to_path_buf(),
+            kind: entry.kind(),
+            enabled: entry.is_enabled(),
+        })
+        .collect()
 }

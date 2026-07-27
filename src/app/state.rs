@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, path::PathBuf};
+use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
@@ -88,7 +88,14 @@ pub enum PendingRequest {
         request_id: RequestId,
         repository_id: Uuid,
         path: PathBuf,
+        purpose: NoteLoadPurpose,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NoteLoadPurpose {
+    Preview,
+    Edit,
 }
 
 impl PendingRequest {
@@ -123,8 +130,28 @@ pub struct WorkspaceState {
     pub editor_instance_id: Option<EditorInstanceId>,
     pub editor_revision: u64,
     pub focus: Focus,
+    pub browser_directory: PathBuf,
     pub tree_selection: Option<usize>,
-    pub expanded: BTreeSet<PathBuf>,
+}
+
+pub(crate) fn directory_entries<'a>(entries: &'a [TreeEntry], directory: &Path) -> &'a [TreeEntry] {
+    if directory.as_os_str().is_empty() {
+        return entries;
+    }
+    fn find<'a>(entries: &'a [TreeEntry], directory: &Path) -> Option<&'a [TreeEntry]> {
+        for entry in entries {
+            if entry.kind() == TreeEntryKind::Directory {
+                if entry.path() == directory {
+                    return Some(entry.children());
+                }
+                if let Some(children) = find(entry.children(), directory) {
+                    return Some(children);
+                }
+            }
+        }
+        None
+    }
+    find(entries, directory).unwrap_or(&[])
 }
 
 impl WorkspaceState {
@@ -278,6 +305,7 @@ pub struct PendingFileMutation {
 pub enum PendingIntent {
     Navigation(NavigationAction),
     Mutation(PendingFileMutation),
+    BrowseFiles,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

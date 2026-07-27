@@ -92,6 +92,8 @@ impl Clipboard for FallbackClipboard {
 pub enum Motion {
     Left,
     Right,
+    WordLeft,
+    WordRight,
     Up,
     Down,
     LineStart,
@@ -269,13 +271,13 @@ impl Editor {
         if !extend_selection {
             if let Some(selection) = self.selection() {
                 match motion {
-                    Motion::Left => {
+                    Motion::Left | Motion::WordLeft => {
                         self.cursor = selection.start;
                         self.anchor = None;
                         self.preferred_column = None;
                         return EditorOutcome::Moved;
                     }
-                    Motion::Right => {
+                    Motion::Right | Motion::WordRight => {
                         self.cursor = selection.end;
                         self.anchor = None;
                         self.preferred_column = None;
@@ -296,6 +298,14 @@ impl Editor {
             Motion::Right => {
                 self.preferred_column = None;
                 self.buffer.next_grapheme_boundary(self.cursor)
+            }
+            Motion::WordLeft => {
+                self.preferred_column = None;
+                self.buffer.previous_word_start(self.cursor)
+            }
+            Motion::WordRight => {
+                self.preferred_column = None;
+                self.buffer.next_word_end(self.cursor)
             }
             Motion::Up => {
                 let (target, column) =

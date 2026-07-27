@@ -162,7 +162,7 @@ impl App {
         self.dialog = Some(Dialog::SavedCommitFailed { message });
         reconciliation
             .note_to_load
-            .map(|path| self.request_note_load(path))
+            .map(|path| self.request_note_reload(path))
             .unwrap_or_default()
     }
 
@@ -188,7 +188,7 @@ impl App {
         if reconciliation.tree_error.is_some() {
             return reconciliation
                 .note_to_load
-                .map(|path| self.request_note_load(path))
+                .map(|path| self.request_note_reload(path))
                 .unwrap_or_default();
         }
         if matches!(pending.kind, PendingMutationKind::Save { .. }) {
@@ -205,7 +205,7 @@ impl App {
         }
         reconciliation
             .note_to_load
-            .map(|path| self.request_note_load(path))
+            .map(|path| self.request_note_reload(path))
             .unwrap_or_default()
     }
 
@@ -249,7 +249,14 @@ impl App {
                         .as_deref()
                         .and_then(|path| rebase_path(path, &from, &to))
                     {
-                        note_to_load = Some(rebased);
+                        if workspace.focus == crate::app::Focus::Tree && rebased != to {
+                            workspace.current_note = None;
+                            workspace.editor = None;
+                            workspace.editor_instance_id = None;
+                            workspace.editor_revision = 0;
+                        } else {
+                            note_to_load = Some(rebased);
+                        }
                     }
                 }
                 FileOutcome::Deleted(path) => {

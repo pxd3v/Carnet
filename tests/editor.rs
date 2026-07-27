@@ -114,6 +114,22 @@ fn vertical_motion_preserves_a_visual_column_across_short_lines() {
 }
 
 #[test]
+fn word_motion_skips_spacing_and_punctuation_on_unicode_boundaries() {
+    let mut editor = editor_from("words.md", "one  café, 世界");
+
+    editor.apply(move_command(Motion::WordRight, false));
+    assert_eq!(editor.cursor(), 3);
+    editor.apply(move_command(Motion::WordRight, false));
+    assert_eq!(editor.cursor(), 9);
+    editor.apply(move_command(Motion::WordRight, true));
+    assert_eq!(editor.selected_text().as_deref(), Some(", 世"));
+    editor.apply(move_command(Motion::WordLeft, false));
+    assert_eq!(editor.cursor(), 9);
+    editor.apply(move_command(Motion::WordLeft, false));
+    assert_eq!(editor.cursor(), 5);
+}
+
+#[test]
 fn insertion_deletion_and_newline_replace_whole_selections() {
     let mut editor = editor_from("edit.md", "one👩‍🚀two");
     editor.apply(move_command(Motion::Right, true));

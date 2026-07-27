@@ -12,11 +12,12 @@ use crate::{
 use super::{
     App, AppEffect, AppExitStatus, CatalogSnapshot, ClipboardRequestId, CommitStatus,
     DefaultChoiceState, Dialog, EditorInstanceId, EditorOrigin, ExternalConflict, FailureKind,
-    FileActionKind, FileMutationAction, Focus, MutationId, NavigationAction, OverlayState,
-    PendingCatalogOperation, PendingClipboardRead, PendingDefaultIntent, PendingFileMutation,
-    PendingIntent, PendingMutation, PendingMutationKind, PendingRequest, PendingSave,
-    RepositoryActionKind, RepositoryAvailability, RepositoryFormField, RepositoryFormState,
-    RequestId, RuntimeFailure, Screen, UnresolvedFailure, WorkspaceOrigin, WorkspaceState,
+    FileActionKind, FileMutationAction, Focus, MutationId, NavigationAction, NoteLoadPurpose,
+    OverlayState, PendingCatalogOperation, PendingClipboardRead, PendingDefaultIntent,
+    PendingFileMutation, PendingIntent, PendingMutation, PendingMutationKind, PendingRequest,
+    PendingSave, RepositoryActionKind, RepositoryAvailability, RepositoryFormField,
+    RepositoryFormState, RequestId, RuntimeFailure, Screen, UnresolvedFailure, WorkspaceOrigin,
+    WorkspaceState, directory_entries,
 };
 use super::{RuntimeError, RuntimeOperation};
 
@@ -84,6 +85,7 @@ pub enum AppAction {
     Editor(EditorCommand),
     Navigate(NavigationAction),
     Focus(Focus),
+    BrowseFiles,
     Tree(TreeAction),
     Dismiss,
     SetDialogInput(String),
@@ -325,10 +327,21 @@ impl App {
                     }
                     _ => {}
                 }
+                let resume_browse = matches!(
+                    (&self.dialog, &self.pending_intent),
+                    (
+                        Some(Dialog::SavedCommitFailed { .. }),
+                        Some(PendingIntent::BrowseFiles)
+                    )
+                );
                 self.dialog = None;
                 self.dialog_input.clear();
                 self.repository_form = RepositoryFormState::default();
                 self.overlay = OverlayState::None;
+                if resume_browse {
+                    self.pending_intent = None;
+                    self.perform_browse_files();
+                }
                 Vec::new()
             }
             AppEvent::Action(AppAction::SetDialogInput(input)) => {
@@ -432,6 +445,7 @@ impl App {
                 }
                 Vec::new()
             }
+            AppEvent::Action(AppAction::BrowseFiles) => self.request_browse_files(),
             AppEvent::Action(AppAction::Tree(action)) => self.tree_action(action),
             AppEvent::MutationFailed {
                 mutation_id,
@@ -686,18 +700,19 @@ impl App {
                 Vec::new()
             }
             AppEvent::Action(AppAction::Global(GlobalAction::ToggleSidebar)) => {
-                if let Screen::Workspace(workspace) = &mut self.screen {
-                    match workspace.focus {
-                        Focus::Editor => {
-                            self.sidebar.visible = true;
-                            workspace.focus = Focus::Tree;
-                        }
-                        Focus::Tree => {
-                            self.sidebar.visible = false;
-                            self.sidebar.overlay_intent = false;
-                            workspace.focus = Focus::Editor;
-                        }
-                    }
+                let focus = match &self.screen {
+                    Screen::Workspace(workspace) => workspace.focus,
+                    Screen::Home => return Vec::new(),
+                };
+                if focus == Focus::Editor {
+                    return self.request_browse_files();
+                }
+                if let Screen::Workspace(workspace) = &mut self.screen
+                    && workspace.editor.is_some()
+                {
+                    self.sidebar.visible = false;
+                    self.sidebar.overlay_intent = false;
+                    workspace.focus = Focus::Editor;
                 }
                 Vec::new()
             }
@@ -1246,6 +1261,10 @@ impl App {
     fn perform_intent(&mut self, intent: PendingIntent) -> Vec<AppEffect> {
         match intent {
             PendingIntent::Navigation(target) => self.perform_navigation(target),
+            PendingIntent::BrowseFiles => {
+                self.perform_browse_files();
+                Vec::new()
+            }
             PendingIntent::Mutation(action) => {
                 if self.pending_request.is_some() {
                     self.pending_intent = Some(PendingIntent::Mutation(action));
@@ -1285,6 +1304,41 @@ impl App {
         }
     }
 
+    fn request_browse_files(&mut self) -> Vec<AppEffect> {
+        let dirty = matches!(
+            &self.screen,
+            Screen::Workspace(workspace)
+                if workspace.focus == Focus::Editor
+                    && workspace.editor.as_ref().is_some_and(Editor::is_dirty)
+        );
+        if self.pending_mutation.is_some() {
+            return Vec::new();
+        }
+        if dirty {
+            self.pending_intent = Some(PendingIntent::BrowseFiles);
+            self.dialog = Some(Dialog::DirtyNavigation);
+            return Vec::new();
+        }
+        self.perform_browse_files();
+        Vec::new()
+    }
+
+    fn perform_browse_files(&mut self) {
+        let current_note = match &self.screen {
+            Screen::Workspace(workspace) if workspace.editor.is_some() => {
+                workspace.current_note.clone()
+            }
+            _ => return,
+        };
+        if let Screen::Workspace(workspace) = &mut self.screen {
+            workspace.focus = Focus::Tree;
+            self.sidebar.visible = true;
+            if let Some(path) = current_note {
+                select_tree_path(workspace, &path);
+            }
+        }
+    }
+
     fn perform_navigation(&mut self, target: NavigationAction) -> Vec<AppEffect> {
         match target {
             NavigationAction::Home => {
@@ -1298,7 +1352,7 @@ impl App {
             NavigationAction::Repository { repository, note } => {
                 self.request_open_workspace(repository, note)
             }
-            NavigationAction::Note(path) => self.request_note_load(path),
+            NavigationAction::Note(path) => self.request_note_load(path, NoteLoadPurpose::Edit),
             NavigationAction::Quit => {
                 self.quit.requested = true;
                 self.quit.final_status = None;
@@ -1367,7 +1421,11 @@ impl App {
         }]
     }
 
-    fn request_note_load(&mut self, path: std::path::PathBuf) -> Vec<AppEffect> {
+    pub(super) fn request_note_load(
+        &mut self,
+        path: std::path::PathBuf,
+        purpose: NoteLoadPurpose,
+    ) -> Vec<AppEffect> {
         self.pending_clipboard_read = None;
         let (repository_id, workspace) = match &self.screen {
             Screen::Workspace(workspace) => (workspace.repository.id, workspace.workspace.clone()),
@@ -1378,6 +1436,7 @@ impl App {
             request_id,
             repository_id,
             path: path.clone(),
+            purpose,
         });
         vec![AppEffect::LoadNote {
             request_id,
@@ -1385,6 +1444,16 @@ impl App {
             workspace,
             path,
         }]
+    }
+
+    pub(super) fn request_note_reload(&mut self, path: std::path::PathBuf) -> Vec<AppEffect> {
+        let purpose = match &self.screen {
+            Screen::Workspace(workspace) if workspace.focus == Focus::Tree => {
+                NoteLoadPurpose::Preview
+            }
+            _ => NoteLoadPurpose::Edit,
+        };
+        self.request_note_load(path, purpose)
     }
 
     fn tree_action(&mut self, action: TreeAction) -> Vec<AppEffect> {
@@ -1416,7 +1485,14 @@ impl App {
             Screen::Workspace(workspace) => (
                 workspace.focus,
                 workspace_origin(workspace),
-                visible_tree(&workspace.tree, &workspace.expanded),
+                directory_entries(&workspace.tree, &workspace.browser_directory)
+                    .iter()
+                    .map(|entry| VisibleTreeEntry {
+                        path: entry.path().to_path_buf(),
+                        kind: entry.kind(),
+                        enabled: entry.is_enabled(),
+                    })
+                    .collect::<Vec<_>>(),
                 workspace.tree_selection,
             ),
             Screen::Home => return Vec::new(),
@@ -1424,13 +1500,22 @@ impl App {
         if focus != Focus::Tree {
             return Vec::new();
         }
+        if matches!(
+            action,
+            TreeAction::Up
+                | TreeAction::Down
+                | TreeAction::Left
+                | TreeAction::Right
+                | TreeAction::Open
+                | TreeAction::Escape
+        ) && matches!(
+            &self.screen,
+            Screen::Workspace(workspace)
+                if workspace.editor.as_ref().is_some_and(Editor::is_dirty)
+        ) {
+            return Vec::new();
+        }
         if action == TreeAction::Escape {
-            if let Screen::Workspace(workspace) = &mut self.screen {
-                workspace.focus = Focus::Editor;
-            }
-            if self.sidebar.overlay_intent {
-                self.sidebar.visible = false;
-            }
             return Vec::new();
         }
         if entries.is_empty() {
@@ -1457,46 +1542,82 @@ impl App {
                 if let Screen::Workspace(workspace) = &mut self.screen {
                     workspace.tree_selection = Some(selected.saturating_sub(1));
                 }
+                return self.reconcile_browser_preview();
             }
             TreeAction::Down => {
                 if let Screen::Workspace(workspace) = &mut self.screen {
                     workspace.tree_selection = Some((selected + 1).min(entries.len() - 1));
                 }
+                return self.reconcile_browser_preview();
             }
             TreeAction::Right => {
                 if entries[selected].kind == TreeEntryKind::Directory
                     && let Screen::Workspace(workspace) = &mut self.screen
                 {
-                    workspace.expanded.insert(entries[selected].path.clone());
+                    workspace.browser_directory = entries[selected].path.clone();
+                    workspace.tree_selection =
+                        (!directory_entries(&workspace.tree, &workspace.browser_directory)
+                            .is_empty())
+                        .then_some(0);
                 }
+                return self.reconcile_browser_preview();
             }
             TreeAction::Left => {
                 if let Screen::Workspace(workspace) = &mut self.screen {
-                    if entries[selected].kind == TreeEntryKind::Directory
-                        && workspace.expanded.remove(&entries[selected].path)
-                    {
+                    let exited = workspace.browser_directory.clone();
+                    if exited.as_os_str().is_empty() {
                         return Vec::new();
                     }
-                    if let Some(parent) = &entries[selected].parent
-                        && let Some(parent_index) = entries
-                            .iter()
-                            .position(|entry| entry.path.as_path() == parent.as_path())
-                    {
-                        workspace.tree_selection = Some(parent_index);
-                    }
+                    let parent = exited.parent().unwrap_or_else(|| std::path::Path::new(""));
+                    workspace.browser_directory = parent.to_path_buf();
+                    let parent_entries =
+                        directory_entries(&workspace.tree, &workspace.browser_directory);
+                    workspace.tree_selection = parent_entries
+                        .iter()
+                        .position(|entry| entry.path() == exited.as_path())
+                        .or_else(|| (!parent_entries.is_empty()).then_some(0));
                 }
+                return self.reconcile_browser_preview();
             }
             TreeAction::Open => {
                 if entries[selected].kind == TreeEntryKind::Directory {
-                    if let Screen::Workspace(workspace) = &mut self.screen
-                        && !workspace.expanded.remove(&entries[selected].path)
-                    {
-                        workspace.expanded.insert(entries[selected].path.clone());
+                    if let Screen::Workspace(workspace) = &mut self.screen {
+                        workspace.browser_directory = entries[selected].path.clone();
+                        workspace.tree_selection =
+                            (!directory_entries(&workspace.tree, &workspace.browser_directory)
+                                .is_empty())
+                            .then_some(0);
                     }
+                    return self.reconcile_browser_preview();
                 } else if entries[selected].enabled {
-                    return self.update(AppEvent::Action(AppAction::Navigate(
-                        NavigationAction::Note(entries[selected].path.clone()),
-                    )));
+                    let path = entries[selected].path.clone();
+                    let loaded = matches!(
+                        &self.screen,
+                        Screen::Workspace(workspace)
+                            if workspace.current_note.as_deref() == Some(path.as_path())
+                                && workspace.editor.is_some()
+                    );
+                    if loaded {
+                        if let Screen::Workspace(workspace) = &mut self.screen {
+                            workspace.focus = Focus::Editor;
+                        }
+                        if self.sidebar.overlay_intent {
+                            self.sidebar.visible = false;
+                        }
+                        return Vec::new();
+                    }
+                    if let Some(PendingRequest::LoadNote {
+                        path: pending_path,
+                        purpose,
+                        ..
+                    }) = &mut self.pending_request
+                        && pending_path == &path
+                    {
+                        *purpose = NoteLoadPurpose::Edit;
+                        return Vec::new();
+                    }
+                    self.clear_preview();
+                    return self.request_note_load(path, NoteLoadPurpose::Edit);
                 }
             }
             TreeAction::NewFile | TreeAction::NewFolder | TreeAction::Rename | TreeAction::Move => {
@@ -1525,6 +1646,53 @@ impl App {
         Vec::new()
     }
 
+    fn clear_preview(&mut self) {
+        if matches!(self.pending_request, Some(PendingRequest::LoadNote { .. })) {
+            self.pending_request = None;
+        }
+        if let Screen::Workspace(workspace) = &mut self.screen {
+            workspace.current_note = None;
+            workspace.editor = None;
+            workspace.editor_instance_id = None;
+            workspace.editor_revision = 0;
+        }
+        self.pending_clipboard_read = None;
+    }
+
+    pub(super) fn reconcile_browser_preview(&mut self) -> Vec<AppEffect> {
+        if matches!(
+            &self.screen,
+            Screen::Workspace(workspace)
+                if workspace.editor.as_ref().is_some_and(Editor::is_dirty)
+        ) {
+            return Vec::new();
+        }
+        let entry = match &self.screen {
+            Screen::Workspace(workspace) if workspace.focus == Focus::Tree => workspace
+                .tree_selection
+                .and_then(|selected| {
+                    directory_entries(&workspace.tree, &workspace.browser_directory).get(selected)
+                })
+                .map(|entry| (entry.path().to_path_buf(), entry.kind(), entry.is_enabled())),
+            _ => None,
+        };
+        let Some((path, TreeEntryKind::File, true)) = entry else {
+            self.clear_preview();
+            return Vec::new();
+        };
+        let already_loaded = matches!(
+            &self.screen,
+            Screen::Workspace(workspace)
+                if workspace.current_note.as_deref() == Some(path.as_path())
+                    && workspace.editor.is_some()
+        );
+        if already_loaded {
+            return Vec::new();
+        }
+        self.clear_preview();
+        self.request_note_load(path, NoteLoadPurpose::Preview)
+    }
+
     fn submit_file_action(&mut self, path: std::path::PathBuf) -> Vec<AppEffect> {
         if self.pending_mutation.is_some() || self.pending_request.is_some() {
             return Vec::new();
@@ -1541,6 +1709,18 @@ impl App {
         if !self.workspace_origin_matches(&origin) {
             return Vec::new();
         }
+        let path = if matches!(kind, FileActionKind::NewFile | FileActionKind::NewFolder) {
+            match &self.screen {
+                Screen::Workspace(workspace)
+                    if !workspace.browser_directory.as_os_str().is_empty() =>
+                {
+                    workspace.browser_directory.join(path)
+                }
+                _ => path,
+            }
+        } else {
+            path
+        };
         let action = match kind {
             FileActionKind::NewFile => FileMutationAction::CreateFile { path },
             FileActionKind::NewFolder => FileMutationAction::CreateFolder { path },
@@ -1690,52 +1870,37 @@ struct VisibleTreeEntry {
     path: std::path::PathBuf,
     kind: TreeEntryKind,
     enabled: bool,
-    parent: Option<std::path::PathBuf>,
-}
-
-fn visible_tree(
-    entries: &[TreeEntry],
-    expanded: &std::collections::BTreeSet<std::path::PathBuf>,
-) -> Vec<VisibleTreeEntry> {
-    fn collect(
-        output: &mut Vec<VisibleTreeEntry>,
-        entries: &[TreeEntry],
-        expanded: &std::collections::BTreeSet<std::path::PathBuf>,
-        parent: Option<&std::path::Path>,
-    ) {
-        for entry in entries {
-            output.push(VisibleTreeEntry {
-                path: entry.path().to_path_buf(),
-                kind: entry.kind(),
-                enabled: entry.is_enabled(),
-                parent: parent.map(std::path::Path::to_path_buf),
-            });
-            if entry.kind() == TreeEntryKind::Directory && expanded.contains(entry.path()) {
-                collect(output, entry.children(), expanded, Some(entry.path()));
-            }
-        }
-    }
-
-    let mut output = Vec::new();
-    collect(&mut output, entries, expanded, None);
-    output
 }
 
 fn select_tree_path(workspace: &mut WorkspaceState, path: &std::path::Path) {
-    let mut parent = path.parent();
-    while let Some(directory) = parent.filter(|directory| !directory.as_os_str().is_empty()) {
-        workspace.expanded.insert(directory.to_path_buf());
-        parent = directory.parent();
-    }
-    let entries = visible_tree(&workspace.tree, &workspace.expanded);
+    workspace.browser_directory = path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""))
+        .to_path_buf();
+    let entries = directory_entries(&workspace.tree, &workspace.browser_directory);
     workspace.tree_selection = entries
         .iter()
-        .position(|entry| entry.path == path)
+        .position(|entry| entry.path() == path)
         .or_else(|| (!entries.is_empty()).then_some(entries.len() - 1));
 }
 
 fn clamp_tree_selection(workspace: &mut WorkspaceState) {
-    let entry_count = visible_tree(&workspace.tree, &workspace.expanded).len();
+    fn has_directory(entries: &[TreeEntry], directory: &std::path::Path) -> bool {
+        entries.iter().any(|entry| {
+            entry.kind() == TreeEntryKind::Directory
+                && (entry.path() == directory || has_directory(entry.children(), directory))
+        })
+    }
+    while !workspace.browser_directory.as_os_str().is_empty()
+        && !has_directory(&workspace.tree, &workspace.browser_directory)
+    {
+        workspace.browser_directory = workspace
+            .browser_directory
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(""))
+            .to_path_buf();
+    }
+    let entry_count = directory_entries(&workspace.tree, &workspace.browser_directory).len();
     workspace.tree_selection = if entry_count == 0 {
         None
     } else {

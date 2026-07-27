@@ -11,7 +11,7 @@ These shortcuts work from the applicable repository workspace unless a dialog or
 | `Ctrl+S` | Save the current note, or retry a failed Git commit without rewriting the file |
 | `Ctrl+F` | Open literal find in the current note |
 | `Ctrl+P` | Open quick open for text files in the current repository |
-| `Ctrl+B` | Focus/show the tree; from the tree, hide it and return to the editor |
+| `Ctrl+B` | Safely return to Files from Editing; from Files, hide it and edit the current preview |
 | `Ctrl+Z` | Undo |
 | `Ctrl+Shift+Z` or `Ctrl+Y` | Redo |
 | `Ctrl+C` | Copy the selection |
@@ -36,24 +36,23 @@ Terminal bracketed-paste input is inserted as one editor transaction, so one und
 
 When a CLI note path is waiting for a default, choosing the default resumes that exact path.
 
-## Tree
+## Files and Preview
 
-Use `Ctrl+B` to enter tree focus.
+Files is a current-folder browser. Selecting a text file previews it on the right without enabling edits.
 
 | Key | Action |
 | --- | --- |
-| `Up` / `Down` | Move through visible entries |
-| `Right` | Expand a selected directory |
-| `Left` | Collapse a directory or move to its visible parent |
-| `Enter` | Open a text file, or toggle a directory |
+| `Up` / `Down` | Select an entry and preview it when it is a text file |
+| `Right` or `Enter` on a folder | Enter the folder and show only its direct children |
+| `Left` | Return to the parent folder |
+| `Enter` on a text file | Move to Editing for the selected preview |
 | `n` | Create a file |
 | `Shift+N` | Create a folder |
 | `r` | Rename the selected file or folder |
 | `m` | Move the selected file or folder |
 | `Delete` | Open delete confirmation |
-| `Escape` | Return to the editor; also closes a narrow-width tree overlay |
 
-Binary/non-UTF-8 files and symlinks can appear in the tree but cannot be opened as notes.
+Selecting a folder, binary/non-UTF-8 file, or symlink clears the preview. Binary files and symlinks cannot be edited as notes.
 
 ## Editor
 
@@ -62,11 +61,17 @@ Binary/non-UTF-8 files and symlinks can appear in the tree but cannot be opened 
 | Arrow keys | Move by grapheme horizontally or by visual column vertically |
 | `Shift` + arrow key | Extend the selection |
 | `Home` / `End` | Move to the start/end of the current line; hold `Shift` to select |
+| `Option+Left` / `Option+Right` | Move to the previous word start / next word end |
+| `Command+Left` / `Command+Right` | Move to the start/end of the current line |
+| `Command+Up` / `Command+Down` | Move to the start/end of the document |
 | Text input | Replace the selection or insert at the cursor |
-| `Enter` | Insert a newline |
+| `Enter` or `Shift+Enter` | Insert a newline |
 | `Backspace` / `Delete` | Delete before/after the cursor, or delete the selection |
 | `Tab` | Indent the selected lines or current line |
 | `Shift+Tab` | Outdent the selected lines or current line |
+| `Escape` | Return to Files; prompts Save / Discard / Cancel when modified |
+
+Adding Shift to Option/Command movement extends the selection. Carnet receives Option as Alt and Command as Super; your terminal must forward those combinations instead of reserving them.
 
 Save, find, quick open, sidebar, undo/redo, clipboard, select-all, and quit use the global shortcuts above.
 

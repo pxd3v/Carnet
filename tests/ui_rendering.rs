@@ -410,12 +410,12 @@ fn workspace_footer_exposes_global_file_and_editor_shortcuts() {
     assert!(output.contains("^S Save"), "{output}");
     assert!(output.contains("^Q Quit"), "{output}");
     assert!(output.contains("Files"), "{output}");
-    assert!(output.contains("Enter Open"), "{output}");
+    assert!(output.contains("Enter Edit"), "{output}");
     assert!(output.contains("Del Delete"), "{output}");
-    assert!(output.contains("Esc Editor"), "{output}");
+    assert!(output.contains("← Parent"), "{output}");
     assert!(output.contains("Editor"), "{output}");
-    assert!(output.contains("S-Arrows Select"), "{output}");
-    assert!(output.contains("S-Tab Outdent"), "{output}");
+    assert!(output.contains("⌥←→ Word"), "{output}");
+    assert!(output.contains("⌘←→ Line"), "{output}");
 }
 
 #[test]
@@ -423,6 +423,7 @@ fn workspace_footer_highlights_the_focused_pane() {
     let (_sandbox, mut app) = workspace_app("note.md", "note");
 
     let editor_focused = render_backend(&app, 180, 16);
+    assert!(editor_focused.to_string().contains("Editing · note.md"));
     let files_label = editor_focused.buffer().cell((0, 13)).unwrap();
     let editor_label = editor_focused.buffer().cell((0, 14)).unwrap();
     assert_eq!(files_label.bg, Color::Reset);
@@ -435,6 +436,7 @@ fn workspace_footer_highlights_the_focused_pane() {
     workspace.focus = carnet::app::Focus::Tree;
 
     let tree_focused = render_backend(&app, 180, 16);
+    assert!(tree_focused.to_string().contains("Preview · note.md"));
     let files_label = tree_focused.buffer().cell((0, 13)).unwrap();
     let editor_label = tree_focused.buffer().cell((0, 14)).unwrap();
     assert_eq!(files_label.fg, Color::Black);

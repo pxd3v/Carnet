@@ -2,7 +2,7 @@
 source: tests/tui_snapshots.rs
 expression: terminal.backend()
 ---
-"┌ notes/welcome.md ──────────────────────────────────────────────────────────────────────┐"
+"┌ Editing · notes/welcome.md ────────────────────────────────────────────────────────────┐"
 "│Draft # Welcome                                                                         │"
 "│                                                                                        │"
 "│                                                                                        │"
@@ -23,6 +23,6 @@ expression: terminal.backend()
 "│                                                                                        │"
 "└────────────────────────────────────────────────────────────────────────────────────────┘"
 "Global  ^S Save  ^F Find  ^P Open  ^B Files  ^Z Undo  ^Y Redo  ^C Copy  ^X Cut  ^V Paste  "
-"Files   ↑↓ Select  ←→ Fold  Enter Open  n New File  N New Folder  r Rename  m Move  Del De"
-"Editor  Arrows Move  S-Arrows Select  Enter Newline  Tab Indent  S-Tab Outdent  Home/End L"
+"Files   ↑↓ Preview  →/Enter Folder  ← Parent  Enter Edit  n File  N Folder  r Rename  m Mo"
+"Editor  Esc Files  ⌥←→ Word  ⌘←→ Line  ⌘↑↓ Doc  Enter/S-Enter Newline  Tab/S-Tab Indent   "
 " Markdown  ·  modified  ·  Ln 1, Col 7                                                    "

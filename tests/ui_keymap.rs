@@ -7,6 +7,7 @@ use carnet::{
         TreeAction,
     },
     catalog::RepoEntry,
+    editor::{EditorCommand, Motion},
     git::GitRepo,
     ui::{COMFORTABLE_WIDTH, map_key, workspace_geometry},
     workspace::Workspace,
@@ -116,6 +117,53 @@ fn home_and_tree_keys_map_only_to_their_pure_actions() {
 }
 
 #[test]
+fn editor_escape_requests_a_safe_return_to_files() {
+    let (_sandbox, app) = workspace_app();
+
+    assert_eq!(
+        mapped_action(&app, KeyEvent::from(KeyCode::Esc)),
+        AppAction::BrowseFiles
+    );
+}
+
+#[test]
+fn editor_modifier_arrows_map_to_word_line_and_document_motion() {
+    let (_sandbox, app) = workspace_app();
+    let cases = [
+        (KeyCode::Left, KeyModifiers::ALT, Motion::WordLeft, false),
+        (KeyCode::Right, KeyModifiers::ALT, Motion::WordRight, false),
+        (KeyCode::Left, KeyModifiers::SUPER, Motion::LineStart, false),
+        (KeyCode::Right, KeyModifiers::SUPER, Motion::LineEnd, false),
+        (
+            KeyCode::Up,
+            KeyModifiers::SUPER,
+            Motion::DocumentStart,
+            false,
+        ),
+        (
+            KeyCode::Down,
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+            Motion::DocumentEnd,
+            true,
+        ),
+    ];
+
+    for (code, modifiers, motion, extend_selection) in cases {
+        assert_eq!(
+            mapped_action(&app, KeyEvent::new(code, modifiers)),
+            AppAction::Editor(EditorCommand::Move {
+                motion,
+                extend_selection,
+            })
+        );
+    }
+    assert_eq!(
+        mapped_action(&app, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+        AppAction::Editor(EditorCommand::Newline)
+    );
+}
+
+#[test]
 fn modal_choices_and_search_input_map_to_explicit_app_events() {
     let mut app = App::home(Vec::new(), None, None);
     app.dialog = Some(Dialog::DirtyNavigation);
@@ -216,7 +264,7 @@ fn quick_open_selects_and_opens_the_first_matching_text_file() {
 }
 
 #[test]
-fn ctrl_b_reaches_tree_actions_from_the_editor_and_returns() {
+fn ctrl_b_reaches_file_actions_and_enter_returns_to_the_loaded_editor() {
     let (_sandbox, mut app) = workspace_app();
     app.sidebar.visible = false;
 
@@ -261,11 +309,11 @@ fn ctrl_b_reaches_tree_actions_from_the_editor_and_returns() {
     app.update(AppEvent::Action(AppAction::Dismiss));
 
     let open = map_key(&app, KeyEvent::from(KeyCode::Enter)).unwrap();
-    assert!(matches!(
-        app.update(open).as_slice(),
-        [carnet::app::AppEffect::LoadNote { path, .. }] if path == &PathBuf::from("note.md")
-    ));
-    app.pending_request = None;
+    assert!(app.update(open).is_empty());
+    let Screen::Workspace(workspace) = &app.screen else {
+        panic!("workspace fixture did not open")
+    };
+    assert_eq!(workspace.focus, Focus::Editor);
 
     let event = map_key(
         &app,
@@ -276,8 +324,8 @@ fn ctrl_b_reaches_tree_actions_from_the_editor_and_returns() {
     let Screen::Workspace(workspace) = &app.screen else {
         panic!("workspace fixture did not open")
     };
-    assert!(!app.sidebar.visible);
-    assert_eq!(workspace.focus, Focus::Editor);
+    assert!(app.sidebar.visible);
+    assert_eq!(workspace.focus, Focus::Tree);
 }
 
 #[test]

@@ -366,7 +366,7 @@ fn dirty_create_file_reprompts_when_edits_arrive_during_its_prerequisite_save() 
 #[test]
 fn discarding_dirty_ancestor_rename_abandons_edits_and_blocks_replacement_races() {
     use carnet::{
-        app::{Dialog, DirtyChoice, EffectExecutor, Focus, TreeAction},
+        app::{Dialog, DirtyChoice, Focus, TreeAction},
         git::CommitOutcome,
         workspace::FileOperation,
     };
@@ -376,6 +376,7 @@ fn discarding_dirty_ancestor_rename_abandons_edits_and_blocks_replacement_races(
         "dirty ".into(),
     ))));
     app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    set_browser_selection(&mut app, "", 0);
     app.update(AppEvent::Action(AppAction::Tree(TreeAction::Rename)));
     assert!(
         app.update(AppEvent::Action(AppAction::SubmitFileAction(
@@ -405,7 +406,7 @@ fn discarding_dirty_ancestor_rename_abandons_edits_and_blocks_replacement_races(
 
     let (mutation_id, repository_id, repository_root, file, tree) =
         apply_mutation_effect(rename.into_iter().next().unwrap());
-    let load = app.update(AppEvent::MutationApplied {
+    let follow_up = app.update(AppEvent::MutationApplied {
         mutation_id,
         repository_id,
         repository_root,
@@ -413,24 +414,12 @@ fn discarding_dirty_ancestor_rename_abandons_edits_and_blocks_replacement_races(
         commit: CommitOutcome::NoChanges,
         tree,
     });
-    assert!(matches!(&load[..], [AppEffect::LoadNote { .. }]));
-
-    app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
-        "blocked during load".into(),
-    ))));
-    assert_eq!(workspace_editor(&app).text(), "base");
-    let loaded = EffectExecutor::default()
-        .execute(load.into_iter().next().unwrap())
-        .unwrap();
-    app.update(loaded);
-    assert_eq!(workspace_editor(&app).text(), "base");
+    assert!(follow_up.is_empty());
     let Screen::Workspace(workspace) = &app.screen else {
         panic!("expected workspace");
     };
-    assert_eq!(
-        workspace.current_note.as_deref(),
-        Some(PathBuf::from("renamed/note.md").as_path())
-    );
+    assert_eq!(workspace.current_note, None);
+    assert!(workspace.editor.is_none());
 }
 
 #[test]
@@ -443,6 +432,7 @@ fn cancelling_a_dirty_ancestor_move_keeps_the_note_and_performs_no_mutation() {
         "dirty ".into(),
     ))));
     app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    set_browser_selection(&mut app, "", 0);
     app.update(AppEvent::Action(AppAction::Tree(TreeAction::Move)));
 
     assert!(
@@ -486,6 +476,7 @@ fn dirty_ancestor_delete_waits_for_save_before_deleting_the_tree() {
         "dirty ".into(),
     ))));
     app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    set_browser_selection(&mut app, "", 0);
     app.update(AppEvent::Action(AppAction::Tree(TreeAction::Delete)));
 
     assert!(
@@ -562,7 +553,7 @@ fn dirty_unrelated_rename_does_not_replace_or_block_the_active_editor() {
         "dirty ".into(),
     ))));
     app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
-    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Down)));
+    set_browser_selection(&mut app, "", 1);
     app.update(AppEvent::Action(AppAction::Tree(TreeAction::Rename)));
     let rename = app.update(AppEvent::Action(AppAction::SubmitFileAction(
         PathBuf::from("renamed-unrelated"),
@@ -640,6 +631,7 @@ fn pending_load_blocks_unrelated_and_active_mutations_until_the_load_resolves() 
 
     unrelated.update(EffectExecutor::default().execute(unrelated_load).unwrap());
     active.update(EffectExecutor::default().execute(active_load).unwrap());
+    active.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
     active.update(AppEvent::Action(AppAction::Tree(TreeAction::Rename)));
     let rename = active.update(AppEvent::Action(AppAction::SubmitFileAction(
         PathBuf::from("renamed.md"),
@@ -826,6 +818,7 @@ fn same_workspace_load_retains_dialog_origin_and_original_rename_target() {
 
     let (_sandbox, mut app) = app_with_note(106, "folder/note.md", "base");
     app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Left)));
     app.update(AppEvent::Action(AppAction::Tree(TreeAction::Rename)));
     let Some(Dialog::FileAction {
         origin,
@@ -1850,21 +1843,16 @@ fn tree_focus_routes_navigation_file_actions_and_escape_through_update() {
 
     app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
     assert_eq!(workspace_focus(&app), Focus::Tree);
-    assert_eq!(workspace_tree_selection(&app), Some(0));
+    assert_eq!(workspace_tree_selection(&app), Some(2));
 
-    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Right)));
-    assert!(workspace_expanded(&app).contains(PathBuf::from("folder").as_path()));
     app.update(AppEvent::Action(AppAction::Tree(TreeAction::Down)));
+    assert_eq!(workspace_tree_selection(&app), Some(2));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Up)));
     assert_eq!(workspace_tree_selection(&app), Some(1));
     app.update(AppEvent::Action(AppAction::Tree(TreeAction::Up)));
     assert_eq!(workspace_tree_selection(&app), Some(0));
-    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Down)));
-    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Left)));
-    assert_eq!(workspace_tree_selection(&app), Some(0));
 
-    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Right)));
-    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Down)));
-    let opened = app.update(AppEvent::Action(AppAction::Tree(TreeAction::Open)));
+    let opened = app.update(AppEvent::Action(AppAction::Tree(TreeAction::Right)));
     assert!(matches!(
         &opened[..],
         [AppEffect::LoadNote { path, .. }] if path == PathBuf::from("folder/child.md").as_path()
@@ -1898,8 +1886,118 @@ fn tree_focus_routes_navigation_file_actions_and_escape_through_update() {
 
     app.update(AppEvent::Action(AppAction::SetSidebarOverlayIntent(true)));
     app.update(AppEvent::Action(AppAction::Tree(TreeAction::Escape)));
+    assert_eq!(workspace_focus(&app), Focus::Tree);
+    assert!(app.sidebar.visible);
+}
+
+#[test]
+fn folder_browser_enters_one_directory_and_left_returns_to_its_parent() {
+    use carnet::app::{Focus, TreeAction};
+
+    let (sandbox, repository, workspace, git) = workspace_fixture(178, "notes", "root.md", "root");
+    fs::create_dir(repository.path.join("folder")).unwrap();
+    fs::write(repository.path.join("folder/child.md"), "child").unwrap();
+    let tree = workspace.tree().unwrap();
+    let mut app = App::home(vec![repository.clone()], Some(repository.id), None);
+    app.update(AppEvent::Action(AppAction::Home(HomeAction::OpenSelected)));
+    let request_id = app.pending_request.as_ref().unwrap().request_id();
+    app.update(AppEvent::WorkspaceOpened {
+        request_id,
+        repository_id: repository.id,
+        workspace,
+        git,
+        tree,
+        note: None,
+    });
+
+    assert_eq!(workspace_browser_directory(&app), Path::new(""));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Right)));
+    assert_eq!(workspace_browser_directory(&app), Path::new("folder"));
+    assert_eq!(workspace_tree_selection(&app), Some(0));
+
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Left)));
+    assert_eq!(workspace_browser_directory(&app), Path::new(""));
+    assert_eq!(workspace_tree_selection(&app), Some(0));
+    assert_eq!(workspace_focus(&app), Focus::Tree);
+
+    drop(sandbox);
+}
+
+#[test]
+fn folder_browser_previews_selection_and_enter_focuses_that_loaded_file() {
+    use carnet::app::{EffectExecutor, Focus, TreeAction};
+
+    let (_sandbox, repository, workspace, git) = workspace_fixture(179, "notes", "a.md", "A");
+    fs::write(repository.path.join("b.md"), "B").unwrap();
+    let tree = workspace.tree().unwrap();
+    let mut app = App::home(vec![repository.clone()], Some(repository.id), None);
+    app.update(AppEvent::Action(AppAction::Home(HomeAction::OpenSelected)));
+    let request_id = app.pending_request.as_ref().unwrap().request_id();
+
+    let preview = app.update(AppEvent::WorkspaceOpened {
+        request_id,
+        repository_id: repository.id,
+        workspace,
+        git,
+        tree,
+        note: None,
+    });
+    assert!(matches!(
+        preview.as_slice(),
+        [AppEffect::LoadNote { path, .. }] if path == Path::new("a.md")
+    ));
+    app.update(
+        EffectExecutor::default()
+            .execute(preview.into_iter().next().unwrap())
+            .unwrap(),
+    );
+    assert_eq!(workspace_focus(&app), Focus::Tree);
+    assert_eq!(workspace_editor(&app).text(), "A");
+
+    let preview = app.update(AppEvent::Action(AppAction::Tree(TreeAction::Down)));
+    assert!(matches!(
+        preview.as_slice(),
+        [AppEffect::LoadNote { path, .. }] if path == Path::new("b.md")
+    ));
+    app.update(
+        EffectExecutor::default()
+            .execute(preview.into_iter().next().unwrap())
+            .unwrap(),
+    );
+    assert_eq!(workspace_focus(&app), Focus::Tree);
+    assert_eq!(workspace_editor(&app).text(), "B");
+
+    assert!(
+        app.update(AppEvent::Action(AppAction::Tree(TreeAction::Open)))
+            .is_empty()
+    );
     assert_eq!(workspace_focus(&app), Focus::Editor);
-    assert!(!app.sidebar.visible);
+    assert_eq!(workspace_editor(&app).text(), "B");
+}
+
+#[test]
+fn dirty_editor_escape_requires_a_choice_before_returning_to_files() {
+    use carnet::app::{DirtyChoice, Focus};
+
+    let (_sandbox, mut app) = app_with_note(180, "note.md", "base");
+    app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "dirty ".into(),
+    ))));
+
+    app.update(AppEvent::Action(AppAction::BrowseFiles));
+    assert_eq!(app.dialog, Some(carnet::app::Dialog::DirtyNavigation));
+    assert_eq!(app.pending_intent, Some(PendingIntent::BrowseFiles));
+    assert_eq!(workspace_focus(&app), Focus::Editor);
+
+    app.update(AppEvent::DirtyChoice(DirtyChoice::Cancel));
+    assert_eq!(workspace_focus(&app), Focus::Editor);
+    assert_eq!(workspace_editor(&app).text(), "dirty base");
+
+    app.update(AppEvent::Action(AppAction::BrowseFiles));
+    app.update(AppEvent::DirtyChoice(DirtyChoice::Discard));
+    assert_eq!(workspace_focus(&app), Focus::Tree);
+    assert_eq!(workspace_editor(&app).text(), "base");
+    assert_eq!(workspace_tree_selection(&app), Some(0));
 }
 
 #[test]
@@ -1936,8 +2034,8 @@ fn workspace_with_a_loaded_note_opens_with_editor_focus() {
 }
 
 #[test]
-fn dirty_tree_open_uses_the_navigation_prompt_before_loading() {
-    use carnet::app::{Dialog, Focus, NavigationAction, TreeAction};
+fn forced_tree_actions_cannot_bypass_a_dirty_editor() {
+    use carnet::app::{Focus, NavigationAction, TreeAction};
 
     let (_sandbox, mut app) = app_with_note(74, "a.md", "a");
     let (repository, workspace, git) = {
@@ -1974,23 +2072,18 @@ fn dirty_tree_open_uses_the_navigation_prompt_before_loading() {
         tree,
         note: Some(note),
     });
-    app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
-    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Down)));
     app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
         "dirty ".into(),
     ))));
+    app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Down)));
 
     let effects = app.update(AppEvent::Action(AppAction::Tree(TreeAction::Open)));
 
     assert!(effects.is_empty());
     assert_eq!(app.pending_request, None);
-    assert_eq!(
-        app.pending_intent,
-        Some(PendingIntent::Navigation(NavigationAction::Note(
-            PathBuf::from("b.md")
-        )))
-    );
-    assert!(matches!(app.dialog, Some(Dialog::DirtyNavigation)));
+    assert_eq!(app.pending_intent, None);
+    assert_eq!(app.dialog, None);
     assert_eq!(workspace_editor(&app).text(), "dirty a");
 }
 
@@ -2106,6 +2199,8 @@ fn folder_rename_move_and_confirmed_delete_build_their_exact_operations() {
     for (index, (action, destination, label)) in cases.into_iter().enumerate() {
         let (_sandbox, mut app) = app_with_note(40 + index as u128, "note.md", "base");
         app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+        app.update(AppEvent::Action(AppAction::Tree(TreeAction::Left)));
+        app.update(AppEvent::Action(AppAction::Tree(TreeAction::Left)));
         app.update(AppEvent::Action(AppAction::Tree(action)));
         let effects = app.update(AppEvent::Action(AppAction::SubmitFileAction(
             destination.clone(),
@@ -2356,6 +2451,8 @@ fn saved_commit_failures_reconcile_every_successful_filesystem_outcome() {
             fs::create_dir(sandbox.path().join("archive")).unwrap();
         }
         app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+        app.update(AppEvent::Action(AppAction::Tree(TreeAction::Left)));
+        app.update(AppEvent::Action(AppAction::Tree(TreeAction::Left)));
         app.update(AppEvent::Action(AppAction::Tree(action)));
         let effect = app
             .update(AppEvent::Action(AppAction::SubmitFileAction(
@@ -2364,20 +2461,18 @@ fn saved_commit_failures_reconcile_every_successful_filesystem_outcome() {
             .pop()
             .unwrap();
         let follow_up = fail(&mut app, effect);
-        let note = destination.join("sub/note.md");
+        assert!(follow_up.is_empty());
         assert!(matches!(
-            follow_up.as_slice(),
-            [AppEffect::LoadNote { path, .. }] if path == &note
-        ));
-        assert!(
             app.update(AppEvent::Action(AppAction::Global(GlobalAction::Save)))
-                .is_empty(),
-            "the stale old-path editor must not overwrite after {action:?}"
-        );
+                .as_slice(),
+            [AppEffect::RetryCommit { .. }]
+        ));
     }
 
     let (_sandbox, mut deleted) = app_with_note(180, "folder/sub/note.md", "base");
     deleted.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    deleted.update(AppEvent::Action(AppAction::Tree(TreeAction::Left)));
+    deleted.update(AppEvent::Action(AppAction::Tree(TreeAction::Left)));
     deleted.update(AppEvent::Action(AppAction::Tree(TreeAction::Delete)));
     let effect = deleted
         .update(AppEvent::Action(AppAction::ConfirmDelete))
@@ -2406,6 +2501,8 @@ fn renaming_an_ancestor_reloads_the_active_note_at_its_rebased_path() {
 
     let (_sandbox, mut app) = app_with_note(81, "folder/sub/note.md", "base");
     app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Left)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Left)));
     app.update(AppEvent::Action(AppAction::Tree(TreeAction::Rename)));
     let effect = app
         .update(AppEvent::Action(AppAction::SubmitFileAction(
@@ -2424,17 +2521,8 @@ fn renaming_an_ancestor_reloads_the_active_note_at_its_rebased_path() {
         tree,
     });
 
-    assert!(matches!(
-        &follow_up[..],
-        [AppEffect::LoadNote { path, .. }]
-            if path == PathBuf::from("renamed/sub/note.md").as_path()
-    ));
-    assert_eq!(
-        app.pending_request
-            .as_ref()
-            .and_then(|pending| pending.path()),
-        Some(PathBuf::from("renamed/sub/note.md").as_path())
-    );
+    assert!(follow_up.is_empty());
+    assert_eq!(app.pending_request, None);
     assert_eq!(selected_tree_path(&app), Some(PathBuf::from("renamed")));
 }
 
@@ -2448,6 +2536,8 @@ fn moving_an_ancestor_reloads_the_active_note_and_selects_the_nested_destination
     let (sandbox, mut app) = app_with_note(82, "folder/sub/note.md", "base");
     fs::create_dir(sandbox.path().join("archive")).unwrap();
     app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Left)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Left)));
     app.update(AppEvent::Action(AppAction::Tree(TreeAction::Move)));
     let effect = app
         .update(AppEvent::Action(AppAction::SubmitFileAction(
@@ -2466,11 +2556,7 @@ fn moving_an_ancestor_reloads_the_active_note_and_selects_the_nested_destination
         tree,
     });
 
-    assert!(matches!(
-        &follow_up[..],
-        [AppEffect::LoadNote { path, .. }]
-            if path == PathBuf::from("archive/folder/sub/note.md").as_path()
-    ));
+    assert!(follow_up.is_empty());
     assert_eq!(
         selected_tree_path(&app),
         Some(PathBuf::from("archive/folder"))
@@ -2487,6 +2573,8 @@ fn deleting_an_ancestor_clears_the_active_note_and_clamps_tree_selection() {
     let (sandbox, mut app) = app_with_note(83, "folder/sub/note.md", "base");
     fs::write(sandbox.path().join("remaining.md"), "remaining").unwrap();
     app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Left)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::Left)));
     app.update(AppEvent::Action(AppAction::Tree(TreeAction::Delete)));
     let effect = app
         .update(AppEvent::Action(AppAction::ConfirmDelete))
@@ -3141,37 +3229,51 @@ fn workspace_tree_selection(app: &App) -> Option<usize> {
     workspace.tree_selection
 }
 
-fn workspace_expanded(app: &App) -> &std::collections::BTreeSet<PathBuf> {
+fn workspace_browser_directory(app: &App) -> &Path {
     let Screen::Workspace(workspace) = &app.screen else {
         panic!("expected workspace screen");
     };
-    &workspace.expanded
+    workspace.browser_directory.as_path()
+}
+
+fn set_browser_selection(app: &mut App, directory: &str, selection: usize) {
+    let Screen::Workspace(workspace) = &mut app.screen else {
+        panic!("expected workspace screen");
+    };
+    workspace.browser_directory = PathBuf::from(directory);
+    workspace.tree_selection = Some(selection);
 }
 
 fn selected_tree_path(app: &App) -> Option<PathBuf> {
-    fn collect(
-        output: &mut Vec<PathBuf>,
-        entries: &[carnet::workspace::TreeEntry],
-        expanded: &std::collections::BTreeSet<PathBuf>,
-    ) {
+    fn entries_for<'a>(
+        entries: &'a [carnet::workspace::TreeEntry],
+        directory: &Path,
+    ) -> Option<&'a [carnet::workspace::TreeEntry]> {
+        if directory.as_os_str().is_empty() {
+            return Some(entries);
+        }
         for entry in entries {
-            output.push(entry.path().to_path_buf());
-            if entry.kind() == carnet::workspace::TreeEntryKind::Directory
-                && expanded.contains(entry.path())
-            {
-                collect(output, entry.children(), expanded);
+            if entry.kind() == carnet::workspace::TreeEntryKind::Directory {
+                if entry.path() == directory {
+                    return Some(entry.children());
+                }
+                if let Some(found) = entries_for(entry.children(), directory) {
+                    return Some(found);
+                }
             }
         }
+        None
     }
 
     let Screen::Workspace(workspace) = &app.screen else {
         return None;
     };
-    let mut paths = Vec::new();
-    collect(&mut paths, &workspace.tree, &workspace.expanded);
     workspace
         .tree_selection
-        .and_then(|selected| paths.get(selected).cloned())
+        .and_then(|selected| {
+            entries_for(&workspace.tree, &workspace.browser_directory)?.get(selected)
+        })
+        .map(|entry| entry.path().to_path_buf())
 }
 
 fn mutation_parts(

@@ -29,7 +29,7 @@ fn wide_workspace_keeps_tree_and_editor_visible() {
     let Screen::Workspace(workspace) = &mut app.screen else {
         panic!("workspace fixture did not open")
     };
-    workspace.expanded.insert(PathBuf::from("notes"));
+    workspace.browser_directory = PathBuf::from("notes");
     let editor = workspace.editor.as_mut().unwrap();
     editor.apply(EditorCommand::Move {
         motion: Motion::DocumentEnd,
@@ -50,7 +50,7 @@ fn narrow_workspace_floats_the_tree_over_a_full_editor() {
     let Screen::Workspace(workspace) = &mut app.screen else {
         panic!("workspace fixture did not open")
     };
-    workspace.expanded.insert(PathBuf::from("notes"));
+    workspace.browser_directory = PathBuf::from("notes");
     workspace.focus = carnet::app::Focus::Tree;
     let backend = TestBackend::new(72, 22);
     let mut terminal = Terminal::new(backend).unwrap();

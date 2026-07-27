@@ -2,8 +2,9 @@ use uuid::Uuid;
 
 use crate::{
     app::{
-        App, AppEffect, DefaultChoiceState, Focus, PendingRequest, RepositoryAvailability,
-        RequestId, RuntimeError, RuntimeOperation, Screen, WorkspaceOrigin, WorkspaceState,
+        App, AppEffect, DefaultChoiceState, Focus, NoteLoadPurpose, PendingRequest,
+        RepositoryAvailability, RequestId, RuntimeError, RuntimeOperation, Screen, WorkspaceOrigin,
+        WorkspaceState, directory_entries,
     },
     editor::Editor,
     git::GitRepo,
@@ -61,17 +62,33 @@ impl App {
         repository_id: Uuid,
         note: LoadedNote,
     ) -> Vec<AppEffect> {
-        if !matches!(
-            self.pending_request.as_ref(),
+        let purpose = match self.pending_request.as_ref() {
             Some(PendingRequest::LoadNote {
                 request_id: pending_request,
                 repository_id: pending_repository,
                 path,
+                purpose,
             }) if *pending_request == request_id
                 && *pending_repository == repository_id
-                && path.as_path() == note.path().relative()
-        ) {
-            return Vec::new();
+                && path.as_path() == note.path().relative() =>
+            {
+                *purpose
+            }
+            _ => return Vec::new(),
+        };
+        if purpose == NoteLoadPurpose::Preview {
+            let selected_matches = matches!(
+                &self.screen,
+                Screen::Workspace(workspace)
+                    if workspace.tree_selection.and_then(|selected| {
+                        directory_entries(&workspace.tree, &workspace.browser_directory)
+                            .get(selected)
+                    }).is_some_and(|entry| entry.path() == note.path().relative())
+            );
+            if !selected_matches {
+                self.pending_request = None;
+                return Vec::new();
+            }
         }
         let editor_instance_id = self.next_editor_instance_id();
         let Screen::Workspace(workspace) = &mut self.screen else {
@@ -84,6 +101,12 @@ impl App {
         workspace.editor = Some(Editor::from_loaded(note));
         workspace.editor_instance_id = Some(editor_instance_id);
         workspace.editor_revision = 0;
+        if purpose == NoteLoadPurpose::Edit {
+            workspace.focus = Focus::Editor;
+            if self.sidebar.overlay_intent {
+                self.sidebar.visible = false;
+            }
+        }
         self.pending_clipboard_read = None;
         self.pending_request = None;
         self.clear_runtime_failures(repository_id, RuntimeOperation::LoadNote);
@@ -139,12 +162,26 @@ impl App {
             repository_root: workspace.root().to_path_buf(),
         };
         let repository = workspace.repo().clone();
-        let tree_selection = (!tree.is_empty()).then_some(0);
+        let browser_directory = current_note
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .unwrap_or_else(|| std::path::Path::new(""))
+            .to_path_buf();
+        let browser_entries = directory_entries(&tree, &browser_directory);
+        let tree_selection = current_note
+            .as_ref()
+            .and_then(|path| {
+                browser_entries
+                    .iter()
+                    .position(|entry| entry.path() == path)
+            })
+            .or_else(|| (!browser_entries.is_empty()).then_some(0));
         let focus = if note.is_some() {
             Focus::Editor
         } else {
             Focus::Tree
         };
+        let preview_initial_selection = current_note.is_none();
         self.screen = Screen::Workspace(Box::new(WorkspaceState {
             repository,
             workspace,
@@ -155,8 +192,8 @@ impl App {
             editor_instance_id,
             editor_revision: 0,
             focus,
+            browser_directory,
             tree_selection,
-            expanded: Default::default(),
         }));
         self.invalidate_workspace_bound_state(&opened_origin);
         if matches!(
@@ -170,6 +207,10 @@ impl App {
             self.home.default_choice = DefaultChoiceState::NotNeeded;
         }
         self.clear_runtime_failures(repository_id, RuntimeOperation::OpenWorkspace);
-        Vec::new()
+        if preview_initial_selection {
+            self.reconcile_browser_preview()
+        } else {
+            Vec::new()
+        }
     }
 }

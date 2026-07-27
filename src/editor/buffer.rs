@@ -60,6 +60,22 @@ impl TextBuffer {
             .unwrap_or_else(|| self.len_chars())
     }
 
+    pub(super) fn previous_word_start(&self, char_index: usize) -> usize {
+        let text = self.rope.to_string();
+        text.unicode_word_indices()
+            .map(|(byte, _)| text[..byte].chars().count())
+            .rfind(|start| *start < char_index)
+            .unwrap_or(0)
+    }
+
+    pub(super) fn next_word_end(&self, char_index: usize) -> usize {
+        let text = self.rope.to_string();
+        text.unicode_word_indices()
+            .map(|(byte, word)| text[..byte + word.len()].chars().count())
+            .find(|end| *end > char_index)
+            .unwrap_or_else(|| self.len_chars())
+    }
+
     pub(super) fn boundary_at_or_after(&self, char_index: usize) -> usize {
         self.grapheme_boundaries()
             .into_iter()

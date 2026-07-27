@@ -2,11 +2,11 @@
 source: tests/tui_snapshots.rs
 expression: terminal.backend()
 ---
-"┌ Files · overlay ───────────────┐─────────────────────────────────────┐"
-"│▾ notes                         │                                     │"
-"│  × archive.bin                 │                                     │"
-"│  • welcome.md                  │                                     │"
-"│• README.txt                    │                                     │"
+"┌ Files · notes · overlay ───────┐─────────────────────────────────────┐"
+"│× archive.bin                   │                                     │"
+"│• welcome.md                    │                                     │"
+"│                                │                                     │"
+"│                                │                                     │"
 "│                                │                                     │"
 "│                                │                                     │"
 "│                                │                                     │"
@@ -21,6 +21,6 @@ expression: terminal.backend()
 "│                                │                                     │"
 "└────────────────────────────────┘─────────────────────────────────────┘"
 "Global  ^S Save  ^F Find  ^P Open  ^B Files  ^Z Undo  ^Y Redo  ^C Copy  "
-"Files   ↑↓ Select  ←→ Fold  Enter Open  n New File  N New Folder  r Rena"
-"Editor  Arrows Move  S-Arrows Select  Enter Newline  Tab Indent  S-Tab O"
+"Files   ↑↓ Preview  →/Enter Folder  ← Parent  Enter Edit  n File  N Fold"
+"Editor  Esc Files  ⌥←→ Word  ⌘←→ Line  ⌘↑↓ Doc  Enter/S-Enter Newline  T"
 " Markdown  ·  saved  ·  Ln 1, Col 1                                     "
