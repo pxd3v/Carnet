@@ -65,6 +65,10 @@ impl HighlightCache {
         }
         &self.spans
     }
+
+    pub(super) fn spans_for_render(&self, text: &str) -> Vec<HighlightSpan> {
+        highlight(self.language, text)
+    }
 }
 
 fn highlight(language: HighlightLanguage, text: &str) -> Vec<HighlightSpan> {

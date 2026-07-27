@@ -227,6 +227,12 @@ impl Editor {
         self.highlights.spans(&text)
     }
 
+    /// Computes presentation spans without changing the editor or its highlight cache.
+    pub fn render_highlighted_spans(&self) -> Vec<HighlightSpan> {
+        let text = self.buffer.text();
+        self.highlights.spans_for_render(&text)
+    }
+
     pub fn save_operation(&self, overwrite: bool) -> FileOperation {
         FileOperation::Save {
             note: self.loaded.clone(),

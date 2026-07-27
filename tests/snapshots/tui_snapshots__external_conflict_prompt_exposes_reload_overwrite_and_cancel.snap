@@ -1,0 +1,29 @@
+---
+source: tests/tui_snapshots.rs
+assertion_line: 96
+expression: terminal.backend()
+---
+"┌ notes/welcome.md ──────────────────────────────────────────────────────────────────────┐"
+"│# Welcome                                                                               │"
+"│                                                                                        │"
+"│                                                                                        │"
+"│                                                                                        │"
+"│                                                                                        │"
+"│                                                                                        │"
+"│                                                                                        │"
+"│           ┌ External conflict ─────────────────────────────────────────────┐           │"
+"│           │notes/welcome.md was modified outside Carnet.                   │           │"
+"│           │Reload uses the disk version; overwrite keeps this editor       │           │"
+"│           │version.                                                        │           │"
+"│           │                                                                │           │"
+"│           │[r] Reload   [o] Overwrite   [Esc] Cancel                       │           │"
+"│           │                                                                │           │"
+"│           └────────────────────────────────────────────────────────────────┘           │"
+"│                                                                                        │"
+"│                                                                                        │"
+"│                                                                                        │"
+"│                                                                                        │"
+"│                                                                                        │"
+"│                                                                                        │"
+"└────────────────────────────────────────────────────────────────────────────────────────┘"
+" Markdown  ·  saved  ·  Ln 1, Col 1                                                       "

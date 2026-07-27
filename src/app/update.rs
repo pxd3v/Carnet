@@ -11,8 +11,8 @@ use super::{
     App, AppEffect, AppExitStatus, CommitStatus, DefaultChoiceState, Dialog, ExternalConflict,
     FailureKind, FileActionKind, FileMutationAction, Focus, MutationId, NavigationAction,
     OverlayState, PendingFileMutation, PendingIntent, PendingMutation, PendingMutationKind,
-    PendingRequest, PendingSave, RequestId, RuntimeFailure, SavedCommitFailure, Screen,
-    UnresolvedFailure, WorkspaceOrigin, WorkspaceState,
+    PendingRequest, PendingSave, RepositoryAvailability, RequestId, RuntimeFailure,
+    SavedCommitFailure, Screen, UnresolvedFailure, WorkspaceOrigin, WorkspaceState,
 };
 use super::{RuntimeError, RuntimeOperation};
 
@@ -77,6 +77,10 @@ pub enum AppAction {
     Focus(Focus),
     Tree(TreeAction),
     Dismiss,
+    SetDialogInput(String),
+    SetOverlayQuery(String),
+    MoveOverlaySelection(isize),
+    SubmitOverlay,
     SubmitFileAction(std::path::PathBuf),
     ConfirmDelete,
     SetSidebarOverlayIntent(bool),
@@ -220,6 +224,16 @@ impl App {
                     return Vec::new();
                 }
                 self.pending_request = None;
+                if operation == RuntimeOperation::OpenWorkspace
+                    && let Some(availability) = self
+                        .home
+                        .repositories
+                        .iter()
+                        .position(|repository| repository.id == repository_id)
+                        .and_then(|index| self.home.repository_availability.get_mut(index))
+                {
+                    *availability = RepositoryAvailability::MissingOrInvalid;
+                }
                 self.record_request_failure(
                     request_id,
                     repository_id,
@@ -232,8 +246,74 @@ impl App {
             AppEvent::Action(AppAction::SubmitFileAction(path)) => self.submit_file_action(path),
             AppEvent::Action(AppAction::Dismiss) => {
                 self.dialog = None;
+                self.dialog_input.clear();
                 self.overlay = OverlayState::None;
                 Vec::new()
+            }
+            AppEvent::Action(AppAction::SetDialogInput(input)) => {
+                if matches!(self.dialog, Some(Dialog::FileAction { .. })) {
+                    self.dialog_input = input;
+                }
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::SetOverlayQuery(query)) => {
+                match &mut self.overlay {
+                    OverlayState::Search {
+                        query: current_query,
+                    } => {
+                        *current_query = query.clone();
+                        if let Some(editor) = self.workspace_editor_mut() {
+                            editor.apply(EditorCommand::SetFindQuery(query));
+                        }
+                    }
+                    OverlayState::QuickOpen {
+                        query: current_query,
+                        selected,
+                    } => {
+                        *current_query = query.clone();
+                        let matches = matching_quick_open_paths(&self.screen, &query).len();
+                        *selected = (matches > 0).then_some(0);
+                    }
+                    OverlayState::None => {}
+                }
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::MoveOverlaySelection(delta)) => {
+                let OverlayState::QuickOpen { query, selected } = &self.overlay else {
+                    return Vec::new();
+                };
+                let matches = matching_quick_open_paths(&self.screen, query).len();
+                if matches == 0 {
+                    if let OverlayState::QuickOpen { selected, .. } = &mut self.overlay {
+                        *selected = None;
+                    }
+                    return Vec::new();
+                }
+                let current = selected.unwrap_or(0);
+                let next = current
+                    .saturating_add_signed(delta)
+                    .min(matches.saturating_sub(1));
+                if let OverlayState::QuickOpen { selected, .. } = &mut self.overlay {
+                    *selected = Some(next);
+                }
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::SubmitOverlay) => {
+                let path = match &self.overlay {
+                    OverlayState::QuickOpen { query, selected } => selected.and_then(|selected| {
+                        matching_quick_open_paths(&self.screen, query)
+                            .get(selected)
+                            .cloned()
+                    }),
+                    OverlayState::None | OverlayState::Search { .. } => None,
+                };
+                let Some(path) = path else {
+                    return Vec::new();
+                };
+                self.overlay = OverlayState::None;
+                self.update(AppEvent::Action(AppAction::Navigate(
+                    NavigationAction::Note(path),
+                )))
             }
             AppEvent::Action(AppAction::Focus(focus)) => {
                 if let Screen::Workspace(workspace) = &mut self.screen {
@@ -665,9 +745,11 @@ impl App {
                 Vec::new()
             }
             AppEvent::Action(AppAction::Global(GlobalAction::QuickOpen)) => {
+                let selected =
+                    (!matching_quick_open_paths(&self.screen, "").is_empty()).then_some(0);
                 self.overlay = OverlayState::QuickOpen {
                     query: String::new(),
-                    selected: None,
+                    selected,
                 };
                 Vec::new()
             }
@@ -700,6 +782,15 @@ impl App {
                     return Vec::new();
                 }
                 self.pending_request = None;
+                if let Some(availability) = self
+                    .home
+                    .repositories
+                    .iter()
+                    .position(|repository| repository.id == repository_id)
+                    .and_then(|index| self.home.repository_availability.get_mut(index))
+                {
+                    *availability = RepositoryAvailability::Available;
+                }
                 let current_note = note
                     .as_ref()
                     .map(|note| note.path().relative().to_path_buf());
@@ -1181,6 +1272,7 @@ impl App {
                     kind,
                     target: None,
                 });
+                self.dialog_input.clear();
             }
             return Vec::new();
         }
@@ -1247,6 +1339,7 @@ impl App {
                     kind,
                     target: Some(entries[selected].path.clone()),
                 });
+                self.dialog_input.clear();
             }
             TreeAction::Delete => {
                 self.dialog = Some(Dialog::ConfirmDelete {
@@ -1271,6 +1364,7 @@ impl App {
         else {
             return Vec::new();
         };
+        self.dialog_input.clear();
         if !self.workspace_origin_matches(&origin) {
             return Vec::new();
         }
@@ -1488,6 +1582,13 @@ fn rebase_path(
         .ok()
         .filter(|suffix| !suffix.as_os_str().is_empty())
         .map(|suffix| to.join(suffix))
+}
+
+fn matching_quick_open_paths(screen: &Screen, query: &str) -> Vec<std::path::PathBuf> {
+    let Screen::Workspace(workspace) = screen else {
+        return Vec::new();
+    };
+    workspace.matching_text_paths(query)
 }
 
 fn mutation_reconciles_editor(workspace: &WorkspaceState, action: &FileMutationAction) -> bool {

@@ -1,0 +1,360 @@
+use std::path::PathBuf;
+
+use ratatui::{
+    Frame,
+    layout::{Constraint, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+};
+use unicode_width::UnicodeWidthStr;
+
+use super::COMFORTABLE_WIDTH;
+use crate::{
+    app::{App, CommitStatus, Focus, PendingMutationKind, WorkspaceState},
+    editor::{Editor, HighlightLanguage, HighlightSpan, HighlightStyle},
+    workspace::{TreeEntry, TreeEntryKind},
+};
+
+const TREE_WIDTH: u16 = 30;
+const NARROW_TREE_WIDTH: u16 = 34;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkspaceGeometry {
+    pub editor: Rect,
+    pub tree: Option<Rect>,
+    pub tree_is_overlay: bool,
+}
+
+pub fn workspace_geometry(area: Rect, sidebar_visible: bool) -> WorkspaceGeometry {
+    if !sidebar_visible {
+        return WorkspaceGeometry {
+            editor: area,
+            tree: None,
+            tree_is_overlay: false,
+        };
+    }
+    if area.width < COMFORTABLE_WIDTH {
+        return WorkspaceGeometry {
+            editor: area,
+            tree: Some(Rect {
+                x: area.x,
+                y: area.y,
+                width: NARROW_TREE_WIDTH.min(area.width.saturating_sub(2)).max(1),
+                height: area.height,
+            }),
+            tree_is_overlay: true,
+        };
+    }
+    let [tree, editor] =
+        Layout::horizontal([Constraint::Length(TREE_WIDTH), Constraint::Min(20)]).areas(area);
+    WorkspaceGeometry {
+        editor,
+        tree: Some(tree),
+        tree_is_overlay: false,
+    }
+}
+
+pub(super) fn render(frame: &mut Frame<'_>, app: &App, workspace: &WorkspaceState) {
+    let [main, status] =
+        Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).areas(frame.area());
+    let geometry = workspace_geometry(main, app.sidebar.visible);
+    render_editor(frame, geometry.editor, workspace);
+    if let Some(tree) = geometry.tree {
+        if geometry.tree_is_overlay {
+            frame.render_widget(Clear, tree);
+        }
+        render_tree(frame, tree, workspace, geometry.tree_is_overlay);
+    }
+
+    render_status(frame, status, app, workspace);
+}
+
+fn render_tree(frame: &mut Frame<'_>, area: Rect, workspace: &WorkspaceState, overlay: bool) {
+    let entries = visible_tree(&workspace.tree, &workspace.expanded);
+    let items = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let selected = workspace.tree_selection == Some(index);
+            let icon = match entry.kind {
+                TreeEntryKind::Directory if workspace.expanded.contains(&entry.path) => "▾",
+                TreeEntryKind::Directory => "▸",
+                TreeEntryKind::File if entry.enabled => "•",
+                TreeEntryKind::File => "×",
+                TreeEntryKind::Symlink => "↗",
+            };
+            let name = entry
+                .path
+                .file_name()
+                .unwrap_or_else(|| entry.path.as_os_str())
+                .to_string_lossy();
+            let mut style = if entry.enabled {
+                Style::default()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            if selected {
+                style = style.bg(Color::Blue).fg(Color::White);
+            }
+            ListItem::new(Line::styled(
+                format!("{}{} {name}", "  ".repeat(entry.depth), icon),
+                style,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let focused = workspace.focus == Focus::Tree;
+    let border_style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let title = if overlay {
+        " Files · overlay "
+    } else {
+        " Files "
+    };
+    frame.render_widget(
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .title(title),
+        ),
+        area,
+    );
+}
+
+fn render_editor(frame: &mut Frame<'_>, area: Rect, workspace: &WorkspaceState) {
+    let focused = workspace.focus == Focus::Editor;
+    let border_style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let title = workspace
+        .current_note
+        .as_deref()
+        .map(|path| format!(" {} ", path.display()))
+        .unwrap_or_else(|| " Editor ".into());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(title);
+    let inner = block.inner(area);
+    let scroll = workspace
+        .editor
+        .as_ref()
+        .map(|editor| editor_scroll(editor, inner))
+        .unwrap_or_default();
+    let content = workspace.editor.as_ref().map_or_else(
+        || {
+            Text::from(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Select a text file from the tree to begin.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+        },
+        editor_text,
+    );
+    frame.render_widget(Paragraph::new(content).scroll(scroll).block(block), area);
+}
+
+fn editor_scroll(editor: &Editor, viewport: Rect) -> (u16, u16) {
+    let text = editor.text();
+    let before = text.chars().take(editor.cursor()).collect::<String>();
+    let cursor_line = before
+        .chars()
+        .filter(|character| *character == '\n')
+        .count();
+    let cursor_column = before
+        .rsplit_once('\n')
+        .map_or(before.as_str(), |(_, tail)| tail);
+    let cursor_column = UnicodeWidthStr::width(cursor_column);
+    let vertical = cursor_line.saturating_sub(viewport.height.saturating_sub(1).into());
+    let horizontal = cursor_column.saturating_sub(viewport.width.saturating_sub(1).into());
+    (
+        u16::try_from(vertical).unwrap_or(u16::MAX),
+        u16::try_from(horizontal).unwrap_or(u16::MAX),
+    )
+}
+
+fn editor_text(editor: &Editor) -> Text<'static> {
+    let text = editor.text();
+    let highlights = editor.render_highlighted_spans();
+    let selection = editor.selection();
+    let cursor = editor.cursor();
+    let mut lines = vec![Line::default()];
+    for (index, character) in text.chars().enumerate() {
+        if character == '\n' {
+            if cursor == index {
+                lines
+                    .last_mut()
+                    .expect("one line")
+                    .push_span(cursor_span(" "));
+            }
+            lines.push(Line::default());
+            continue;
+        }
+        let mut style = highlight_style_at(&highlights, index);
+        if selection
+            .as_ref()
+            .is_some_and(|selection| selection.contains(&index))
+        {
+            style = style.bg(Color::Blue).fg(Color::White);
+        }
+        let span = if cursor == index {
+            Span::styled(character.to_string(), cursor_style(style))
+        } else {
+            Span::styled(character.to_string(), style)
+        };
+        lines.last_mut().expect("one line").push_span(span);
+    }
+    if cursor == text.chars().count() {
+        lines
+            .last_mut()
+            .expect("one line")
+            .push_span(cursor_span(" "));
+    }
+    Text::from(lines)
+}
+
+fn highlight_style_at(spans: &[HighlightSpan], index: usize) -> Style {
+    spans
+        .iter()
+        .find(|span| span.range.contains(&index))
+        .map(|span| to_ratatui_style(span.style))
+        .unwrap_or_default()
+}
+
+fn to_ratatui_style(style: HighlightStyle) -> Style {
+    let mut output = Style::default()
+        .fg(Color::Rgb(
+            style.foreground[0],
+            style.foreground[1],
+            style.foreground[2],
+        ))
+        .bg(Color::Rgb(
+            style.background[0],
+            style.background[1],
+            style.background[2],
+        ));
+    if style.bold {
+        output = output.add_modifier(Modifier::BOLD);
+    }
+    if style.italic {
+        output = output.add_modifier(Modifier::ITALIC);
+    }
+    if style.underline {
+        output = output.add_modifier(Modifier::UNDERLINED);
+    }
+    output
+}
+
+fn cursor_style(style: Style) -> Style {
+    style.bg(Color::Yellow).fg(Color::Black)
+}
+
+fn cursor_span(text: &'static str) -> Span<'static> {
+    Span::styled(text, cursor_style(Style::default()))
+}
+
+fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App, workspace: &WorkspaceState) {
+    let editor = workspace.editor.as_ref();
+    let file_type = editor.map_or("No file", |editor| match editor.highlight_language() {
+        HighlightLanguage::Markdown => "Markdown",
+        HighlightLanguage::Html => "HTML",
+        HighlightLanguage::PlainText => "Plain text",
+    });
+    let dirty = editor.is_some_and(Editor::is_dirty);
+    let (line, column) = editor.map(cursor_position).unwrap_or((1, 1));
+    let mutation = app
+        .pending_mutation
+        .as_ref()
+        .map(|pending| match pending.kind {
+            PendingMutationKind::Save { .. } => "saving",
+            PendingMutationKind::RetryCommit => "retrying commit",
+            PendingMutationKind::File(_) | PendingMutationKind::Delete => "applying mutation",
+        });
+    let request = app.pending_request.as_ref().map(|_| "loading");
+    let commit = match &app.status.commit {
+        CommitStatus::Idle => None,
+        CommitStatus::Pending => Some("commit pending".to_owned()),
+        CommitStatus::Committed { revision } => Some(format!(
+            "committed {}",
+            revision.chars().take(8).collect::<String>()
+        )),
+        CommitStatus::NoChanges => Some("saved · no Git changes".to_owned()),
+        CommitStatus::SavedCommitFailed { message } => {
+            Some(format!("saved · not committed: {message}"))
+        }
+    };
+    let mut parts = vec![
+        file_type.to_owned(),
+        if dirty { "modified" } else { "saved" }.to_owned(),
+        format!("Ln {line}, Col {column}"),
+    ];
+    parts.extend(mutation.or(request).map(str::to_owned));
+    parts.extend(commit);
+    if let Some(message) = &app.status.message
+        && !parts.iter().any(|part| part.contains(message))
+    {
+        parts.push(message.clone());
+    }
+    frame.render_widget(
+        Paragraph::new(format!(" {} ", parts.join("  ·  ")))
+            .style(Style::default().fg(Color::Black).bg(Color::Gray)),
+        area,
+    );
+}
+
+fn cursor_position(editor: &Editor) -> (usize, usize) {
+    let text = editor.text();
+    let before = text.chars().take(editor.cursor()).collect::<String>();
+    let line = before
+        .chars()
+        .filter(|character| *character == '\n')
+        .count()
+        + 1;
+    let column = before
+        .rsplit_once('\n')
+        .map_or(before.as_str(), |(_, tail)| tail);
+    (line, UnicodeWidthStr::width(column) + 1)
+}
+
+struct VisibleTreeEntry {
+    path: PathBuf,
+    kind: TreeEntryKind,
+    enabled: bool,
+    depth: usize,
+}
+
+fn visible_tree(
+    entries: &[TreeEntry],
+    expanded: &std::collections::BTreeSet<PathBuf>,
+) -> Vec<VisibleTreeEntry> {
+    fn collect(
+        output: &mut Vec<VisibleTreeEntry>,
+        entries: &[TreeEntry],
+        expanded: &std::collections::BTreeSet<PathBuf>,
+        depth: usize,
+    ) {
+        for entry in entries {
+            output.push(VisibleTreeEntry {
+                path: entry.path().to_path_buf(),
+                kind: entry.kind(),
+                enabled: entry.is_enabled(),
+                depth,
+            });
+            if entry.kind() == TreeEntryKind::Directory && expanded.contains(entry.path()) {
+                collect(output, entry.children(), expanded, depth + 1);
+            }
+        }
+    }
+
+    let mut output = Vec::new();
+    collect(&mut output, entries, expanded, 0);
+    output
+}

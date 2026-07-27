@@ -8,7 +8,9 @@ description = "A terminal note editor with Git-backed repositories"
 arboard = { version = "3.6", default-features = false }
 cap-std = "4.0.2"
 clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.29"
 directories = "6.0"
+ratatui = "0.30.2"
 ropey = "1.6"
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.10"
@@ -21,4 +23,5 @@ unicode-width = "0.2"
 uuid = { version = "1.16", features = ["serde", "v4"] }
 
 [dev-dependencies]
+insta = "1.48"
 proptest = "1.7"

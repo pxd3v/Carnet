@@ -7,7 +7,7 @@ use crate::{
     catalog::RepoEntry,
     editor::Editor,
     git::{CommitIntent, GitRepo},
-    workspace::{TreeEntry, Workspace},
+    workspace::{TreeEntry, TreeEntryKind, Workspace},
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -83,6 +83,26 @@ pub struct WorkspaceState {
     pub expanded: BTreeSet<PathBuf>,
 }
 
+impl WorkspaceState {
+    pub fn matching_text_paths(&self, query: &str) -> Vec<PathBuf> {
+        fn collect(output: &mut Vec<PathBuf>, entries: &[TreeEntry]) {
+            for entry in entries {
+                if entry.kind() == TreeEntryKind::Directory {
+                    collect(output, entry.children());
+                } else if entry.kind() == TreeEntryKind::File && entry.is_enabled() {
+                    output.push(entry.path().to_path_buf());
+                }
+            }
+        }
+
+        let mut paths = Vec::new();
+        collect(&mut paths, &self.tree);
+        let query = query.to_lowercase();
+        paths.retain(|path| path.to_string_lossy().to_lowercase().contains(&query));
+        paths
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Focus {
     Editor,
@@ -99,10 +119,17 @@ pub enum DefaultChoiceState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HomeState {
     pub repositories: Vec<RepoEntry>,
+    pub repository_availability: Vec<RepositoryAvailability>,
     pub selected: Option<usize>,
     pub default_repository: Option<Uuid>,
     pub pending_note: Option<PathBuf>,
     pub default_choice: DefaultChoiceState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepositoryAvailability {
+    Available,
+    MissingOrInvalid,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -320,6 +347,7 @@ pub struct App {
     pub pending_intent: Option<PendingIntent>,
     pub pending_request: Option<PendingRequest>,
     pub dialog: Option<Dialog>,
+    pub dialog_input: String,
     pub status: StatusState,
     pub quit: QuitState,
     pub failures: FailureState,
@@ -335,6 +363,7 @@ impl App {
         default_repository: Option<Uuid>,
         pending_note: Option<PathBuf>,
     ) -> Self {
+        let repository_availability = vec![RepositoryAvailability::Available; repositories.len()];
         let selected = default_repository
             .and_then(|id| {
                 repositories
@@ -353,6 +382,7 @@ impl App {
             pending_intent: None,
             pending_request: None,
             dialog: None,
+            dialog_input: String::new(),
             status: StatusState::default(),
             quit: QuitState::default(),
             failures: FailureState::default(),
@@ -362,6 +392,7 @@ impl App {
             next_save_generation: 1,
             home: HomeState {
                 repositories,
+                repository_availability,
                 selected,
                 default_repository,
                 default_choice: if pending_note.is_some() && default_repository.is_none() {

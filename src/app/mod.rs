@@ -7,9 +7,9 @@ pub use state::{
     App, AppExitStatus, CommitStatus, DefaultChoiceState, Dialog, ExternalConflict, FailureKind,
     FailureState, FileActionKind, FileMutationAction, Focus, HomeState, MutationId,
     NavigationAction, OverlayState, PendingFileMutation, PendingIntent, PendingMutation,
-    PendingMutationKind, PendingRequest, PendingSave, QuitState, RequestId, RuntimeFailure,
-    SavedCommitFailure, Screen, SidebarState, StatusState, UnresolvedFailure, WorkspaceOrigin,
-    WorkspaceState,
+    PendingMutationKind, PendingRequest, PendingSave, QuitState, RepositoryAvailability, RequestId,
+    RuntimeFailure, SavedCommitFailure, Screen, SidebarState, StatusState, UnresolvedFailure,
+    WorkspaceOrigin, WorkspaceState,
 };
 pub use update::{
     AppAction, AppEvent, ConflictChoice, DirtyChoice, GlobalAction, HomeAction, TreeAction,

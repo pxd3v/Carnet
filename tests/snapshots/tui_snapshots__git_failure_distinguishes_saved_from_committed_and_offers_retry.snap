@@ -1,0 +1,29 @@
+---
+source: tests/tui_snapshots.rs
+assertion_line: 114
+expression: terminal.backend()
+---
+"┌ notes/welcome.md ──────────────────────────────────────────────────────────────────────┐"
+"│# Welcome                                                                               │"
+"│                                                                                        │"
+"│                                                                                        │"
+"│                                                                                        │"
+"│                                                                                        │"
+"│                                                                                        │"
+"│                                                                                        │"
+"│           ┌ Git failure ───────────────────────────────────────────────────┐           │"
+"│           │The file was saved, but it was not committed.                   │           │"
+"│           │Git identity is not configured                                  │           │"
+"│           │                                                                │           │"
+"│           │[r] Retry commit   [Esc] Continue editing                       │           │"
+"│           │                                                                │           │"
+"│           │                                                                │           │"
+"│           └────────────────────────────────────────────────────────────────┘           │"
+"│                                                                                        │"
+"│                                                                                        │"
+"│                                                                                        │"
+"│                                                                                        │"
+"│                                                                                        │"
+"│                                                                                        │"
+"└────────────────────────────────────────────────────────────────────────────────────────┘"
+" Markdown  ·  saved  ·  Ln 1, Col 1  ·  saved · not committed: Git identity is not configu"
