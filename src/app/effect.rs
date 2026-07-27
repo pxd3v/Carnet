@@ -30,7 +30,9 @@ pub enum AppEffect {
         text: String,
     },
     ApplyAndCommit {
+        mutation_id: super::MutationId,
         repository_id: Uuid,
+        repository_root: PathBuf,
         workspace: Workspace,
         git: GitRepo,
         operation: Box<FileOperation>,
@@ -43,7 +45,9 @@ pub enum AppEffect {
         path: PathBuf,
     },
     RetryCommit {
+        mutation_id: super::MutationId,
         repository_id: Uuid,
+        repository_root: PathBuf,
         git: GitRepo,
         intent: CommitIntent,
     },
@@ -86,6 +90,12 @@ pub struct EffectExecutor {
     repository_locks: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
 }
 
+struct MutationOrigin {
+    mutation_id: super::MutationId,
+    repository_id: Uuid,
+    repository_root: PathBuf,
+}
+
 impl EffectExecutor {
     pub fn execute(&self, effect: AppEffect) -> Result<super::AppEvent, EffectExecutionError> {
         match effect {
@@ -101,17 +111,39 @@ impl EffectExecutor {
                 path,
             } => Ok(self.load_note(request_id, repository_id, workspace, path)),
             AppEffect::ApplyAndCommit {
+                mutation_id,
                 repository_id,
+                repository_root,
                 workspace,
                 git,
                 operation,
                 intent,
-            } => Ok(self.apply_and_commit(repository_id, workspace, git, *operation, intent)),
+            } => Ok(self.apply_and_commit(
+                MutationOrigin {
+                    mutation_id,
+                    repository_id,
+                    repository_root,
+                },
+                workspace,
+                git,
+                *operation,
+                intent,
+            )),
             AppEffect::RetryCommit {
+                mutation_id,
                 repository_id,
+                repository_root,
                 git,
                 intent,
-            } => Ok(self.retry_commit(repository_id, git, intent)),
+            } => Ok(self.retry_commit(
+                MutationOrigin {
+                    mutation_id,
+                    repository_id,
+                    repository_root,
+                },
+                git,
+                intent,
+            )),
             effect @ (AppEffect::SetDefaultRepository { .. }
             | AppEffect::ReadClipboard
             | AppEffect::WriteClipboard { .. }) => Err(EffectExecutionError {
@@ -189,18 +221,25 @@ impl EffectExecutor {
 
     fn apply_and_commit(
         &self,
-        repository_id: Uuid,
+        origin: MutationOrigin,
         workspace: Workspace,
         git: GitRepo,
         operation: FileOperation,
         intent: CommitIntent,
     ) -> super::AppEvent {
+        let MutationOrigin {
+            mutation_id,
+            repository_id,
+            repository_root,
+        } = origin;
         let root = workspace.root().to_path_buf();
         self.run_serialized(&root, || {
             match apply_and_commit(&workspace, &git, operation, intent) {
                 Ok(MutationCommitOutcome::Applied { file, commit }) => {
                     super::AppEvent::MutationApplied {
+                        mutation_id,
                         repository_id,
+                        repository_root,
                         file,
                         commit,
                         tree: workspace.tree(),
@@ -208,7 +247,9 @@ impl EffectExecutor {
                 }
                 Ok(MutationCommitOutcome::SavedCommitFailed { file, error }) => {
                     super::AppEvent::MutationSavedCommitFailed {
+                        mutation_id,
                         repository_id,
+                        repository_root,
                         file,
                         error,
                         tree: workspace.tree(),
@@ -216,18 +257,24 @@ impl EffectExecutor {
                 }
                 Err(MutationCommitError::File(FileError::ExternalModification { path })) => {
                     super::AppEvent::MutationConflict {
+                        mutation_id,
                         repository_id,
+                        repository_root,
                         conflict: super::ExternalConflict::Modified { path },
                     }
                 }
                 Err(MutationCommitError::File(FileError::ExternalDeletion { path })) => {
                     super::AppEvent::MutationConflict {
+                        mutation_id,
                         repository_id,
+                        repository_root,
                         conflict: super::ExternalConflict::Deleted { path },
                     }
                 }
                 Err(error) => super::AppEvent::MutationFailed {
+                    mutation_id,
                     repository_id,
+                    repository_root,
                     error,
                 },
             }
@@ -236,18 +283,27 @@ impl EffectExecutor {
 
     fn retry_commit(
         &self,
-        repository_id: Uuid,
+        origin: MutationOrigin,
         git: GitRepo,
         intent: CommitIntent,
     ) -> super::AppEvent {
+        let MutationOrigin {
+            mutation_id,
+            repository_id,
+            repository_root,
+        } = origin;
         let root = git.root().to_path_buf();
         self.run_serialized(&root, || match git.commit_all(intent) {
             Ok(commit) => super::AppEvent::CommitRetryApplied {
+                mutation_id,
                 repository_id,
+                repository_root,
                 commit,
             },
             Err(error) => super::AppEvent::CommitRetryFailed {
+                mutation_id,
                 repository_id,
+                repository_root,
                 error,
             },
         })

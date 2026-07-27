@@ -167,10 +167,13 @@ fn dirty_create_file_waits_for_save_success_before_starting_the_create() {
         mutation_parts(&save[0]).1,
         FileOperation::Save { content, .. } if content == "dirty base"
     ));
-    let (repository_id, file) = apply_save_effect(save.into_iter().next().unwrap());
+    let (mutation_id, repository_id, repository_root, file) =
+        apply_save_effect(save.into_iter().next().unwrap());
 
     let create = app.update(AppEvent::MutationApplied {
+        mutation_id,
         repository_id,
+        repository_root,
         file,
         commit: CommitOutcome::NoChanges,
         tree: Ok(Vec::new()),
@@ -207,11 +210,14 @@ fn dirty_create_file_reprompts_when_edits_arrive_during_its_prerequisite_save() 
     app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
         "newer ".into(),
     ))));
-    let (repository_id, file) = apply_save_effect(save.into_iter().next().unwrap());
+    let (mutation_id, repository_id, repository_root, file) =
+        apply_save_effect(save.into_iter().next().unwrap());
 
     assert!(
         app.update(AppEvent::MutationApplied {
+            mutation_id,
             repository_id,
+            repository_root,
             file,
             commit: CommitOutcome::NoChanges,
             tree: Ok(Vec::new()),
@@ -273,9 +279,12 @@ fn discarding_dirty_ancestor_rename_abandons_edits_and_blocks_replacement_races(
     );
     assert_eq!(workspace_editor(&app).text(), "base");
 
-    let (repository_id, file, tree) = apply_mutation_effect(rename.into_iter().next().unwrap());
+    let (mutation_id, repository_id, repository_root, file, tree) =
+        apply_mutation_effect(rename.into_iter().next().unwrap());
     let load = app.update(AppEvent::MutationApplied {
+        mutation_id,
         repository_id,
+        repository_root,
         file,
         commit: CommitOutcome::NoChanges,
         tree,
@@ -367,9 +376,12 @@ fn dirty_ancestor_delete_waits_for_save_before_deleting_the_tree() {
     );
 
     let save = app.update(AppEvent::DirtyChoice(DirtyChoice::Save));
-    let (repository_id, file) = apply_save_effect(save.into_iter().next().unwrap());
+    let (mutation_id, repository_id, repository_root, file) =
+        apply_save_effect(save.into_iter().next().unwrap());
     let delete = app.update(AppEvent::MutationApplied {
+        mutation_id,
         repository_id,
+        repository_root,
         file,
         commit: CommitOutcome::NoChanges,
         tree: Ok(Vec::new()),
@@ -431,10 +443,13 @@ fn dirty_unrelated_rename_does_not_replace_or_block_the_active_editor() {
     )));
     assert!(matches!(&rename[..], [AppEffect::ApplyAndCommit { .. }]));
 
-    let (repository_id, file, tree) = apply_mutation_effect(rename.into_iter().next().unwrap());
+    let (mutation_id, repository_id, repository_root, file, tree) =
+        apply_mutation_effect(rename.into_iter().next().unwrap());
     assert!(
         app.update(AppEvent::MutationApplied {
+            mutation_id,
             repository_id,
+            repository_root,
             file,
             commit: CommitOutcome::NoChanges,
             tree,
@@ -455,6 +470,340 @@ fn dirty_unrelated_rename_does_not_replace_or_block_the_active_editor() {
 }
 
 #[test]
+fn pending_load_blocks_unrelated_and_active_mutations_until_the_load_resolves() {
+    use carnet::{
+        app::{Dialog, EffectExecutor, FileActionKind, Focus, NavigationAction, TreeAction},
+        workspace::FileOperation,
+    };
+
+    let (_sandbox, mut unrelated) = app_with_note(90, "note.md", "base");
+    let unrelated_load = unrelated
+        .update(AppEvent::Action(AppAction::Navigate(
+            NavigationAction::Note(PathBuf::from("note.md")),
+        )))
+        .pop()
+        .unwrap();
+    unrelated.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    unrelated.update(AppEvent::Action(AppAction::Tree(TreeAction::NewFolder)));
+    assert!(
+        unrelated
+            .update(AppEvent::Action(AppAction::SubmitFileAction(
+                PathBuf::from("folder"),
+            )))
+            .is_empty()
+    );
+    assert!(matches!(
+        unrelated.dialog,
+        Some(Dialog::FileAction {
+            kind: FileActionKind::NewFolder,
+            ..
+        })
+    ));
+
+    let (_sandbox, mut active) = app_with_note(91, "note.md", "base");
+    let active_load = active
+        .update(AppEvent::Action(AppAction::Navigate(
+            NavigationAction::Note(PathBuf::from("note.md")),
+        )))
+        .pop()
+        .unwrap();
+    active.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    active.update(AppEvent::Action(AppAction::Tree(TreeAction::Rename)));
+    assert!(
+        active
+            .update(AppEvent::Action(AppAction::SubmitFileAction(
+                PathBuf::from("renamed.md"),
+            )))
+            .is_empty()
+    );
+    assert!(matches!(
+        active.dialog,
+        Some(Dialog::FileAction {
+            kind: FileActionKind::Rename,
+            ..
+        })
+    ));
+
+    unrelated.update(EffectExecutor::default().execute(unrelated_load).unwrap());
+    active.update(EffectExecutor::default().execute(active_load).unwrap());
+    let rename = active.update(AppEvent::Action(AppAction::SubmitFileAction(
+        PathBuf::from("renamed.md"),
+    )));
+    assert!(matches!(
+        mutation_parts(&rename[0]).1,
+        FileOperation::Rename { from, to, .. }
+            if from == PathBuf::from("note.md").as_path()
+                && to == PathBuf::from("renamed.md").as_path()
+    ));
+}
+
+#[test]
+fn pending_workspace_open_blocks_mutation_start_in_the_old_visible_repository() {
+    use carnet::app::{Dialog, FileActionKind, Focus, NavigationAction, TreeAction};
+
+    let (_sandbox, mut app) = app_with_note(92, "note.md", "base");
+    let repository_b = repository(93, "repository-b");
+    let open = app.update(AppEvent::Action(AppAction::Navigate(
+        NavigationAction::Repository {
+            repository: repository_b,
+            note: None,
+        },
+    )));
+    assert!(matches!(&open[..], [AppEffect::OpenWorkspace { .. }]));
+
+    app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::NewFolder)));
+    assert!(
+        app.update(AppEvent::Action(AppAction::SubmitFileAction(
+            PathBuf::from("must-wait"),
+        )))
+        .is_empty()
+    );
+    assert!(matches!(
+        app.dialog,
+        Some(Dialog::FileAction {
+            kind: FileActionKind::NewFolder,
+            ..
+        })
+    ));
+    assert!(app.pending_mutation.is_none());
+}
+
+#[test]
+fn navigation_cannot_overwrite_a_deferred_dirty_mutation_intent() {
+    use carnet::app::{Dialog, FileMutationAction, Focus, NavigationAction, TreeAction};
+
+    let (_sandbox, mut app) = app_with_note(99, "note.md", "base");
+    app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "dirty ".into(),
+    ))));
+    app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::NewFile)));
+    app.update(AppEvent::Action(AppAction::SubmitFileAction(
+        PathBuf::from("created.md"),
+    )));
+    let deferred = PendingIntent::Mutation(FileMutationAction::CreateFile {
+        path: PathBuf::from("created.md"),
+    });
+    assert_eq!(app.pending_intent, Some(deferred.clone()));
+
+    assert!(
+        app.update(AppEvent::Action(AppAction::Navigate(
+            NavigationAction::Note(PathBuf::from("other.md")),
+        )))
+        .is_empty()
+    );
+    assert_eq!(app.pending_intent, Some(deferred));
+    assert_eq!(app.dialog, Some(Dialog::DirtyNavigation));
+    assert!(app.pending_request.is_none());
+}
+
+#[test]
+fn stale_mutation_success_cannot_clear_a_newer_same_repository_mutation() {
+    use carnet::{
+        app::{FileActionKind, Focus, PendingMutationKind, TreeAction},
+        git::{CommitOutcome, MutationCommitError},
+    };
+
+    let (_sandbox, mut app) = empty_app(94);
+    app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::NewFolder)));
+    let stale = app
+        .update(AppEvent::Action(AppAction::SubmitFileAction(
+            PathBuf::from("stale"),
+        )))
+        .pop()
+        .unwrap();
+    let (mutation_id, repository_id, repository_root) = mutation_identity(&stale);
+    app.update(AppEvent::MutationFailed {
+        mutation_id,
+        repository_id,
+        repository_root,
+        error: MutationCommitError::WorkspaceMismatch,
+    });
+
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::NewFolder)));
+    let current = app.update(AppEvent::Action(AppAction::SubmitFileAction(
+        PathBuf::from("current"),
+    )));
+    assert!(matches!(&current[..], [AppEffect::ApplyAndCommit { .. }]));
+    let current_identity = mutation_identity(&current[0]);
+    assert!(mutation_id.get() < current_identity.0.get());
+    let (mutation_id, repository_id, repository_root, file, tree) = apply_mutation_effect(stale);
+
+    assert!(
+        app.update(AppEvent::MutationApplied {
+            mutation_id,
+            repository_id,
+            repository_root,
+            file,
+            commit: CommitOutcome::NoChanges,
+            tree,
+        })
+        .is_empty()
+    );
+    assert_eq!(pending_mutation_identity(&app), current_identity);
+    assert!(matches!(
+        app.pending_mutation.as_ref().map(|pending| pending.kind),
+        Some(PendingMutationKind::File(FileActionKind::NewFolder))
+    ));
+    let Screen::Workspace(workspace) = &app.screen else {
+        panic!("expected workspace");
+    };
+    assert!(workspace.tree.is_empty());
+    assert_eq!(workspace.tree_selection, None);
+}
+
+#[test]
+fn repository_a_mutation_success_cannot_touch_repository_b_state() {
+    use carnet::{
+        app::{Focus, TreeAction},
+        git::CommitOutcome,
+    };
+
+    let (_sandbox_a, mut app_a) = empty_app(95);
+    app_a.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app_a.update(AppEvent::Action(AppAction::Tree(TreeAction::NewFolder)));
+    let stale = app_a
+        .update(AppEvent::Action(AppAction::SubmitFileAction(
+            PathBuf::from("from-a"),
+        )))
+        .pop()
+        .unwrap();
+    let (mutation_id, repository_id, repository_root, file, tree) = apply_mutation_effect(stale);
+
+    let (_sandbox_b, mut app_b) = empty_app(96);
+    app_b.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app_b.update(AppEvent::Action(AppAction::Tree(TreeAction::NewFolder)));
+    let current = app_b.update(AppEvent::Action(AppAction::SubmitFileAction(
+        PathBuf::from("from-b"),
+    )));
+    let (current_mutation_id, current_repository_id, current_root) = mutation_identity(&current[0]);
+    assert_eq!(mutation_id, current_mutation_id);
+
+    assert!(
+        app_b
+            .update(AppEvent::MutationApplied {
+                mutation_id,
+                repository_id,
+                repository_root,
+                file,
+                commit: CommitOutcome::NoChanges,
+                tree,
+            })
+            .is_empty()
+    );
+    assert_eq!(
+        pending_mutation_identity(&app_b),
+        (current_mutation_id, current_repository_id, current_root)
+    );
+    let Screen::Workspace(workspace) = &app_b.screen else {
+        panic!("expected repository B workspace");
+    };
+    assert_eq!(workspace.repository.id, Uuid::from_u128(96));
+    assert!(workspace.tree.is_empty());
+    assert_eq!(workspace.tree_selection, None);
+}
+
+#[test]
+fn stale_failure_and_conflict_cannot_replace_the_current_mutation() {
+    use carnet::{
+        app::{CommitStatus, ExternalConflict, Focus, TreeAction},
+        git::MutationCommitError,
+    };
+
+    let (_sandbox, mut app) = empty_app(97);
+    app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::NewFolder)));
+    let stale = app
+        .update(AppEvent::Action(AppAction::SubmitFileAction(
+            PathBuf::from("stale"),
+        )))
+        .pop()
+        .unwrap();
+    let (stale_id, repository_id, repository_root) = mutation_identity(&stale);
+    app.update(AppEvent::MutationFailed {
+        mutation_id: stale_id,
+        repository_id,
+        repository_root: repository_root.clone(),
+        error: MutationCommitError::WorkspaceMismatch,
+    });
+    app.update(AppEvent::Action(AppAction::Dismiss));
+
+    app.update(AppEvent::Action(AppAction::Tree(TreeAction::NewFolder)));
+    let current = app.update(AppEvent::Action(AppAction::SubmitFileAction(
+        PathBuf::from("current"),
+    )));
+    let current_identity = mutation_identity(&current[0]);
+    let recorded_failure_count = app.failures.runtime.len();
+
+    app.update(AppEvent::MutationFailed {
+        mutation_id: stale_id,
+        repository_id,
+        repository_root: repository_root.clone(),
+        error: MutationCommitError::RepositoryMismatch,
+    });
+    app.update(AppEvent::MutationConflict {
+        mutation_id: stale_id,
+        repository_id,
+        repository_root,
+        conflict: ExternalConflict::Modified {
+            path: PathBuf::from("stale"),
+        },
+    });
+
+    assert_eq!(pending_mutation_identity(&app), current_identity);
+    assert_eq!(app.status.commit, CommitStatus::Pending);
+    assert_eq!(app.dialog, None);
+    assert_eq!(app.failures.runtime.len(), recorded_failure_count);
+}
+
+#[test]
+fn stale_saved_commit_failure_cannot_mark_a_newer_save_clean_or_failed() {
+    use carnet::{
+        app::{CommitStatus, GlobalAction},
+        git::{GitError, MutationCommitError},
+    };
+
+    let (_sandbox, mut app) = app_with_note(98, "note.md", "base");
+    app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "dirty ".into(),
+    ))));
+    let stale = app.update(AppEvent::Action(AppAction::Global(GlobalAction::Save)));
+    let (stale_id, repository_id, repository_root, file) =
+        apply_save_effect(stale.into_iter().next().unwrap());
+    app.update(AppEvent::MutationFailed {
+        mutation_id: stale_id,
+        repository_id,
+        repository_root: repository_root.clone(),
+        error: MutationCommitError::WorkspaceMismatch,
+    });
+    app.update(AppEvent::Action(AppAction::Dismiss));
+
+    let current = app.update(AppEvent::Action(AppAction::Global(GlobalAction::Save)));
+    let current_identity = mutation_identity(&current[0]);
+    app.update(AppEvent::MutationSavedCommitFailed {
+        mutation_id: stale_id,
+        repository_id,
+        repository_root,
+        file,
+        error: GitError::CommandFailed {
+            operation: "commit",
+            status: Some(1),
+            stderr: "stale failure".into(),
+        },
+        tree: Ok(Vec::new()),
+    });
+
+    assert_eq!(pending_mutation_identity(&app), current_identity);
+    assert!(workspace_editor(&app).is_dirty());
+    assert_eq!(app.saved_commit_failure, None);
+    assert_eq!(app.failures.git, None);
+    assert_eq!(app.status.commit, CommitStatus::Pending);
+    assert_eq!(app.dialog, None);
+}
+
+#[test]
 fn edits_after_save_start_keep_newer_text_dirty_when_save_completes() {
     use carnet::{app::GlobalAction, git::CommitOutcome};
 
@@ -466,10 +815,13 @@ fn edits_after_save_start_keep_newer_text_dirty_when_save_completes() {
     app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
         "newer ".into(),
     ))));
-    let (repository_id, file) = apply_save_effect(save.into_iter().next().unwrap());
+    let (mutation_id, repository_id, repository_root, file) =
+        apply_save_effect(save.into_iter().next().unwrap());
 
     app.update(AppEvent::MutationApplied {
+        mutation_id,
         repository_id,
+        repository_root,
         file,
         commit: CommitOutcome::NoChanges,
         tree: Ok(Vec::new()),
@@ -504,10 +856,13 @@ fn dirty_navigation_does_not_resume_when_edits_arrive_after_save_start() {
     app.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
         "newer ".into(),
     ))));
-    let (repository_id, file) = apply_save_effect(save.into_iter().next().unwrap());
+    let (mutation_id, repository_id, repository_root, file) =
+        apply_save_effect(save.into_iter().next().unwrap());
 
     let effects = app.update(AppEvent::MutationApplied {
+        mutation_id,
         repository_id,
+        repository_root,
         file,
         commit: CommitOutcome::NoChanges,
         tree: Ok(Vec::new()),
@@ -634,10 +989,13 @@ fn dirty_navigation_save_resumes_only_after_the_confirmed_save_result() {
     assert_eq!(app.pending_intent, Some(PendingIntent::Navigation(target)));
     assert_eq!(app.dialog, None);
     assert_eq!(save_effects.len(), 1);
-    let (repository_id, file) = apply_save_effect(save_effects.into_iter().next().unwrap());
+    let (mutation_id, repository_id, repository_root, file) =
+        apply_save_effect(save_effects.into_iter().next().unwrap());
 
     let resumed = app.update(AppEvent::MutationApplied {
+        mutation_id,
         repository_id,
+        repository_root,
         file,
         commit: CommitOutcome::NoChanges,
         tree: Ok(Vec::new()),
@@ -692,12 +1050,15 @@ fn cancelling_an_external_conflict_keeps_the_dirty_buffer() {
         "mine ".into(),
     ))));
     app.update(AppEvent::Action(AppAction::Global(GlobalAction::Save)));
+    let (mutation_id, _, repository_root) = pending_mutation_identity(&app);
     let conflict = ExternalConflict::Modified {
         path: PathBuf::from("note.md"),
     };
 
     app.update(AppEvent::MutationConflict {
+        mutation_id,
         repository_id: Uuid::from_u128(28),
+        repository_root,
         conflict: conflict.clone(),
     });
 
@@ -722,8 +1083,11 @@ fn overwriting_an_external_conflict_emits_an_overwrite_save() {
         "mine ".into(),
     ))));
     app.update(AppEvent::Action(AppAction::Global(GlobalAction::Save)));
+    let (mutation_id, _, repository_root) = pending_mutation_identity(&app);
     app.update(AppEvent::MutationConflict {
+        mutation_id,
         repository_id: Uuid::from_u128(29),
+        repository_root,
         conflict: ExternalConflict::Modified {
             path: PathBuf::from("note.md"),
         },
@@ -755,8 +1119,11 @@ fn reloading_an_external_conflict_waits_for_the_load_result_before_replacing_the
         "mine ".into(),
     ))));
     app.update(AppEvent::Action(AppAction::Global(GlobalAction::Save)));
+    let (mutation_id, _, repository_root) = pending_mutation_identity(&app);
     app.update(AppEvent::MutationConflict {
+        mutation_id,
         repository_id: Uuid::from_u128(30),
+        repository_root,
         conflict: ExternalConflict::Modified {
             path: PathBuf::from("note.md"),
         },
@@ -807,10 +1174,13 @@ fn saved_commit_failure_marks_the_buffer_clean_and_global_save_retries_only_git(
         "saved ".into(),
     ))));
     let save = app.update(AppEvent::Action(AppAction::Global(GlobalAction::Save)));
-    let (repository_id, file) = apply_save_effect(save.into_iter().next().unwrap());
+    let (mutation_id, repository_id, repository_root, file) =
+        apply_save_effect(save.into_iter().next().unwrap());
 
     app.update(AppEvent::MutationSavedCommitFailed {
+        mutation_id,
         repository_id,
+        repository_root,
         file,
         error: GitError::CommandFailed {
             operation: "commit",
@@ -842,8 +1212,11 @@ fn saved_commit_failure_marks_the_buffer_clean_and_global_save_retries_only_git(
             .is_empty()
     );
 
+    let (mutation_id, _, repository_root) = mutation_identity(&retry[0]);
     app.update(AppEvent::CommitRetryApplied {
+        mutation_id,
         repository_id,
+        repository_root,
         commit: CommitOutcome::Committed {
             revision: "abc123".into(),
         },
@@ -871,9 +1244,12 @@ fn failed_commit_retry_stays_retryable_without_rewriting_the_file() {
     let (_sandbox, mut app) = app_with_note(32, "note.md", "saved");
     enter_saved_commit_failure(&mut app, Uuid::from_u128(32));
     app.update(AppEvent::Action(AppAction::Global(GlobalAction::Save)));
+    let (mutation_id, _, repository_root) = pending_mutation_identity(&app);
 
     app.update(AppEvent::CommitRetryFailed {
+        mutation_id,
         repository_id: Uuid::from_u128(32),
+        repository_root,
         error: GitError::CommandFailed {
             operation: "commit",
             status: Some(1),
@@ -905,9 +1281,12 @@ fn git_recovery_clears_only_git_failure_and_unrelated_failure_keeps_exit_one() {
     assert!(app.failures.clipboard.is_some());
     assert!(app.failures.git.is_some());
 
-    app.update(AppEvent::Action(AppAction::Global(GlobalAction::Save)));
+    let retry = app.update(AppEvent::Action(AppAction::Global(GlobalAction::Save)));
+    let (mutation_id, _, repository_root) = mutation_identity(&retry[0]);
     app.update(AppEvent::CommitRetryApplied {
+        mutation_id,
         repository_id: Uuid::from_u128(81),
+        repository_root,
         commit: CommitOutcome::Committed {
             revision: "recovered".into(),
         },
@@ -943,8 +1322,11 @@ fn dirty_navigation_during_commit_failure_prompts_before_saving_newer_edits() {
         Some(PendingIntent::Navigation(NavigationAction::Quit))
     );
 
+    let (mutation_id, _, repository_root) = mutation_identity(&retry[0]);
     let save = app.update(AppEvent::CommitRetryApplied {
+        mutation_id,
         repository_id: Uuid::from_u128(36),
+        repository_root,
         commit: CommitOutcome::Committed {
             revision: "old-save".into(),
         },
@@ -981,9 +1363,12 @@ fn failed_save_stays_on_the_dirty_note_and_marks_a_failure_exit() {
         NavigationAction::Quit,
     )));
     app.update(AppEvent::DirtyChoice(DirtyChoice::Save));
+    let (mutation_id, _, repository_root) = pending_mutation_identity(&app);
 
     app.update(AppEvent::MutationFailed {
+        mutation_id,
         repository_id: Uuid::from_u128(33),
+        repository_root,
         error: MutationCommitError::File(FileError::Io {
             path: PathBuf::from("note.md"),
             source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "read only"),
@@ -1005,9 +1390,12 @@ fn failed_save_stays_on_the_dirty_note_and_marks_a_failure_exit() {
             .as_slice(),
         [AppEffect::ApplyAndCommit { .. }]
     ));
+    let (mutation_id, _, repository_root) = pending_mutation_identity(&app);
 
     app.update(AppEvent::MutationFailed {
+        mutation_id,
         repository_id: Uuid::from_u128(33),
+        repository_root,
         error: MutationCommitError::File(FileError::Io {
             path: PathBuf::from("note.md"),
             source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "still read only"),
@@ -1030,10 +1418,13 @@ fn tree_refresh_failure_after_save_preserves_the_saved_result_and_reports_runtim
         "saved ".into(),
     ))));
     let save = app.update(AppEvent::Action(AppAction::Global(GlobalAction::Save)));
-    let (repository_id, file) = apply_save_effect(save.into_iter().next().unwrap());
+    let (mutation_id, repository_id, repository_root, file) =
+        apply_save_effect(save.into_iter().next().unwrap());
 
     app.update(AppEvent::MutationApplied {
+        mutation_id,
         repository_id,
+        repository_root,
         file,
         commit: CommitOutcome::NoChanges,
         tree: Err(FileError::GitIgnore {
@@ -1389,9 +1780,11 @@ fn mutation_results_reconcile_active_note_and_tree_selection() {
         )))
         .pop()
         .unwrap();
-    let (repository_id, file, tree) = apply_mutation_effect(effect);
+    let (mutation_id, repository_id, repository_root, file, tree) = apply_mutation_effect(effect);
     let follow_up = created.update(AppEvent::MutationApplied {
+        mutation_id,
         repository_id,
+        repository_root,
         file,
         commit: CommitOutcome::NoChanges,
         tree,
@@ -1411,11 +1804,13 @@ fn mutation_results_reconcile_active_note_and_tree_selection() {
         )))
         .pop()
         .unwrap();
-    let (repository_id, file, tree) = apply_mutation_effect(effect);
+    let (mutation_id, repository_id, repository_root, file, tree) = apply_mutation_effect(effect);
     assert!(
         folder
             .update(AppEvent::MutationApplied {
+                mutation_id,
                 repository_id,
+                repository_root,
                 file,
                 commit: CommitOutcome::NoChanges,
                 tree,
@@ -1437,9 +1832,12 @@ fn mutation_results_reconcile_active_note_and_tree_selection() {
             )))
             .pop()
             .unwrap();
-        let (repository_id, file, tree) = apply_mutation_effect(effect);
+        let (mutation_id, repository_id, repository_root, file, tree) =
+            apply_mutation_effect(effect);
         let follow_up = app.update(AppEvent::MutationApplied {
+            mutation_id,
             repository_id,
+            repository_root,
             file,
             commit: CommitOutcome::NoChanges,
             tree,
@@ -1467,11 +1865,13 @@ fn mutation_results_reconcile_active_note_and_tree_selection() {
         .update(AppEvent::Action(AppAction::ConfirmDelete))
         .pop()
         .unwrap();
-    let (repository_id, file, tree) = apply_mutation_effect(effect);
+    let (mutation_id, repository_id, repository_root, file, tree) = apply_mutation_effect(effect);
     assert!(
         deleted
             .update(AppEvent::MutationApplied {
+                mutation_id,
                 repository_id,
+                repository_root,
                 file,
                 commit: CommitOutcome::NoChanges,
                 tree,
@@ -1502,10 +1902,12 @@ fn renaming_an_ancestor_reloads_the_active_note_at_its_rebased_path() {
         )))
         .pop()
         .unwrap();
-    let (repository_id, file, tree) = apply_mutation_effect(effect);
+    let (mutation_id, repository_id, repository_root, file, tree) = apply_mutation_effect(effect);
 
     let follow_up = app.update(AppEvent::MutationApplied {
+        mutation_id,
         repository_id,
+        repository_root,
         file,
         commit: CommitOutcome::NoChanges,
         tree,
@@ -1542,10 +1944,12 @@ fn moving_an_ancestor_reloads_the_active_note_and_selects_the_nested_destination
         )))
         .pop()
         .unwrap();
-    let (repository_id, file, tree) = apply_mutation_effect(effect);
+    let (mutation_id, repository_id, repository_root, file, tree) = apply_mutation_effect(effect);
 
     let follow_up = app.update(AppEvent::MutationApplied {
+        mutation_id,
         repository_id,
+        repository_root,
         file,
         commit: CommitOutcome::NoChanges,
         tree,
@@ -1577,11 +1981,13 @@ fn deleting_an_ancestor_clears_the_active_note_and_clamps_tree_selection() {
         .update(AppEvent::Action(AppAction::ConfirmDelete))
         .pop()
         .unwrap();
-    let (repository_id, file, tree) = apply_mutation_effect(effect);
+    let (mutation_id, repository_id, repository_root, file, tree) = apply_mutation_effect(effect);
 
     assert!(
         app.update(AppEvent::MutationApplied {
+            mutation_id,
             repository_id,
+            repository_root,
             file,
             commit: CommitOutcome::NoChanges,
             tree,
@@ -1951,9 +2357,49 @@ fn mutation_parts(
     (*repository_id, operation.as_ref(), intent)
 }
 
-fn apply_save_effect(effect: AppEffect) -> (Uuid, carnet::workspace::FileOutcome) {
-    let AppEffect::ApplyAndCommit {
+fn mutation_identity(effect: &AppEffect) -> (carnet::app::MutationId, Uuid, PathBuf) {
+    let (AppEffect::ApplyAndCommit {
+        mutation_id,
         repository_id,
+        repository_root,
+        ..
+    }
+    | AppEffect::RetryCommit {
+        mutation_id,
+        repository_id,
+        repository_root,
+        ..
+    }) = effect
+    else {
+        panic!("expected mutation effect, got {effect:?}");
+    };
+    (*mutation_id, *repository_id, repository_root.clone())
+}
+
+fn pending_mutation_identity(app: &App) -> (carnet::app::MutationId, Uuid, PathBuf) {
+    let pending = app
+        .pending_mutation
+        .as_ref()
+        .expect("expected pending mutation");
+    (
+        pending.mutation_id,
+        pending.repository_id,
+        pending.repository_root.clone(),
+    )
+}
+
+fn apply_save_effect(
+    effect: AppEffect,
+) -> (
+    carnet::app::MutationId,
+    Uuid,
+    PathBuf,
+    carnet::workspace::FileOutcome,
+) {
+    let AppEffect::ApplyAndCommit {
+        mutation_id,
+        repository_id,
+        repository_root,
         operation,
         ..
     } = effect
@@ -1965,7 +2411,9 @@ fn apply_save_effect(effect: AppEffect) -> (Uuid, carnet::workspace::FileOutcome
         carnet::workspace::FileOperation::Save { .. }
     ));
     (
+        mutation_id,
         repository_id,
+        repository_root,
         Workspace::apply(*operation).expect("save operation should apply"),
     )
 }
@@ -1973,12 +2421,16 @@ fn apply_save_effect(effect: AppEffect) -> (Uuid, carnet::workspace::FileOutcome
 fn apply_mutation_effect(
     effect: AppEffect,
 ) -> (
+    carnet::app::MutationId,
     Uuid,
+    PathBuf,
     carnet::workspace::FileOutcome,
     Result<Vec<carnet::workspace::TreeEntry>, carnet::workspace::FileError>,
 ) {
     let AppEffect::ApplyAndCommit {
+        mutation_id,
         repository_id,
+        repository_root,
         workspace,
         operation,
         ..
@@ -1988,7 +2440,7 @@ fn apply_mutation_effect(
     };
     let file = Workspace::apply(*operation).expect("mutation should apply");
     let tree = workspace.tree();
-    (repository_id, file, tree)
+    (mutation_id, repository_id, repository_root, file, tree)
 }
 
 fn enter_saved_commit_failure(app: &mut App, repository_id: Uuid) {
@@ -1998,10 +2450,13 @@ fn enter_saved_commit_failure(app: &mut App, repository_id: Uuid) {
     let effects = app.update(AppEvent::Action(AppAction::Global(
         carnet::app::GlobalAction::Save,
     )));
-    let (effect_repository_id, file) = apply_save_effect(effects.into_iter().next().unwrap());
+    let (mutation_id, effect_repository_id, repository_root, file) =
+        apply_save_effect(effects.into_iter().next().unwrap());
     assert_eq!(effect_repository_id, repository_id);
     app.update(AppEvent::MutationSavedCommitFailed {
+        mutation_id,
         repository_id,
+        repository_root,
         file,
         error: carnet::git::GitError::CommandFailed {
             operation: "commit",

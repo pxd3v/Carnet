@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf, process::Command};
 use carnet::{
     app::{
         App, AppAction, AppEffect, AppEvent, EffectExecutor, ExternalConflict, FailureKind,
-        HomeAction, NavigationAction, RequestId, RuntimeError, RuntimeOperation,
+        HomeAction, MutationId, NavigationAction, RequestId, RuntimeError, RuntimeOperation,
     },
     catalog::RepoEntry,
     git::{CommitIntent, CommitOutcome, GitRepo},
@@ -61,7 +61,9 @@ fn executor_applies_and_commits_a_save_then_maps_external_conflicts() {
 
     let event = EffectExecutor::default()
         .execute(AppEffect::ApplyAndCommit {
+            mutation_id: MutationId::new(1),
             repository_id: repo.entry.id,
+            repository_root: repo.root().to_path_buf(),
             workspace: workspace.clone(),
             git: repo.git.clone(),
             operation: Box::new(FileOperation::Save {
@@ -76,10 +78,12 @@ fn executor_applies_and_commits_a_save_then_maps_external_conflicts() {
     assert!(matches!(
         event,
         AppEvent::MutationApplied {
+            mutation_id,
+            repository_root,
             file: FileOutcome::Saved(_),
             commit: CommitOutcome::Committed { .. },
             ..
-        }
+        } if mutation_id == MutationId::new(1) && repository_root == repo.root()
     ));
     assert_eq!(
         fs::read_to_string(repo.root().join("note.md")).unwrap(),
@@ -96,7 +100,9 @@ fn executor_applies_and_commits_a_save_then_maps_external_conflicts() {
     fs::write(repo.root().join("note.md"), "external").unwrap();
     let conflict = EffectExecutor::default()
         .execute(AppEffect::ApplyAndCommit {
+            mutation_id: MutationId::new(2),
             repository_id: repo.entry.id,
+            repository_root: repo.root().to_path_buf(),
             workspace: workspace.clone(),
             git: repo.git.clone(),
             operation: Box::new(FileOperation::Save {
@@ -129,7 +135,9 @@ fn executor_applies_and_commits_a_save_then_maps_external_conflicts() {
     fs::remove_file(repo.root().join("note.md")).unwrap();
     let conflict = EffectExecutor::default()
         .execute(AppEffect::ApplyAndCommit {
+            mutation_id: MutationId::new(3),
             repository_id: repo.entry.id,
+            repository_root: repo.root().to_path_buf(),
             workspace,
             git: repo.git.clone(),
             operation: Box::new(FileOperation::Save {
@@ -171,7 +179,9 @@ fn executor_preserves_a_saved_file_across_commit_failure_and_retries_only_git() 
 
     let event = EffectExecutor::default()
         .execute(AppEffect::ApplyAndCommit {
+            mutation_id: MutationId::new(4),
             repository_id: repo.entry.id,
+            repository_root: repo.root().to_path_buf(),
             workspace,
             git: repo.git.clone(),
             operation: Box::new(FileOperation::Save {
@@ -192,12 +202,21 @@ fn executor_preserves_a_saved_file_across_commit_failure_and_retries_only_git() 
     repo.configure_identity();
     let retry = EffectExecutor::default()
         .execute(AppEffect::RetryCommit {
+            mutation_id: MutationId::new(5),
             repository_id: repo.entry.id,
+            repository_root: repo.root().to_path_buf(),
             git: repo.git.clone(),
             intent,
         })
         .unwrap();
-    assert!(matches!(retry, AppEvent::CommitRetryApplied { .. }));
+    assert!(matches!(
+        retry,
+        AppEvent::CommitRetryApplied {
+            mutation_id,
+            repository_root,
+            ..
+        } if mutation_id == MutationId::new(5) && repository_root == repo.root()
+    ));
     assert_eq!(
         fs::read_to_string(repo.root().join("note.md")).unwrap(),
         "saved"
@@ -532,7 +551,9 @@ fn open_and_load_share_mutation_lock_per_root_without_blocking_other_roots() {
     let mutation_git = repo_a.git.clone();
     let mutation = thread::spawn(move || {
         mutation_executor.execute(AppEffect::ApplyAndCommit {
+            mutation_id: MutationId::new(6),
             repository_id: mutation_repository_id,
+            repository_root: workspace_a.root().to_path_buf(),
             workspace: workspace_a,
             git: mutation_git,
             operation: Box::new(FileOperation::Save {

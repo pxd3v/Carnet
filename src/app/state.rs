@@ -23,6 +23,19 @@ impl RequestId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct MutationId(pub(crate) u64);
+
+impl MutationId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PendingRequest {
     OpenWorkspace {
@@ -121,7 +134,9 @@ pub enum PendingMutationKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingMutation {
+    pub mutation_id: MutationId,
     pub repository_id: Uuid,
+    pub repository_root: PathBuf,
     pub kind: PendingMutationKind,
     pub intent: CommitIntent,
     pub save: Option<PendingSave>,
@@ -296,6 +311,7 @@ pub struct App {
     pub failures: FailureState,
     pub saved_commit_failure: Option<SavedCommitFailure>,
     pub(crate) next_request_id: u64,
+    pub(crate) next_mutation_id: u64,
     pub(crate) next_save_generation: u64,
 }
 
@@ -328,6 +344,7 @@ impl App {
             failures: FailureState::default(),
             saved_commit_failure: None,
             next_request_id: 1,
+            next_mutation_id: 1,
             next_save_generation: 1,
             home: HomeState {
                 repositories,

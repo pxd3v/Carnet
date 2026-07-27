@@ -9,9 +9,9 @@ use crate::{
 
 use super::{
     App, AppEffect, AppExitStatus, CommitStatus, DefaultChoiceState, Dialog, ExternalConflict,
-    FailureKind, FileActionKind, FileMutationAction, Focus, NavigationAction, OverlayState,
-    PendingIntent, PendingMutation, PendingMutationKind, PendingRequest, PendingSave, RequestId,
-    RuntimeFailure, SavedCommitFailure, Screen, UnresolvedFailure, WorkspaceState,
+    FailureKind, FileActionKind, FileMutationAction, Focus, MutationId, NavigationAction,
+    OverlayState, PendingIntent, PendingMutation, PendingMutationKind, PendingRequest, PendingSave,
+    RequestId, RuntimeFailure, SavedCommitFailure, Screen, UnresolvedFailure, WorkspaceState,
 };
 use super::{RuntimeError, RuntimeOperation};
 
@@ -93,31 +93,43 @@ pub enum AppEvent {
     DirtyChoice(DirtyChoice),
     ConflictChoice(ConflictChoice),
     MutationApplied {
+        mutation_id: MutationId,
         repository_id: Uuid,
+        repository_root: std::path::PathBuf,
         file: FileOutcome,
         commit: CommitOutcome,
         tree: Result<Vec<TreeEntry>, crate::workspace::FileError>,
     },
     MutationConflict {
+        mutation_id: MutationId,
         repository_id: Uuid,
+        repository_root: std::path::PathBuf,
         conflict: ExternalConflict,
     },
     MutationSavedCommitFailed {
+        mutation_id: MutationId,
         repository_id: Uuid,
+        repository_root: std::path::PathBuf,
         file: FileOutcome,
         error: GitError,
         tree: Result<Vec<TreeEntry>, crate::workspace::FileError>,
     },
     MutationFailed {
+        mutation_id: MutationId,
         repository_id: Uuid,
+        repository_root: std::path::PathBuf,
         error: MutationCommitError,
     },
     CommitRetryApplied {
+        mutation_id: MutationId,
         repository_id: Uuid,
+        repository_root: std::path::PathBuf,
         commit: CommitOutcome,
     },
     CommitRetryFailed {
+        mutation_id: MutationId,
         repository_id: Uuid,
+        repository_root: std::path::PathBuf,
         error: GitError,
     },
     WorkspaceOpened {
@@ -230,15 +242,12 @@ impl App {
             }
             AppEvent::Action(AppAction::Tree(action)) => self.tree_action(action),
             AppEvent::MutationFailed {
+                mutation_id,
                 repository_id,
+                repository_root,
                 error,
             } => {
-                if self
-                    .pending_mutation
-                    .as_ref()
-                    .map(|pending| pending.repository_id)
-                    != Some(repository_id)
-                {
+                if !self.mutation_result_is_current(mutation_id, repository_id, &repository_root) {
                     return Vec::new();
                 }
                 self.pending_mutation = None;
@@ -267,17 +276,17 @@ impl App {
                 Vec::new()
             }
             AppEvent::CommitRetryFailed {
+                mutation_id,
                 repository_id,
+                repository_root,
                 error,
             } => {
-                if !matches!(
-                    self.pending_mutation.as_ref(),
-                    Some(PendingMutation {
-                        repository_id: pending_repository,
-                        kind: PendingMutationKind::RetryCommit,
-                        ..
-                    }) if *pending_repository == repository_id
-                ) {
+                if !self.mutation_result_is_current(mutation_id, repository_id, &repository_root)
+                    || !matches!(
+                        self.pending_mutation.as_ref().map(|pending| pending.kind),
+                        Some(PendingMutationKind::RetryCommit)
+                    )
+                {
                     return Vec::new();
                 }
                 let pending = self.pending_mutation.take().expect("checked above");
@@ -299,17 +308,17 @@ impl App {
                 Vec::new()
             }
             AppEvent::CommitRetryApplied {
+                mutation_id,
                 repository_id,
+                repository_root,
                 commit,
             } => {
-                if !matches!(
-                    self.pending_mutation.as_ref(),
-                    Some(PendingMutation {
-                        repository_id: pending_repository,
-                        kind: PendingMutationKind::RetryCommit,
-                        ..
-                    }) if *pending_repository == repository_id
-                ) {
+                if !self.mutation_result_is_current(mutation_id, repository_id, &repository_root)
+                    || !matches!(
+                        self.pending_mutation.as_ref().map(|pending| pending.kind),
+                        Some(PendingMutationKind::RetryCommit)
+                    )
+                {
                     return Vec::new();
                 }
                 self.pending_mutation = None;
@@ -337,17 +346,14 @@ impl App {
                     .unwrap_or_default()
             }
             AppEvent::MutationSavedCommitFailed {
+                mutation_id,
                 repository_id,
+                repository_root,
                 file,
                 error,
                 tree,
             } => {
-                if self
-                    .pending_mutation
-                    .as_ref()
-                    .map(|pending| pending.repository_id)
-                    != Some(repository_id)
-                {
+                if !self.mutation_result_is_current(mutation_id, repository_id, &repository_root) {
                     return Vec::new();
                 }
                 let pending = self.pending_mutation.take().expect("checked above");
@@ -426,15 +432,12 @@ impl App {
                 Vec::new()
             }
             AppEvent::MutationConflict {
+                mutation_id,
                 repository_id,
+                repository_root,
                 conflict,
             } => {
-                if self
-                    .pending_mutation
-                    .as_ref()
-                    .map(|pending| pending.repository_id)
-                    != Some(repository_id)
-                {
+                if !self.mutation_result_is_current(mutation_id, repository_id, &repository_root) {
                     return Vec::new();
                 }
                 self.pending_mutation = None;
@@ -447,15 +450,14 @@ impl App {
                 AppEvent::Action(AppAction::Navigate(NavigationAction::Quit)),
             ),
             AppEvent::MutationApplied {
+                mutation_id,
                 repository_id,
+                repository_root,
                 file,
                 commit,
                 tree,
             } => {
-                let Some(pending) = self.pending_mutation.as_ref() else {
-                    return Vec::new();
-                };
-                if pending.repository_id != repository_id {
+                if !self.mutation_result_is_current(mutation_id, repository_id, &repository_root) {
                     return Vec::new();
                 }
                 let pending = self.pending_mutation.take().expect("checked above");
@@ -573,7 +575,9 @@ impl App {
                 Vec::new()
             }
             AppEvent::Action(AppAction::Navigate(target)) => {
-                if self.pending_mutation.is_some() {
+                if self.pending_mutation.is_some()
+                    || matches!(self.pending_intent, Some(PendingIntent::Mutation(_)))
+                {
                     return Vec::new();
                 }
                 if self
@@ -799,6 +803,27 @@ impl App {
                 .is_some_and(|pending| pending.reconciles_editor)
     }
 
+    fn mutation_result_is_current(
+        &self,
+        mutation_id: MutationId,
+        repository_id: Uuid,
+        repository_root: &std::path::Path,
+    ) -> bool {
+        let pending_matches = self.pending_mutation.as_ref().is_some_and(|pending| {
+            pending.mutation_id == mutation_id
+                && pending.repository_id == repository_id
+                && pending.repository_root == repository_root
+        });
+        let workspace_matches = match &self.screen {
+            Screen::Workspace(workspace) => {
+                workspace.repository.id == repository_id
+                    && workspace.workspace.root() == repository_root
+            }
+            Screen::Home => false,
+        };
+        pending_matches && workspace_matches
+    }
+
     fn record_request_failure(
         &mut self,
         request_id: RequestId,
@@ -865,7 +890,7 @@ impl App {
     }
 
     fn save(&mut self, overwrite: bool) -> Vec<AppEffect> {
-        if self.pending_mutation.is_some() {
+        if self.pending_mutation.is_some() || self.pending_request.is_some() {
             return Vec::new();
         }
         let Screen::Workspace(workspace) = &self.screen else {
@@ -890,6 +915,7 @@ impl App {
             CommitIntent::Create(path)
         };
         let repository_id = workspace.repository.id;
+        let repository_root = workspace.workspace.root().to_path_buf();
         let effect_workspace = workspace.workspace.clone();
         let effect_git = workspace.git.clone();
         let snapshot = editor.text();
@@ -898,8 +924,11 @@ impl App {
             .next_save_generation
             .checked_add(1)
             .expect("save generation overflow");
+        let mutation_id = self.next_mutation_id();
         self.pending_mutation = Some(PendingMutation {
+            mutation_id,
             repository_id,
+            repository_root: repository_root.clone(),
             kind: PendingMutationKind::Save { overwrite },
             intent: intent.clone(),
             save: Some(PendingSave {
@@ -910,7 +939,9 @@ impl App {
         });
         self.status.commit = CommitStatus::Pending;
         vec![AppEffect::ApplyAndCommit {
+            mutation_id,
             repository_id,
+            repository_root,
             workspace: effect_workspace,
             git: effect_git,
             operation: Box::new(operation),
@@ -919,7 +950,7 @@ impl App {
     }
 
     fn global_save(&mut self) -> Vec<AppEffect> {
-        if self.pending_mutation.is_some() {
+        if self.pending_mutation.is_some() || self.pending_request.is_some() {
             return Vec::new();
         }
         if let Some(failure) = self.saved_commit_failure.clone() {
@@ -929,8 +960,13 @@ impl App {
             if workspace.repository.id != failure.repository_id {
                 return Vec::new();
             }
+            let repository_root = workspace.workspace.root().to_path_buf();
+            let effect_git = workspace.git.clone();
+            let mutation_id = self.next_mutation_id();
             self.pending_mutation = Some(PendingMutation {
+                mutation_id,
                 repository_id: failure.repository_id,
+                repository_root: repository_root.clone(),
                 kind: PendingMutationKind::RetryCommit,
                 intent: failure.intent.clone(),
                 save: None,
@@ -938,8 +974,10 @@ impl App {
             });
             self.status.commit = CommitStatus::Pending;
             return vec![AppEffect::RetryCommit {
+                mutation_id,
                 repository_id: failure.repository_id,
-                git: workspace.git.clone(),
+                repository_root,
+                git: effect_git,
                 intent: failure.intent,
             }];
         }
@@ -949,7 +987,14 @@ impl App {
     fn perform_intent(&mut self, intent: PendingIntent) -> Vec<AppEffect> {
         match intent {
             PendingIntent::Navigation(target) => self.perform_navigation(target),
-            PendingIntent::Mutation(action) => self.start_file_mutation(action),
+            PendingIntent::Mutation(action) => {
+                if self.pending_request.is_some() {
+                    self.pending_intent = Some(PendingIntent::Mutation(action));
+                    Vec::new()
+                } else {
+                    self.start_file_mutation(action)
+                }
+            }
         }
     }
 
@@ -993,12 +1038,23 @@ impl App {
         request_id
     }
 
+    fn next_mutation_id(&mut self) -> MutationId {
+        let mutation_id = MutationId(self.next_mutation_id);
+        self.next_mutation_id = self
+            .next_mutation_id
+            .checked_add(1)
+            .expect("application mutation ID overflow");
+        mutation_id
+    }
+
     fn request_open_workspace(
         &mut self,
         repository: crate::catalog::RepoEntry,
         note: Option<std::path::PathBuf>,
     ) -> Vec<AppEffect> {
-        if self.pending_mutation.is_some() {
+        if self.pending_mutation.is_some()
+            || matches!(self.pending_intent, Some(PendingIntent::Mutation(_)))
+        {
             return Vec::new();
         }
         let request_id = self.next_request_id();
@@ -1150,7 +1206,7 @@ impl App {
     }
 
     fn submit_file_action(&mut self, path: std::path::PathBuf) -> Vec<AppEffect> {
-        if self.pending_mutation.is_some() {
+        if self.pending_mutation.is_some() || self.pending_request.is_some() {
             return Vec::new();
         }
         let Some(Dialog::FileAction { kind, target }) = self.dialog.take() else {
@@ -1176,7 +1232,7 @@ impl App {
     }
 
     fn confirm_delete(&mut self) -> Vec<AppEffect> {
-        if self.pending_mutation.is_some() {
+        if self.pending_mutation.is_some() || self.pending_request.is_some() {
             return Vec::new();
         }
         let Some(Dialog::ConfirmDelete { path }) = self.dialog.take() else {
@@ -1186,7 +1242,7 @@ impl App {
     }
 
     fn request_file_mutation(&mut self, action: FileMutationAction) -> Vec<AppEffect> {
-        if self.pending_mutation.is_some() {
+        if self.pending_mutation.is_some() || self.pending_request.is_some() {
             return Vec::new();
         }
         let should_guard = match &self.screen {
@@ -1208,14 +1264,16 @@ impl App {
     }
 
     fn start_file_mutation(&mut self, action: FileMutationAction) -> Vec<AppEffect> {
-        if self.pending_mutation.is_some() {
+        if self.pending_mutation.is_some() || self.pending_request.is_some() {
             return Vec::new();
         }
         let Screen::Workspace(workspace) = &self.screen else {
             return Vec::new();
         };
         let reconciles_editor = mutation_reconciles_editor(workspace, &action);
+        let repository_root = workspace.workspace.root().to_path_buf();
         let effect_workspace = workspace.workspace.clone();
+        let effect_git = workspace.git.clone();
         let (kind, operation, intent) = match action {
             FileMutationAction::CreateFile { path } => (
                 PendingMutationKind::File(FileActionKind::NewFile),
@@ -1262,8 +1320,11 @@ impl App {
             ),
         };
         let repository_id = workspace.repository.id;
+        let mutation_id = self.next_mutation_id();
         self.pending_mutation = Some(PendingMutation {
+            mutation_id,
             repository_id,
+            repository_root: repository_root.clone(),
             kind,
             intent: intent.clone(),
             save: None,
@@ -1271,9 +1332,11 @@ impl App {
         });
         self.status.commit = CommitStatus::Pending;
         vec![AppEffect::ApplyAndCommit {
+            mutation_id,
             repository_id,
+            repository_root,
             workspace: effect_workspace,
-            git: workspace.git.clone(),
+            git: effect_git,
             operation: Box::new(operation),
             intent,
         }]
