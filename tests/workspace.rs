@@ -47,6 +47,20 @@ fn rejects_absolute_traversal_and_git_note_paths() {
 }
 
 #[test]
+fn rejects_git_metadata_components_case_insensitively() {
+    let sandbox = tempdir().unwrap();
+    let root = fs::canonicalize(sandbox.path()).unwrap();
+    let workspace = open_workspace(root);
+
+    for path in [".GIT/config", "notes/.Git/index", "nested/.gIt/HEAD"] {
+        assert!(matches!(
+            workspace.resolve_note(Path::new(path)),
+            Err(PathError::GitMetadata { .. })
+        ));
+    }
+}
+
+#[test]
 fn save_reports_external_modification_and_deletion_conflicts_unless_overwritten() {
     let sandbox = tempdir().unwrap();
     let root = fs::canonicalize(sandbox.path()).unwrap();
@@ -364,6 +378,18 @@ fn tree_keeps_tracked_files_inside_an_ignored_directory() {
     assert!(!flattened.contains_key(Path::new("ignored/hidden.md")));
 }
 
+#[test]
+fn tree_returns_an_error_when_git_ignore_check_is_fatal() {
+    let sandbox = tempdir().unwrap();
+    let root = fs::canonicalize(sandbox.path()).unwrap();
+    fs::write(root.join(".git"), "not a valid gitfile\n").unwrap();
+    fs::write(root.join("note.md"), "visible only if Git succeeds").unwrap();
+
+    let error = open_workspace(root).tree().unwrap_err();
+
+    assert!(matches!(error, FileError::GitIgnore { .. }));
+}
+
 fn flatten_tree(
     entries: &[TreeEntry],
 ) -> std::collections::BTreeMap<PathBuf, (TreeEntryKind, bool)> {
@@ -547,12 +573,79 @@ fn mutations_reject_a_repository_root_replaced_by_a_symlink() {
     std::os::unix::fs::symlink(outside.path(), &repo).unwrap();
 
     assert!(workspace.tree().is_err());
-    let error = Workspace::apply(FileOperation::CreateFile {
+    Workspace::apply(FileOperation::CreateFile {
         workspace,
         path: PathBuf::from("escaped.md"),
     })
     .unwrap_err();
 
-    assert!(matches!(error, FileError::Path(PathError::Symlink { .. })));
     assert!(!outside.path().join("escaped.md").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn mutations_remain_bound_to_the_opened_root_directory_identity() {
+    let sandbox = tempdir().unwrap();
+    let repo = sandbox.path().join("repo");
+    let moved_repo = sandbox.path().join("moved-repo");
+    fs::create_dir(&repo).unwrap();
+    let workspace = open_workspace(fs::canonicalize(&repo).unwrap());
+    fs::write(repo.join("save.md"), "loaded").unwrap();
+    fs::write(repo.join("rename.md"), "rename").unwrap();
+    fs::write(repo.join("move.md"), "move").unwrap();
+    fs::write(repo.join("delete.md"), "delete").unwrap();
+    fs::create_dir(repo.join("archive")).unwrap();
+    let loaded = workspace
+        .load_note(&workspace.resolve_note(Path::new("save.md")).unwrap())
+        .unwrap();
+    let outside = tempdir().unwrap();
+    fs::rename(&repo, &moved_repo).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &repo).unwrap();
+
+    Workspace::apply(FileOperation::CreateFile {
+        workspace: workspace.clone(),
+        path: PathBuf::from("confined.md"),
+    })
+    .unwrap();
+    Workspace::apply(FileOperation::CreateFolder {
+        workspace: workspace.clone(),
+        path: PathBuf::from("created-folder"),
+    })
+    .unwrap();
+    Workspace::apply(FileOperation::Save {
+        note: loaded,
+        content: "saved".into(),
+        overwrite: false,
+    })
+    .unwrap();
+    Workspace::apply(FileOperation::Rename {
+        workspace: workspace.clone(),
+        from: PathBuf::from("rename.md"),
+        to: PathBuf::from("renamed.md"),
+    })
+    .unwrap();
+    Workspace::apply(FileOperation::Move {
+        workspace: workspace.clone(),
+        from: PathBuf::from("move.md"),
+        to: PathBuf::from("archive/moved.md"),
+    })
+    .unwrap();
+    Workspace::apply(FileOperation::Delete {
+        workspace,
+        path: PathBuf::from("delete.md"),
+        confirmed: true,
+    })
+    .unwrap();
+
+    assert!(moved_repo.join("confined.md").is_file());
+    assert!(moved_repo.join("created-folder").is_dir());
+    assert_eq!(
+        fs::read_to_string(moved_repo.join("save.md")).unwrap(),
+        "saved"
+    );
+    assert!(moved_repo.join("renamed.md").is_file());
+    assert!(moved_repo.join("archive/moved.md").is_file());
+    assert!(!moved_repo.join("delete.md").exists());
+    assert!(!outside.path().join("confined.md").exists());
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
 }

@@ -113,7 +113,7 @@ fn is_ignored(root: &Path, relative: &Path) -> Result<bool, FileError> {
         })?;
     match output.status.code() {
         Some(0) => Ok(true),
-        Some(1) | Some(128) => Ok(false),
+        Some(1) => Ok(false),
         _ => Err(FileError::GitIgnore {
             message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         }),

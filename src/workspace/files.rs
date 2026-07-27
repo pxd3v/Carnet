@@ -1,9 +1,12 @@
 use std::{
-    fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
+#[cfg(unix)]
+use cap_std::fs::MetadataExt;
+use cap_std::fs::{Dir, File, OpenOptions, Permissions};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -25,8 +28,20 @@ pub struct LoadedNote {
     has_bom: bool,
     newline_style: NewlineStyle,
     had_final_newline: bool,
-    permissions: Option<fs::Permissions>,
+    permissions: Option<Permissions>,
+    identity: Option<FileIdentity>,
 }
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(not(unix))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity;
 
 #[derive(Clone, Debug)]
 pub enum FileOperation {
@@ -133,11 +148,10 @@ pub(crate) fn bytes_are_text(bytes: &[u8]) -> bool {
         && std::str::from_utf8(bytes.strip_prefix(UTF8_BOM).unwrap_or(bytes)).is_ok()
 }
 
-pub(crate) fn load_note(root: &std::path::Path, path: &NotePath) -> Result<LoadedNote, FileError> {
-    paths::revalidate_note(root, path)?;
-    let absolute = path.absolute();
-    let bytes = match fs::read(&absolute) {
-        Ok(bytes) => bytes,
+pub(crate) fn load_note(path: &NotePath) -> Result<LoadedNote, FileError> {
+    paths::revalidate_note(path)?;
+    let snapshot = match read_snapshot(path.directory(), path.relative()) {
+        Ok(snapshot) => snapshot,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
             return Ok(LoadedNote {
                 path: path.clone(),
@@ -147,17 +161,21 @@ pub(crate) fn load_note(root: &std::path::Path, path: &NotePath) -> Result<Loade
                 newline_style: NewlineStyle::Lf,
                 had_final_newline: false,
                 permissions: None,
+                identity: None,
             });
         }
         Err(source) => {
             return Err(FileError::Io {
-                path: absolute,
+                path: path.relative().to_path_buf(),
                 source,
             });
         }
     };
+    let bytes = snapshot.bytes;
     if bytes.contains(&0) {
-        return Err(FileError::Binary { path: absolute });
+        return Err(FileError::Binary {
+            path: path.relative().to_path_buf(),
+        });
     }
     let hash = Sha256::digest(&bytes).into();
     let has_bom = bytes.starts_with(UTF8_BOM);
@@ -167,7 +185,7 @@ pub(crate) fn load_note(root: &std::path::Path, path: &NotePath) -> Result<Loade
         &bytes
     };
     let decoded = std::str::from_utf8(payload).map_err(|_| FileError::InvalidUtf8 {
-        path: absolute.clone(),
+        path: path.relative().to_path_buf(),
     })?;
     let newline_style = if decoded.contains("\r\n") {
         NewlineStyle::CrLf
@@ -179,13 +197,6 @@ pub(crate) fn load_note(root: &std::path::Path, path: &NotePath) -> Result<Loade
         NewlineStyle::Lf => decoded.to_owned(),
         NewlineStyle::CrLf => decoded.replace("\r\n", "\n"),
     };
-    let permissions = fs::metadata(&absolute)
-        .map_err(|source| FileError::Io {
-            path: absolute,
-            source,
-        })?
-        .permissions();
-
     Ok(LoadedNote {
         path: path.clone(),
         text,
@@ -193,7 +204,8 @@ pub(crate) fn load_note(root: &std::path::Path, path: &NotePath) -> Result<Loade
         has_bom,
         newline_style,
         had_final_newline,
-        permissions: Some(permissions),
+        permissions: Some(snapshot.permissions),
+        identity: Some(snapshot.identity),
     })
 }
 
@@ -225,61 +237,49 @@ pub(crate) fn apply(operation: FileOperation) -> Result<FileOutcome, FileError> 
 }
 
 fn create_file(workspace: &Workspace, path: &Path) -> Result<FileOutcome, FileError> {
-    let resolved = paths::resolve_target(workspace.root(), path, false)?;
+    let directory = workspace.directory();
+    let resolved = paths::resolve_target(directory, path, false)?;
     if resolved.metadata.is_some() {
         return Err(FileError::AlreadyExists {
             path: resolved.relative,
         });
     }
-    let parent = resolved
-        .absolute
-        .parent()
-        .expect("validated target is below repository root");
-    fs::create_dir_all(parent).map_err(|source| FileError::Io {
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    let resolved = paths::resolve_target(workspace.root(), path, false)?;
-    let mut temporary =
-        tempfile::NamedTempFile::new_in(parent).map_err(|source| FileError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    temporary.flush().map_err(|source| FileError::Io {
-        path: temporary.path().to_path_buf(),
-        source,
-    })?;
-    temporary
-        .as_file()
-        .sync_all()
+    create_parent_directories(directory, &resolved.relative)?;
+    paths::resolve_target(directory, path, false)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    let file = directory
+        .open_with(&resolved.relative, &options)
         .map_err(|source| FileError::Io {
-            path: temporary.path().to_path_buf(),
+            path: resolved.relative.clone(),
             source,
         })?;
-    temporary
-        .persist_noclobber(&resolved.absolute)
-        .map_err(|error| FileError::Io {
-            path: resolved.absolute,
-            source: error.error,
-        })?;
+    file.sync_all().map_err(|source| FileError::Io {
+        path: resolved.relative.clone(),
+        source,
+    })?;
     Ok(FileOutcome::CreatedFile(paths::resolve_note(
         workspace.root(),
+        Arc::clone(directory),
         path,
     )?))
 }
 
 fn create_folder(workspace: &Workspace, path: &Path) -> Result<FileOutcome, FileError> {
-    let resolved = paths::resolve_target(workspace.root(), path, true)?;
+    let directory = workspace.directory();
+    let resolved = paths::resolve_target(directory, path, true)?;
     if resolved.metadata.is_some() {
         return Err(FileError::AlreadyExists {
             path: resolved.relative,
         });
     }
-    fs::create_dir_all(&resolved.absolute).map_err(|source| FileError::Io {
-        path: resolved.absolute.clone(),
-        source,
-    })?;
-    paths::resolve_target(workspace.root(), path, true)?;
+    directory
+        .create_dir_all(&resolved.relative)
+        .map_err(|source| FileError::Io {
+            path: resolved.relative.clone(),
+            source,
+        })?;
+    paths::resolve_target(directory, path, true)?;
     Ok(FileOutcome::CreatedFolder(resolved.relative))
 }
 
@@ -289,32 +289,28 @@ fn relocate(
     to: &Path,
     is_move: bool,
 ) -> Result<FileOutcome, FileError> {
-    let source = paths::resolve_target(workspace.root(), from, true)?;
+    let directory = workspace.directory();
+    let source = paths::resolve_target(directory, from, true)?;
     if source.metadata.is_none() {
         return Err(FileError::Missing {
             path: source.relative,
         });
     }
-    let destination = paths::resolve_target(workspace.root(), to, true)?;
+    let destination = paths::resolve_target(directory, to, true)?;
     if destination.metadata.is_some() {
         return Err(FileError::AlreadyExists {
             path: destination.relative,
         });
     }
-    let parent = destination
-        .absolute
-        .parent()
-        .expect("validated target is below repository root");
-    fs::create_dir_all(parent).map_err(|source| FileError::Io {
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    let source = paths::resolve_target(workspace.root(), from, true)?;
-    let destination = paths::resolve_target(workspace.root(), to, true)?;
-    fs::rename(&source.absolute, &destination.absolute).map_err(|source| FileError::Io {
-        path: destination.absolute,
-        source,
-    })?;
+    create_parent_directories(directory, &destination.relative)?;
+    let source = paths::resolve_target(directory, from, true)?;
+    let destination = paths::resolve_target(directory, to, true)?;
+    directory
+        .rename(&source.relative, directory, &destination.relative)
+        .map_err(|source| FileError::Io {
+            path: destination.relative.clone(),
+            source,
+        })?;
     if is_move {
         Ok(FileOutcome::Moved {
             from: source.relative,
@@ -334,92 +330,222 @@ fn delete(workspace: &Workspace, path: &Path, confirmed: bool) -> Result<FileOut
             path: path.to_path_buf(),
         });
     }
-    let resolved = paths::resolve_target(workspace.root(), path, true)?;
+    let directory = workspace.directory();
+    let resolved = paths::resolve_target(directory, path, true)?;
     let metadata = resolved.metadata.ok_or_else(|| FileError::Missing {
         path: resolved.relative.clone(),
     })?;
-    if metadata.is_dir() {
-        fs::remove_dir_all(&resolved.absolute)
+    let result = if metadata.is_dir() {
+        directory.remove_dir_all(&resolved.relative)
     } else {
-        fs::remove_file(&resolved.absolute)
-    }
-    .map_err(|source| FileError::Io {
-        path: resolved.absolute,
+        directory.remove_file(&resolved.relative)
+    };
+    result.map_err(|source| FileError::Io {
+        path: resolved.relative.clone(),
         source,
     })?;
     Ok(FileOutcome::Deleted(resolved.relative))
 }
 
 fn save_note(note: LoadedNote, content: String, overwrite: bool) -> Result<FileOutcome, FileError> {
-    paths::revalidate_note(note.path.root(), &note.path)?;
-    let target = note.path.absolute();
+    save_note_before_commit(note, content, overwrite, || {})
+}
+
+fn save_note_before_commit(
+    note: LoadedNote,
+    content: String,
+    overwrite: bool,
+    before_commit: impl FnOnce(),
+) -> Result<FileOutcome, FileError> {
+    paths::revalidate_note(&note.path)?;
     if !overwrite {
-        verify_unchanged(&note, &target)?;
+        verify_unchanged(&note)?;
     }
-    let parent = target.parent().expect("note path has a repository root");
-    fs::create_dir_all(parent).map_err(|source| FileError::Io {
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    paths::revalidate_note(note.path.root(), &note.path)?;
+    create_parent_directories(note.path.directory(), note.path.relative())?;
+    paths::revalidate_note(&note.path)?;
 
     let bytes = encode(&note, &content);
-    let mut temporary =
-        tempfile::NamedTempFile::new_in(parent).map_err(|source| FileError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
+    let mut temporary = CapabilityTempFile::new(
+        Arc::clone(note.path.directory()),
+        note.path.relative().parent(),
+    )?;
     temporary
+        .file_mut()
         .write_all(&bytes)
         .map_err(|source| FileError::Io {
-            path: temporary.path().to_path_buf(),
+            path: temporary.relative().to_path_buf(),
             source,
         })?;
     if let Some(permissions) = note.permissions.clone() {
         temporary
-            .as_file()
+            .file()
             .set_permissions(permissions)
             .map_err(|source| FileError::Io {
-                path: temporary.path().to_path_buf(),
+                path: temporary.relative().to_path_buf(),
                 source,
             })?;
     }
-    temporary.flush().map_err(|source| FileError::Io {
-        path: temporary.path().to_path_buf(),
-        source,
-    })?;
     temporary
-        .as_file()
-        .sync_all()
+        .file_mut()
+        .flush()
         .map_err(|source| FileError::Io {
-            path: temporary.path().to_path_buf(),
+            path: temporary.relative().to_path_buf(),
             source,
         })?;
-    temporary.persist(&target).map_err(|error| FileError::Io {
-        path: target.clone(),
-        source: error.error,
-    })?;
-    Ok(FileOutcome::Saved(load_note(note.path.root(), &note.path)?))
+    temporary
+        .file()
+        .sync_all()
+        .map_err(|source| FileError::Io {
+            path: temporary.relative().to_path_buf(),
+            source,
+        })?;
+    before_commit();
+    if !overwrite {
+        verify_unchanged(&note)?;
+    }
+    temporary.persist(note.path.relative())?;
+    Ok(FileOutcome::Saved(load_note(&note.path)?))
 }
 
-fn verify_unchanged(note: &LoadedNote, target: &Path) -> Result<(), FileError> {
-    match (&note.hash, fs::read(target)) {
+fn verify_unchanged(note: &LoadedNote) -> Result<(), FileError> {
+    match (
+        &note.hash,
+        read_snapshot(note.path.directory(), note.path.relative()),
+    ) {
         (Some(_), Err(source)) if source.kind() == std::io::ErrorKind::NotFound => {
             Err(FileError::ExternalDeletion {
                 path: note.path.relative().to_path_buf(),
             })
         }
         (None, Err(source)) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        (Some(expected), Ok(bytes)) if <[u8; 32]>::from(Sha256::digest(&bytes)) == *expected => {
+        (Some(expected), Ok(snapshot))
+            if <[u8; 32]>::from(Sha256::digest(&snapshot.bytes)) == *expected
+                && note.identity == Some(snapshot.identity) =>
+        {
             Ok(())
         }
         (Some(_), Ok(_)) | (None, Ok(_)) => Err(FileError::ExternalModification {
             path: note.path.relative().to_path_buf(),
         }),
         (_, Err(source)) => Err(FileError::Io {
-            path: target.to_path_buf(),
+            path: note.path.relative().to_path_buf(),
             source,
         }),
+    }
+}
+
+struct FileSnapshot {
+    bytes: Vec<u8>,
+    permissions: Permissions,
+    identity: FileIdentity,
+}
+
+fn read_snapshot(directory: &Dir, relative: &Path) -> std::io::Result<FileSnapshot> {
+    let mut file = directory.open(relative)?;
+    let metadata = file.metadata()?;
+    let identity = file_identity(&metadata);
+    let permissions = metadata.permissions();
+    let mut bytes = Vec::with_capacity(metadata.len().try_into().unwrap_or(0));
+    file.read_to_end(&mut bytes)?;
+    Ok(FileSnapshot {
+        bytes,
+        permissions,
+        identity,
+    })
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &cap_std::fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &cap_std::fs::Metadata) -> FileIdentity {
+    FileIdentity
+}
+
+fn create_parent_directories(directory: &Dir, relative: &Path) -> Result<(), FileError> {
+    let Some(parent) = relative
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+    directory
+        .create_dir_all(parent)
+        .map_err(|source| FileError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })
+}
+
+struct CapabilityTempFile {
+    directory: Arc<Dir>,
+    relative: PathBuf,
+    file: File,
+    persisted: bool,
+}
+
+impl CapabilityTempFile {
+    fn new(directory: Arc<Dir>, parent: Option<&Path>) -> Result<Self, FileError> {
+        let parent = parent.filter(|parent| !parent.as_os_str().is_empty());
+        loop {
+            let name = format!(".carnet-{}.tmp", uuid::Uuid::new_v4());
+            let relative = parent.map_or_else(|| PathBuf::from(&name), |parent| parent.join(&name));
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            match directory.open_with(&relative, &options) {
+                Ok(file) => {
+                    return Ok(Self {
+                        directory,
+                        relative,
+                        file,
+                        persisted: false,
+                    });
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(source) => {
+                    return Err(FileError::Io {
+                        path: relative,
+                        source,
+                    });
+                }
+            }
+        }
+    }
+
+    fn relative(&self) -> &Path {
+        &self.relative
+    }
+
+    fn file(&self) -> &File {
+        &self.file
+    }
+
+    fn file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
+
+    fn persist(mut self, target: &Path) -> Result<(), FileError> {
+        self.directory
+            .rename(&self.relative, &self.directory, target)
+            .map_err(|source| FileError::Io {
+                path: target.to_path_buf(),
+                source,
+            })?;
+        self.persisted = true;
+        Ok(())
+    }
+}
+
+impl Drop for CapabilityTempFile {
+    fn drop(&mut self) {
+        if !self.persisted {
+            let _ = self.directory.remove_file(&self.relative);
+        }
     }
 }
 
@@ -446,4 +572,120 @@ fn encode(note: &LoadedNote, content: &str) -> Vec<u8> {
     }
     bytes.extend_from_slice(encoded.as_bytes());
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::Path};
+
+    use tempfile::tempdir;
+    use uuid::Uuid;
+
+    use crate::{
+        catalog::RepoEntry,
+        workspace::{FileError, Workspace},
+    };
+
+    use super::save_note_before_commit;
+
+    #[test]
+    fn save_rechecks_for_external_edits_after_syncing_the_temporary_file() {
+        let sandbox = tempdir().unwrap();
+        let root = fs::canonicalize(sandbox.path()).unwrap();
+        let target = root.join("note.md");
+        fs::write(&target, "loaded").unwrap();
+        let workspace = Workspace::open(RepoEntry {
+            id: Uuid::new_v4(),
+            name: "notes".into(),
+            path: root,
+        })
+        .unwrap();
+        let note = workspace
+            .load_note(&workspace.resolve_note(Path::new("note.md")).unwrap())
+            .unwrap();
+
+        let error = save_note_before_commit(note, "editor".into(), false, || {
+            fs::write(&target, "external").unwrap();
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, FileError::ExternalModification { .. }));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "external");
+        assert_eq!(fs::read_dir(target.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn save_rechecks_file_identity_after_syncing_the_temporary_file() {
+        let sandbox = tempdir().unwrap();
+        let root = fs::canonicalize(sandbox.path()).unwrap();
+        let target = root.join("note.md");
+        fs::write(&target, "same bytes").unwrap();
+        let workspace = Workspace::open(RepoEntry {
+            id: Uuid::new_v4(),
+            name: "notes".into(),
+            path: root,
+        })
+        .unwrap();
+        let note = workspace
+            .load_note(&workspace.resolve_note(Path::new("note.md")).unwrap())
+            .unwrap();
+
+        let error = save_note_before_commit(note, "editor".into(), false, || {
+            fs::remove_file(&target).unwrap();
+            fs::write(&target, "same bytes").unwrap();
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, FileError::ExternalModification { .. }));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "same bytes");
+    }
+
+    #[test]
+    fn save_rechecks_for_external_deletion_after_syncing_the_temporary_file() {
+        let sandbox = tempdir().unwrap();
+        let root = fs::canonicalize(sandbox.path()).unwrap();
+        let target = root.join("note.md");
+        fs::write(&target, "loaded").unwrap();
+        let workspace = Workspace::open(RepoEntry {
+            id: Uuid::new_v4(),
+            name: "notes".into(),
+            path: root,
+        })
+        .unwrap();
+        let note = workspace
+            .load_note(&workspace.resolve_note(Path::new("note.md")).unwrap())
+            .unwrap();
+
+        let error = save_note_before_commit(note, "editor".into(), false, || {
+            fs::remove_file(&target).unwrap();
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, FileError::ExternalDeletion { .. }));
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn first_save_rechecks_for_external_creation_after_syncing_the_temporary_file() {
+        let sandbox = tempdir().unwrap();
+        let root = fs::canonicalize(sandbox.path()).unwrap();
+        let target = root.join("note.md");
+        let workspace = Workspace::open(RepoEntry {
+            id: Uuid::new_v4(),
+            name: "notes".into(),
+            path: root,
+        })
+        .unwrap();
+        let note = workspace
+            .load_note(&workspace.resolve_note(Path::new("note.md")).unwrap())
+            .unwrap();
+
+        let error = save_note_before_commit(note, "editor".into(), false, || {
+            fs::write(&target, "external").unwrap();
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, FileError::ExternalModification { .. }));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "external");
+    }
 }

@@ -2,8 +2,12 @@ mod files;
 mod paths;
 mod tree;
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
+use cap_std::{ambient_authority, fs::Dir};
 use thiserror::Error;
 
 use crate::catalog::RepoEntry;
@@ -28,6 +32,7 @@ pub enum WorkspaceError {
 pub struct Workspace {
     repo: RepoEntry,
     root: PathBuf,
+    directory: Arc<Dir>,
 }
 
 impl Workspace {
@@ -41,18 +46,26 @@ impl Workspace {
                 path: repo.path.clone(),
             });
         }
+        let directory =
+            Dir::open_ambient_dir(&canonical, ambient_authority()).map_err(|source| {
+                WorkspaceError::Io {
+                    path: canonical.clone(),
+                    source,
+                }
+            })?;
         Ok(Workspace {
             repo,
             root: canonical,
+            directory: Arc::new(directory),
         })
     }
 
     pub fn resolve_note(&self, path: &Path) -> Result<NotePath, PathError> {
-        paths::resolve_note(&self.root, path)
+        paths::resolve_note(&self.root, Arc::clone(&self.directory), path)
     }
 
     pub fn load_note(&self, path: &NotePath) -> Result<LoadedNote, FileError> {
-        files::load_note(&self.root, path)
+        files::load_note(path)
     }
 
     pub fn tree(&self) -> Result<Vec<TreeEntry>, FileError> {
@@ -69,5 +82,9 @@ impl Workspace {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn directory(&self) -> &Arc<Dir> {
+        &self.directory
     }
 }

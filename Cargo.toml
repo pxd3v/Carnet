@@ -5,6 +5,7 @@ edition = "2024"
 description = "A terminal note editor with Git-backed repositories"
 
 [dependencies]
+cap-std = "4.0.2"
 clap = { version = "4.5", features = ["derive"] }
 directories = "6.0"
 serde = { version = "1.0", features = ["derive"] }
