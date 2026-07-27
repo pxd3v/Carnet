@@ -126,6 +126,13 @@ pub struct HomeState {
     pub default_choice: DefaultChoiceState,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogSnapshot {
+    pub repositories: Vec<RepoEntry>,
+    pub default_repository: Option<Uuid>,
+    pub selected_repository: Option<Uuid>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RepositoryAvailability {
     Available,

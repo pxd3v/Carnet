@@ -8,12 +8,12 @@ use crate::{
 };
 
 use super::{
-    App, AppEffect, AppExitStatus, CommitStatus, DefaultChoiceState, Dialog, ExternalConflict,
-    FailureKind, FileActionKind, FileMutationAction, Focus, MutationId, NavigationAction,
-    OverlayState, PendingFileMutation, PendingIntent, PendingMutation, PendingMutationKind,
-    PendingRequest, PendingSave, RepositoryActionKind, RepositoryAvailability, RepositoryFormField,
-    RepositoryFormState, RequestId, RuntimeFailure, SavedCommitFailure, Screen, UnresolvedFailure,
-    WorkspaceOrigin, WorkspaceState,
+    App, AppEffect, AppExitStatus, CatalogSnapshot, CommitStatus, DefaultChoiceState, Dialog,
+    ExternalConflict, FailureKind, FileActionKind, FileMutationAction, Focus, MutationId,
+    NavigationAction, OverlayState, PendingFileMutation, PendingIntent, PendingMutation,
+    PendingMutationKind, PendingRequest, PendingSave, RepositoryActionKind, RepositoryAvailability,
+    RepositoryFormField, RepositoryFormState, RequestId, RuntimeFailure, SavedCommitFailure,
+    Screen, UnresolvedFailure, WorkspaceOrigin, WorkspaceState,
 };
 use super::{RuntimeError, RuntimeOperation};
 
@@ -101,6 +101,10 @@ pub enum AppEvent {
     Action(AppAction),
     ClipboardRead(Result<String, ClipboardError>),
     ClipboardWritten(Result<(), ClipboardError>),
+    RepositoryCatalogChanged(CatalogSnapshot),
+    RepositoryCatalogFailed {
+        message: String,
+    },
     DefaultRepositoryPersisted {
         repository_id: Uuid,
         result: Result<(), CatalogError>,
@@ -174,6 +178,68 @@ impl App {
             return Vec::new();
         }
         match event {
+            AppEvent::RepositoryCatalogChanged(snapshot) => {
+                let old_selected = self
+                    .home
+                    .selected
+                    .and_then(|index| self.home.repositories.get(index))
+                    .map(|repository| repository.id);
+                let old_availability = self
+                    .home
+                    .repositories
+                    .iter()
+                    .zip(self.home.repository_availability.iter().copied())
+                    .map(|(repository, availability)| (repository.id, availability))
+                    .collect::<std::collections::HashMap<_, _>>();
+                self.home.repositories = snapshot.repositories;
+                self.home.repository_availability = self
+                    .home
+                    .repositories
+                    .iter()
+                    .map(|repository| {
+                        old_availability
+                            .get(&repository.id)
+                            .copied()
+                            .unwrap_or(RepositoryAvailability::Available)
+                    })
+                    .collect();
+                self.home.default_repository = snapshot.default_repository;
+                self.home.selected = snapshot
+                    .selected_repository
+                    .or(old_selected)
+                    .or(snapshot.default_repository)
+                    .and_then(|id| {
+                        self.home
+                            .repositories
+                            .iter()
+                            .position(|repository| repository.id == id)
+                    })
+                    .or((!self.home.repositories.is_empty()).then_some(0));
+                self.failures.catalog = None;
+
+                if self.home.pending_note.is_some()
+                    && self.home.default_choice == DefaultChoiceState::AwaitingSelection
+                    && let Some(default_repository) = snapshot.default_repository
+                    && let Some(repository) = self
+                        .home
+                        .repositories
+                        .iter()
+                        .find(|repository| repository.id == default_repository)
+                        .cloned()
+                {
+                    let note = self.home.pending_note.clone().expect("checked above");
+                    self.home.default_choice = DefaultChoiceState::ResumingPendingNote {
+                        repository_id: repository.id,
+                        note: note.clone(),
+                    };
+                    return self.request_open_workspace(repository, Some(note));
+                }
+                Vec::new()
+            }
+            AppEvent::RepositoryCatalogFailed { message } => {
+                self.record_outer_failure(FailureKind::Runtime, message, false);
+                Vec::new()
+            }
             AppEvent::DefaultRepositoryPersisted {
                 repository_id,
                 result,

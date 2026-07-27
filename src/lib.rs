@@ -5,5 +5,6 @@ pub mod catalog;
 pub mod cli;
 pub mod editor;
 pub mod git;
+pub mod runtime;
 pub mod ui;
 pub mod workspace;

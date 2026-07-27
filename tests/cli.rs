@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf, process::Command};
 
 use carnet::{
     catalog::{Catalog, CatalogError},
-    cli::{Cli, CliError, route},
+    cli::{Cli, CliError, Launch, route},
 };
 use clap::{CommandFactory, Parser};
 use tempfile::tempdir;
@@ -50,30 +50,58 @@ fn route_rejects_absolute_and_parent_traversal_note_paths() {
 }
 
 #[test]
-fn route_reports_missing_named_and_default_registrations() {
+fn route_reports_missing_named_registrations() {
     let sandbox = tempdir().unwrap();
     let repo = sandbox.path().join("notes");
     fs::create_dir(&repo).unwrap();
     let mut named_catalog = Catalog::create_at(sandbox.path().join("named.toml"));
     named_catalog.register("personal", &repo).unwrap();
-    let empty_catalog = Catalog::create_at(sandbox.path().join("empty.toml"));
 
     let named_error = route(
         Cli::try_parse_from(["carnet", "--repo", "work"]).unwrap(),
         &named_catalog,
     )
     .unwrap_err();
-    let default_error =
-        route(Cli::try_parse_from(["carnet"]).unwrap(), &empty_catalog).unwrap_err();
-
     assert!(matches!(
         named_error,
         CliError::Catalog(CatalogError::RepositoryNotFound { .. })
     ));
-    assert!(matches!(
-        default_error,
-        CliError::Catalog(CatalogError::DefaultRepositoryNotSet)
-    ));
+}
+
+#[test]
+fn no_arguments_enters_home_even_without_a_default_repository() {
+    let sandbox = tempdir().unwrap();
+    let catalog = Catalog::create_at(sandbox.path().join("catalog.toml"));
+
+    let launch = route(Cli::try_parse_from(["carnet"]).unwrap(), &catalog).unwrap();
+
+    assert_eq!(
+        launch,
+        Launch::Home {
+            selected_repository: None,
+            pending_note: None,
+        }
+    );
+}
+
+#[test]
+fn a_note_without_a_default_enters_home_and_preserves_the_pending_path() {
+    let sandbox = tempdir().unwrap();
+    let catalog = Catalog::create_at(sandbox.path().join("catalog.toml"));
+
+    let launch = route(
+        Cli::try_parse_from(["carnet", "inbox/today.md"]).unwrap(),
+        &catalog,
+    )
+    .unwrap();
+
+    assert_eq!(
+        launch,
+        Launch::Home {
+            selected_repository: None,
+            pending_note: Some(PathBuf::from("inbox/today.md")),
+        }
+    );
 }
 
 #[test]
@@ -83,6 +111,7 @@ fn process_exits_two_for_a_configuration_failure_before_tui_entry() {
     let output = Command::new(env!("CARGO_BIN_EXE_carnet"))
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .args(["--repo", "missing"])
         .output()
         .unwrap();
 
@@ -90,7 +119,7 @@ fn process_exits_two_for_a_configuration_failure_before_tui_entry() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("default repository is not registered")
+            .contains("repository named \"missing\" is not registered")
     );
 }
 

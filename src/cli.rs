@@ -2,6 +2,7 @@ use std::path::{Component, Path, PathBuf};
 
 use clap::Parser;
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::catalog::{Catalog, CatalogError, RepoEntry};
 
@@ -24,8 +25,14 @@ pub struct Cli {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Launch {
-    RepositoryHome { default_repo: RepoEntry },
-    Note { repo: RepoEntry, note_path: PathBuf },
+    Home {
+        selected_repository: Option<Uuid>,
+        pending_note: Option<PathBuf>,
+    },
+    Repository {
+        repository: RepoEntry,
+        note: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -39,13 +46,29 @@ pub enum CliError {
 }
 
 pub fn route(cli: Cli, catalog: &Catalog) -> Result<Launch, CliError> {
-    let repo = catalog.resolve_repo(cli.repo.as_deref())?;
-    match cli.note_path {
-        Some(note_path) => {
-            validate_note_path(&note_path)?;
-            Ok(Launch::Note { repo, note_path })
-        }
-        None => Ok(Launch::RepositoryHome { default_repo: repo }),
+    if let Some(note) = &cli.note_path {
+        validate_note_path(note)?;
+    }
+    match (cli.repo.as_deref(), cli.note_path) {
+        (None, None) => Ok(Launch::Home {
+            selected_repository: catalog.default_repository_id(),
+            pending_note: None,
+        }),
+        (None, Some(note)) => match catalog.resolve_repo(None) {
+            Ok(repository) => Ok(Launch::Repository {
+                repository,
+                note: Some(note),
+            }),
+            Err(CatalogError::DefaultRepositoryNotSet) => Ok(Launch::Home {
+                selected_repository: None,
+                pending_note: Some(note),
+            }),
+            Err(error) => Err(error.into()),
+        },
+        (Some(name), note) => Ok(Launch::Repository {
+            repository: catalog.resolve_repo(Some(name))?,
+            note,
+        }),
     }
 }
 

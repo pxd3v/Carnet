@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Quality (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Lint all targets and features
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Test all targets and features
+        run: cargo test --locked --all-targets --all-features
+
+  coverage:
+    name: Coverage report
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+      - name: Install stable Rust with coverage tools
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools-preview
+          rustup default stable
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+      - name: Generate LCOV report
+        run: cargo llvm-cov --locked --all-targets --all-features --lcov --output-path lcov.info
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error

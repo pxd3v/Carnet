@@ -1,10 +1,15 @@
-use std::process::ExitCode;
+use std::{io, process::ExitCode, time::Duration};
 
 use carnet::{
+    app::AppExitStatus,
     catalog::Catalog,
     cli::{Cli, route},
+    runtime::{CrosstermLifecycle, RestorationGuard, Runtime, map_terminal_event},
+    ui,
 };
 use clap::Parser;
+use crossterm::event;
+use ratatui::{Terminal, backend::CrosstermBackend};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -15,11 +20,55 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match route(cli, &catalog) {
-        Ok(_) => ExitCode::SUCCESS,
+    let launch = match route(cli, &catalog) {
+        Ok(launch) => launch,
         Err(error) => {
             eprintln!("carnet: {error}");
-            ExitCode::from(2)
+            return ExitCode::from(2);
+        }
+    };
+    let mut runtime = Runtime::new(catalog, launch);
+    match run_tui(&mut runtime) {
+        Ok(status) => ExitCode::from(status.code()),
+        Err(error) => {
+            eprintln!("carnet: terminal runtime failed: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_tui(runtime: &mut Runtime) -> io::Result<AppExitStatus> {
+    let guard = RestorationGuard::enter(CrosstermLifecycle)?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    let result = drive_terminal(&mut terminal, runtime);
+    let restore = guard.restore();
+    match (result, restore) {
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        (Ok(status), Ok(())) => Ok(status),
+    }
+}
+
+fn drive_terminal(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    runtime: &mut Runtime,
+) -> io::Result<AppExitStatus> {
+    loop {
+        runtime.poll_background().map_err(io::Error::other)?;
+        terminal.draw(|frame| ui::render(frame, runtime.app()))?;
+
+        if runtime.app().quit.requested {
+            return Ok(runtime
+                .app()
+                .quit
+                .final_status
+                .unwrap_or(AppExitStatus::Failure));
+        }
+
+        if event::poll(Duration::from_millis(50))?
+            && let Some(app_event) = map_terminal_event(runtime.app(), event::read()?)
+        {
+            runtime.dispatch(app_event);
         }
     }
 }

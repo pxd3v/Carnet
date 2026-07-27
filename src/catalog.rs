@@ -58,7 +58,7 @@ pub struct RepoEntry {
     pub path: PathBuf,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Catalog {
     path: PathBuf,
     version: u32,
@@ -145,6 +145,14 @@ impl Catalog {
         validate_canonical_repository_path(&repo.path)?;
 
         Ok(repo.clone())
+    }
+
+    pub fn repositories(&self) -> &[RepoEntry] {
+        &self.repos
+    }
+
+    pub fn default_repository_id(&self) -> Option<Uuid> {
+        self.default_repo_id
     }
 
     pub fn create() -> Result<Catalog, CatalogError> {

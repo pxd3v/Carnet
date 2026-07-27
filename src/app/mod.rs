@@ -4,13 +4,13 @@ mod update;
 
 pub use effect::{AppEffect, EffectExecutionError, EffectExecutor, RuntimeError, RuntimeOperation};
 pub use state::{
-    App, AppExitStatus, CommitStatus, DefaultChoiceState, Dialog, ExternalConflict, FailureKind,
-    FailureState, FileActionKind, FileMutationAction, Focus, HomeState, MutationId,
-    NavigationAction, OverlayState, PendingFileMutation, PendingIntent, PendingMutation,
-    PendingMutationKind, PendingRequest, PendingSave, QuitState, RepositoryActionKind,
-    RepositoryAvailability, RepositoryFormField, RepositoryFormState, RequestId, RuntimeFailure,
-    SavedCommitFailure, Screen, SidebarState, StatusState, UnresolvedFailure, WorkspaceOrigin,
-    WorkspaceState,
+    App, AppExitStatus, CatalogSnapshot, CommitStatus, DefaultChoiceState, Dialog,
+    ExternalConflict, FailureKind, FailureState, FileActionKind, FileMutationAction, Focus,
+    HomeState, MutationId, NavigationAction, OverlayState, PendingFileMutation, PendingIntent,
+    PendingMutation, PendingMutationKind, PendingRequest, PendingSave, QuitState,
+    RepositoryActionKind, RepositoryAvailability, RepositoryFormField, RepositoryFormState,
+    RequestId, RuntimeFailure, SavedCommitFailure, Screen, SidebarState, StatusState,
+    UnresolvedFailure, WorkspaceOrigin, WorkspaceState,
 };
 pub use update::{
     AppAction, AppEvent, ConflictChoice, DirtyChoice, GlobalAction, HomeAction, TreeAction,

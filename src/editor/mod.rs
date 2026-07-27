@@ -28,7 +28,7 @@ pub trait Clipboard {
     fn write_text(&mut self, text: &str) -> Result<(), ClipboardError>;
 }
 
-struct SystemClipboard;
+pub struct SystemClipboard;
 
 impl Clipboard for SystemClipboard {
     fn read_text(&mut self) -> Result<String, ClipboardError> {
