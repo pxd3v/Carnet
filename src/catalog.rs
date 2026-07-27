@@ -142,26 +142,7 @@ impl Catalog {
             }
         };
 
-        let canonical_path =
-            fs::canonicalize(&repo.path).map_err(|source| match source.kind() {
-                std::io::ErrorKind::NotFound => CatalogError::RepositoryPathMissing {
-                    path: repo.path.clone(),
-                },
-                _ => CatalogError::Io {
-                    path: repo.path.clone(),
-                    source,
-                },
-            })?;
-        if !canonical_path.is_dir() {
-            return Err(CatalogError::RepositoryPathNotDirectory {
-                path: canonical_path,
-            });
-        }
-        if canonical_path != repo.path {
-            return Err(CatalogError::RepositoryPathNotCanonical {
-                path: repo.path.clone(),
-            });
-        }
+        validate_canonical_repository_path(&repo.path)?;
 
         Ok(repo.clone())
     }
@@ -199,6 +180,9 @@ impl Catalog {
             });
         }
         validate_entries(&file.repos)?;
+        for repo in &file.repos {
+            validate_canonical_repository_path(&repo.path)?;
+        }
         if let Some(default_repo_id) = file.default_repo_id
             && !file.repos.iter().any(|repo| repo.id == default_repo_id)
         {
@@ -311,6 +295,16 @@ fn canonical_repository_path(path: &Path) -> Result<PathBuf, CatalogError> {
         });
     }
     Ok(canonical_path)
+}
+
+fn validate_canonical_repository_path(path: &Path) -> Result<(), CatalogError> {
+    let canonical_path = canonical_repository_path(path)?;
+    if canonical_path != path {
+        return Err(CatalogError::RepositoryPathNotCanonical {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 fn valid_name(name: String) -> Result<String, CatalogError> {

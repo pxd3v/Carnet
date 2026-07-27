@@ -2,6 +2,7 @@ use std::fs;
 
 use carnet::catalog::{Catalog, CatalogError};
 use tempfile::tempdir;
+use uuid::Uuid;
 
 #[test]
 fn saves_and_loads_a_default_registration_with_a_canonical_path() {
@@ -44,6 +45,50 @@ fn rejects_registration_of_a_missing_path() {
     let error = catalog.register("personal", &missing).unwrap_err();
 
     assert!(matches!(error, CatalogError::RepositoryPathMissing { .. }));
+}
+
+#[test]
+fn rejects_a_persisted_catalog_with_a_missing_repository_path() {
+    let sandbox = tempdir().unwrap();
+    let config_path = sandbox.path().join("catalog.toml");
+    write_catalog(&config_path, &sandbox.path().join("missing"));
+
+    let error = Catalog::load_at(&config_path).unwrap_err();
+
+    assert!(matches!(error, CatalogError::RepositoryPathMissing { .. }));
+}
+
+#[test]
+fn rejects_a_persisted_catalog_with_a_non_directory_repository_path() {
+    let sandbox = tempdir().unwrap();
+    let file = sandbox.path().join("notes.md");
+    fs::write(&file, "note").unwrap();
+    let config_path = sandbox.path().join("catalog.toml");
+    write_catalog(&config_path, &file);
+
+    let error = Catalog::load_at(&config_path).unwrap_err();
+
+    assert!(matches!(
+        error,
+        CatalogError::RepositoryPathNotDirectory { .. }
+    ));
+}
+
+#[test]
+fn rejects_a_persisted_catalog_with_a_non_canonical_repository_path() {
+    let sandbox = tempdir().unwrap();
+    let repo = sandbox.path().join("notes");
+    fs::create_dir(&repo).unwrap();
+    let non_canonical = repo.join("..").join("notes");
+    let config_path = sandbox.path().join("catalog.toml");
+    write_catalog(&config_path, &non_canonical);
+
+    let error = Catalog::load_at(&config_path).unwrap_err();
+
+    assert!(matches!(
+        error,
+        CatalogError::RepositoryPathNotCanonical { .. }
+    ));
 }
 
 #[test]
@@ -92,4 +137,16 @@ fn rename_set_default_and_unregister_keep_repository_directories_untouched() {
         catalog.resolve_repo(Some("journal")).unwrap().id,
         personal_entry.id
     );
+}
+
+fn write_catalog(config_path: &std::path::Path, repo_path: &std::path::Path) {
+    let id = Uuid::new_v4();
+    fs::write(
+        config_path,
+        format!(
+            "version = 1\ndefault_repo_id = \"{id}\"\n\n[[repos]]\nid = \"{id}\"\nname = \"personal\"\npath = \"{}\"\n",
+            repo_path.display()
+        ),
+    )
+    .unwrap();
 }
