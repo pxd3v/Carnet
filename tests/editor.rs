@@ -132,6 +132,25 @@ fn insertion_deletion_and_newline_replace_whole_selections() {
 }
 
 #[test]
+fn identical_replacement_collapses_the_selection_before_the_next_insert() {
+    let mut editor = editor_from("identical.md", "x");
+    editor.apply(move_command(Motion::Right, true));
+
+    assert_eq!(editor.selected_text().as_deref(), Some("x"));
+    assert_eq!(
+        editor.apply(EditorCommand::Insert("x".into())),
+        EditorOutcome::Moved
+    );
+    assert_eq!(editor.text(), "x");
+    assert_eq!(editor.selection(), None);
+    assert_eq!(editor.cursor(), 1);
+    assert!(!editor.is_dirty());
+
+    editor.apply(EditorCommand::Insert("y".into()));
+    assert_eq!(editor.text(), "xy");
+}
+
+#[test]
 fn edits_are_single_transactions_and_new_edits_clear_redo() {
     let mut editor = editor_from("history.md", "base");
     editor.apply(EditorCommand::Insert("a".into()));

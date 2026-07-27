@@ -343,9 +343,7 @@ impl Editor {
 
     fn replace_selection(&mut self, text: &str) -> bool {
         let range = self.selection().unwrap_or(self.cursor..self.cursor);
-        if !self.buffer.replace(range.clone(), text) {
-            return false;
-        }
+        let changed = self.buffer.replace(range.clone(), text);
         let start = range.start;
         self.cursor = self
             .buffer
@@ -353,7 +351,7 @@ impl Editor {
         self.anchor = None;
         self.preferred_column = None;
         self.search.reset_navigation();
-        true
+        changed
     }
 
     fn backspace(&mut self) -> bool {
