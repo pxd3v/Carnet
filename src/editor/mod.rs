@@ -402,6 +402,7 @@ impl Editor {
         if let Some(anchor) = &mut self.anchor {
             *anchor += starts.iter().filter(|start| **start <= *anchor).count() * 4;
         }
+        self.snap_endpoints();
         self.preferred_column = None;
     }
 
@@ -430,7 +431,28 @@ impl Editor {
         if let Some(anchor) = &mut self.anchor {
             *anchor = adjusted_after_removals(*anchor, &removals);
         }
+        self.snap_endpoints();
         self.preferred_column = None;
+    }
+
+    fn snap_endpoints(&mut self) {
+        match self.anchor {
+            None => {
+                self.cursor = self.buffer.boundary_at_or_after(self.cursor);
+            }
+            Some(anchor) if anchor < self.cursor => {
+                self.anchor = Some(self.buffer.boundary_at_or_before(anchor));
+                self.cursor = self.buffer.boundary_at_or_after(self.cursor);
+            }
+            Some(anchor) if anchor > self.cursor => {
+                self.anchor = Some(self.buffer.boundary_at_or_after(anchor));
+                self.cursor = self.buffer.boundary_at_or_before(self.cursor);
+            }
+            Some(_) => {
+                self.cursor = self.buffer.boundary_at_or_after(self.cursor);
+                self.anchor = Some(self.cursor);
+            }
+        }
     }
 
     fn selected_line_starts(&self) -> Vec<usize> {

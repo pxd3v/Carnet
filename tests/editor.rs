@@ -256,6 +256,25 @@ fn highlight_cache_recomputes_styled_ranges_after_an_edit() {
 }
 
 #[test]
+fn markdown_highlights_heading_and_emphasis_differently_from_plain_text() {
+    let mut editor = editor_from("tokens.md", "# Heading\nplain *emphasis* tail\n");
+    let spans = editor.highlighted_spans().to_vec();
+    let plain = style_at(&spans, 10);
+
+    assert_ne!(style_at(&spans, 2), plain);
+    assert_ne!(style_at(&spans, 17), plain);
+}
+
+#[test]
+fn html_highlights_tag_names_differently_from_adjacent_text() {
+    let mut editor = editor_from("tokens.html", "<p>plain</p>");
+    let spans = editor.highlighted_spans().to_vec();
+
+    assert_ne!(style_at(&spans, 1), style_at(&spans, 3));
+    assert_ne!(style_at(&spans, 10), style_at(&spans, 3));
+}
+
+#[test]
 fn outdent_keeps_selection_endpoints_valid_when_indented_lines_are_adjacent() {
     let mut editor = editor_from("outdent.md", "    \n x");
     editor.apply(EditorCommand::SelectAll);
@@ -281,6 +300,38 @@ fn deletion_snaps_the_cursor_when_surrounding_text_forms_a_new_grapheme() {
     delete.apply(EditorCommand::Delete);
     assert_eq!(delete.text(), "🇺🇳");
     assert_eq!(delete.cursor(), 2);
+}
+
+#[test]
+fn indent_snaps_endpoints_created_inside_a_spacing_mark_grapheme() {
+    let mut editor = editor_from("indent-boundary.md", "");
+    editor.apply(EditorCommand::Insert("ၖ".into()));
+    editor.apply(move_command(Motion::DocumentStart, false));
+
+    editor.apply(EditorCommand::Indent);
+
+    assert_eq!(editor.text(), "    ၖ");
+    assert_valid_editor_endpoints(&editor);
+    editor.apply(EditorCommand::Undo);
+    assert_valid_editor_endpoints(&editor);
+    editor.apply(EditorCommand::Redo);
+    assert_eq!(editor.text(), "    ၖ");
+    assert_valid_editor_endpoints(&editor);
+}
+
+#[test]
+fn indent_snaps_both_ends_of_a_selection_around_a_spacing_mark_grapheme() {
+    let mut editor = editor_from("indent-selection.md", "ၖ");
+    editor.apply(EditorCommand::SelectAll);
+
+    editor.apply(EditorCommand::Indent);
+
+    assert_eq!(editor.text(), "    ၖ");
+    assert_valid_editor_endpoints(&editor);
+    editor.apply(EditorCommand::Undo);
+    assert_valid_editor_endpoints(&editor);
+    editor.apply(EditorCommand::Redo);
+    assert_valid_editor_endpoints(&editor);
 }
 
 proptest! {
@@ -391,6 +442,7 @@ fn unicode_text() -> BoxedStrategy<String> {
             1 => Just("好".to_owned()),
             1 => Just("👩‍👩‍👧‍👦".to_owned()),
             1 => Just("🇺🇳".to_owned()),
+            1 => Just("ၖ".to_owned()),
             1 => Just("\n".to_owned()),
         ],
         0..32,
@@ -418,4 +470,15 @@ fn is_grapheme_boundary(text: &str, char_index: usize) -> bool {
             || text
                 .grapheme_indices(true)
                 .any(|(boundary, _)| boundary == byte_index))
+}
+
+fn style_at(
+    spans: &[carnet::editor::HighlightSpan],
+    char_index: usize,
+) -> carnet::editor::HighlightStyle {
+    spans
+        .iter()
+        .find(|span| span.range.contains(&char_index))
+        .unwrap_or_else(|| panic!("no highlighted span at scalar index {char_index}"))
+        .style
 }

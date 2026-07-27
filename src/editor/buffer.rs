@@ -58,6 +58,14 @@ impl TextBuffer {
             .unwrap_or_else(|| self.len_chars())
     }
 
+    pub(super) fn boundary_at_or_before(&self, char_index: usize) -> usize {
+        self.grapheme_boundaries()
+            .into_iter()
+            .take_while(|boundary| *boundary <= char_index)
+            .last()
+            .unwrap_or(0)
+    }
+
     pub(super) fn line_start(&self, char_index: usize) -> usize {
         self.rope.line_to_char(self.rope.char_to_line(char_index))
     }
