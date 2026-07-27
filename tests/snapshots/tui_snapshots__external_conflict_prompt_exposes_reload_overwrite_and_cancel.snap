@@ -1,6 +1,5 @@
 ---
 source: tests/tui_snapshots.rs
-assertion_line: 96
 expression: terminal.backend()
 ---
 "┌ notes/welcome.md ──────────────────────────────────────────────────────────────────────┐"
@@ -22,8 +21,8 @@ expression: terminal.backend()
 "│                                                                                        │"
 "│                                                                                        │"
 "│                                                                                        │"
-"│                                                                                        │"
-"│                                                                                        │"
-"│                                                                                        │"
 "└────────────────────────────────────────────────────────────────────────────────────────┘"
+"Global  ^S Save  ^F Find  ^P Open  ^B Files  ^Z Undo  ^Y Redo  ^C Copy  ^X Cut  ^V Paste  "
+"Files   ↑↓ Select  ←→ Fold  Enter Open  n New File  N New Folder  r Rename  m Move  Del De"
+"Editor  Arrows Move  S-Arrows Select  Enter Newline  Tab Indent  S-Tab Outdent  Home/End L"
 " Markdown  ·  saved  ·  Ln 1, Col 1                                                       "

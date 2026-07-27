@@ -1,6 +1,5 @@
 ---
 source: tests/tui_snapshots.rs
-assertion_line: 60
 expression: terminal.backend()
 ---
 "┌ Files · overlay ───────────────┐─────────────────────────────────────┐"
@@ -20,8 +19,8 @@ expression: terminal.backend()
 "│                                │                                     │"
 "│                                │                                     │"
 "│                                │                                     │"
-"│                                │                                     │"
-"│                                │                                     │"
-"│                                │                                     │"
 "└────────────────────────────────┘─────────────────────────────────────┘"
+"Global  ^S Save  ^F Find  ^P Open  ^B Files  ^Z Undo  ^Y Redo  ^C Copy  "
+"Files   ↑↓ Select  ←→ Fold  Enter Open  n New File  N New Folder  r Rena"
+"Editor  Arrows Move  S-Arrows Select  Enter Newline  Tab Indent  S-Tab O"
 " Markdown  ·  saved  ·  Ln 1, Col 1                                     "

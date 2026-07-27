@@ -57,8 +57,12 @@ pub fn workspace_geometry(area: Rect, sidebar_visible: bool) -> WorkspaceGeometr
 }
 
 pub(super) fn render(frame: &mut Frame<'_>, app: &App, workspace: &WorkspaceState) {
-    let [main, status] =
-        Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).areas(frame.area());
+    let [main, shortcuts, status] = Layout::vertical([
+        Constraint::Min(5),
+        Constraint::Length(3),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
     let geometry = workspace_geometry(main, app.sidebar.visible);
     render_editor(frame, geometry.editor, workspace);
     if let Some(tree) = geometry.tree {
@@ -68,7 +72,40 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &App, workspace: &WorkspaceStat
         render_tree(frame, tree, workspace, geometry.tree_is_overlay);
     }
 
+    render_shortcuts(frame, shortcuts, workspace.focus);
     render_status(frame, status, app, workspace);
+}
+
+fn render_shortcuts(frame: &mut Frame<'_>, area: Rect, focus: Focus) {
+    let lines = vec![
+        shortcut_line(
+            "Global",
+            false,
+            "^S Save  ^F Find  ^P Open  ^B Files  ^Z Undo  ^Y Redo  ^C Copy  ^X Cut  ^V Paste  ^A All  ^Q Quit",
+        ),
+        shortcut_line(
+            "Files",
+            focus == Focus::Tree,
+            "↑↓ Select  ←→ Fold  Enter Open  n New File  N New Folder  r Rename  m Move  Del Delete  Esc Editor",
+        ),
+        shortcut_line(
+            "Editor",
+            focus == Focus::Editor,
+            "Arrows Move  S-Arrows Select  Enter Newline  Tab Indent  S-Tab Outdent  Home/End Line Start/End",
+        ),
+    ];
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn shortcut_line(label: &'static str, active: bool, shortcuts: &'static str) -> Line<'static> {
+    let mut label_style = Style::default().add_modifier(Modifier::BOLD);
+    if active {
+        label_style = label_style.fg(Color::Black).bg(Color::Cyan);
+    }
+    Line::from(vec![
+        Span::styled(format!("{label:<8}"), label_style),
+        Span::raw(shortcuts),
+    ])
 }
 
 fn render_tree(frame: &mut Frame<'_>, area: Rect, workspace: &WorkspaceState, overlay: bool) {

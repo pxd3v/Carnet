@@ -401,6 +401,48 @@ fn tree_viewport_keeps_an_offscreen_selection_visible() {
 }
 
 #[test]
+fn workspace_footer_exposes_global_file_and_editor_shortcuts() {
+    let (_sandbox, app) = workspace_app("note.md", "note");
+
+    let output = rendered_text(&app, 110, 16);
+
+    assert!(output.contains("Global"), "{output}");
+    assert!(output.contains("^S Save"), "{output}");
+    assert!(output.contains("^Q Quit"), "{output}");
+    assert!(output.contains("Files"), "{output}");
+    assert!(output.contains("Enter Open"), "{output}");
+    assert!(output.contains("Del Delete"), "{output}");
+    assert!(output.contains("Esc Editor"), "{output}");
+    assert!(output.contains("Editor"), "{output}");
+    assert!(output.contains("S-Arrows Select"), "{output}");
+    assert!(output.contains("S-Tab Outdent"), "{output}");
+}
+
+#[test]
+fn workspace_footer_highlights_the_focused_pane() {
+    let (_sandbox, mut app) = workspace_app("note.md", "note");
+
+    let editor_focused = render_backend(&app, 180, 16);
+    let files_label = editor_focused.buffer().cell((0, 13)).unwrap();
+    let editor_label = editor_focused.buffer().cell((0, 14)).unwrap();
+    assert_eq!(files_label.bg, Color::Reset);
+    assert_eq!(editor_label.fg, Color::Black);
+    assert_eq!(editor_label.bg, Color::Cyan);
+
+    let Screen::Workspace(workspace) = &mut app.screen else {
+        panic!("workspace fixture did not open")
+    };
+    workspace.focus = carnet::app::Focus::Tree;
+
+    let tree_focused = render_backend(&app, 180, 16);
+    let files_label = tree_focused.buffer().cell((0, 13)).unwrap();
+    let editor_label = tree_focused.buffer().cell((0, 14)).unwrap();
+    assert_eq!(files_label.fg, Color::Black);
+    assert_eq!(files_label.bg, Color::Cyan);
+    assert_eq!(editor_label.bg, Color::Reset);
+}
+
+#[test]
 fn quick_open_viewport_keeps_selection_and_footer_visible() {
     let (_sandbox, mut app) = workspace_app_with_many_files(30);
     app.sidebar.visible = false;

@@ -1903,6 +1903,39 @@ fn tree_focus_routes_navigation_file_actions_and_escape_through_update() {
 }
 
 #[test]
+fn workspace_without_a_loaded_note_opens_with_tree_focus() {
+    use carnet::app::Focus;
+
+    let (_sandbox, repository, workspace, git) =
+        workspace_fixture(176, "notes", "available.md", "available");
+    let tree = workspace.tree().unwrap();
+    let mut app = App::home(vec![repository.clone()], Some(repository.id), None);
+    app.update(AppEvent::Action(AppAction::Home(HomeAction::OpenSelected)));
+    let request_id = app.pending_request.as_ref().unwrap().request_id();
+
+    app.update(AppEvent::WorkspaceOpened {
+        request_id,
+        repository_id: repository.id,
+        workspace,
+        git,
+        tree,
+        note: None,
+    });
+
+    assert_eq!(workspace_focus(&app), Focus::Tree);
+    assert_eq!(workspace_tree_selection(&app), Some(0));
+}
+
+#[test]
+fn workspace_with_a_loaded_note_opens_with_editor_focus() {
+    use carnet::app::Focus;
+
+    let (_sandbox, app) = app_with_note(177, "note.md", "note");
+
+    assert_eq!(workspace_focus(&app), Focus::Editor);
+}
+
+#[test]
 fn dirty_tree_open_uses_the_navigation_prompt_before_loading() {
     use carnet::app::{Dialog, Focus, NavigationAction, TreeAction};
 

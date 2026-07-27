@@ -140,6 +140,11 @@ impl App {
         };
         let repository = workspace.repo().clone();
         let tree_selection = (!tree.is_empty()).then_some(0);
+        let focus = if note.is_some() {
+            Focus::Editor
+        } else {
+            Focus::Tree
+        };
         self.screen = Screen::Workspace(Box::new(WorkspaceState {
             repository,
             workspace,
@@ -149,7 +154,7 @@ impl App {
             editor: note.map(Editor::from_loaded),
             editor_instance_id,
             editor_revision: 0,
-            focus: Focus::Editor,
+            focus,
             tree_selection,
             expanded: Default::default(),
         }));
