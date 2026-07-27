@@ -234,6 +234,39 @@ pub enum Dialog {
         origin: WorkspaceOrigin,
         path: PathBuf,
     },
+    RepositoryForm {
+        kind: RepositoryActionKind,
+        repository_id: Option<Uuid>,
+    },
+    ConfirmSetDefault {
+        repository_id: Uuid,
+        name: String,
+    },
+    ConfirmUnregister {
+        repository_id: Uuid,
+        name: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepositoryActionKind {
+    Create,
+    Register,
+    Rename,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RepositoryFormField {
+    #[default]
+    Name,
+    Path,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RepositoryFormState {
+    pub name: String,
+    pub path: String,
+    pub active_field: RepositoryFormField,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -348,6 +381,7 @@ pub struct App {
     pub pending_request: Option<PendingRequest>,
     pub dialog: Option<Dialog>,
     pub dialog_input: String,
+    pub repository_form: RepositoryFormState,
     pub status: StatusState,
     pub quit: QuitState,
     pub failures: FailureState,
@@ -383,6 +417,7 @@ impl App {
             pending_request: None,
             dialog: None,
             dialog_input: String::new(),
+            repository_form: RepositoryFormState::default(),
             status: StatusState::default(),
             quit: QuitState::default(),
             failures: FailureState::default(),

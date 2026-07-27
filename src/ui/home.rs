@@ -115,8 +115,8 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &App) {
 
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(" [c] Create  [a] Register  [Enter] Open  [r] Rename  [d] Default"),
-            Line::from(" [u] Unregister  [Ctrl+Q] Quit"),
+            Line::from(" [c] Create  [a] Register  [Enter] Open available  [R] Rename"),
+            Line::from(" [d] Default  [u] Unregister  [Ctrl+Q] Quit"),
         ])
         .block(
             Block::default()

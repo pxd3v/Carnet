@@ -2299,8 +2299,8 @@ fn outer_runtime_effect_failures_return_as_explicit_app_events() {
 }
 
 #[test]
-fn global_find_quick_open_and_sidebar_actions_update_overlay_state() {
-    use carnet::app::{GlobalAction, OverlayState};
+fn global_find_quick_open_and_sidebar_actions_update_overlay_and_focus_state() {
+    use carnet::app::{Focus, GlobalAction, OverlayState};
 
     let (_sandbox, mut app) = app_with_note(20, "note.md", "text");
 
@@ -2317,7 +2317,13 @@ fn global_find_quick_open_and_sidebar_actions_update_overlay_state() {
     app.update(AppEvent::Action(AppAction::Global(
         GlobalAction::ToggleSidebar,
     )));
+    assert!(app.sidebar.visible);
+    assert_eq!(workspace_focus(&app), Focus::Tree);
+    app.update(AppEvent::Action(AppAction::Global(
+        GlobalAction::ToggleSidebar,
+    )));
     assert!(!app.sidebar.visible);
+    assert_eq!(workspace_focus(&app), Focus::Editor);
     app.update(AppEvent::Action(AppAction::SetSidebarOverlayIntent(true)));
     assert!(app.sidebar.overlay_intent);
 }

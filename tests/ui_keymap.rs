@@ -2,8 +2,9 @@ use std::{fs, path::PathBuf};
 
 use carnet::{
     app::{
-        App, AppAction, AppEvent, ConflictChoice, Dialog, DirtyChoice, Focus, GlobalAction,
-        HomeAction, OverlayState, Screen, TreeAction,
+        App, AppAction, AppEvent, ConflictChoice, Dialog, DirtyChoice, FileActionKind, Focus,
+        GlobalAction, HomeAction, OverlayState, RepositoryActionKind, RepositoryFormField, Screen,
+        TreeAction,
     },
     catalog::RepoEntry,
     git::GitRepo,
@@ -214,10 +215,305 @@ fn quick_open_selects_and_opens_the_first_matching_text_file() {
     ));
 }
 
+#[test]
+fn ctrl_b_reaches_tree_actions_from_the_editor_and_returns() {
+    let (_sandbox, mut app) = workspace_app();
+    app.sidebar.visible = false;
+
+    let event = map_key(
+        &app,
+        KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+    )
+    .unwrap();
+    app.update(event);
+    let Screen::Workspace(workspace) = &app.screen else {
+        panic!("workspace fixture did not open")
+    };
+    assert!(app.sidebar.visible);
+    assert_eq!(workspace.focus, Focus::Tree);
+
+    for (key, expected) in [
+        (
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            FileActionKind::NewFile,
+        ),
+        (
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            FileActionKind::Rename,
+        ),
+        (
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            FileActionKind::Move,
+        ),
+    ] {
+        let event = map_key(&app, key).unwrap();
+        app.update(event);
+        assert!(matches!(
+            app.dialog,
+            Some(Dialog::FileAction { kind, .. }) if kind == expected
+        ));
+        app.update(AppEvent::Action(AppAction::Dismiss));
+    }
+
+    let event = map_key(&app, KeyEvent::from(KeyCode::Delete)).unwrap();
+    app.update(event);
+    assert!(matches!(app.dialog, Some(Dialog::ConfirmDelete { .. })));
+    app.update(AppEvent::Action(AppAction::Dismiss));
+
+    let open = map_key(&app, KeyEvent::from(KeyCode::Enter)).unwrap();
+    assert!(matches!(
+        app.update(open).as_slice(),
+        [carnet::app::AppEffect::LoadNote { path, .. }] if path == &PathBuf::from("note.md")
+    ));
+    app.pending_request = None;
+
+    let event = map_key(
+        &app,
+        KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+    )
+    .unwrap();
+    app.update(event);
+    let Screen::Workspace(workspace) = &app.screen else {
+        panic!("workspace fixture did not open")
+    };
+    assert!(!app.sidebar.visible);
+    assert_eq!(workspace.focus, Focus::Editor);
+}
+
+#[test]
+fn dialogs_and_overlays_consume_keys_that_are_not_explicit_choices() {
+    let (_sandbox, mut app) = workspace_app();
+    let dialogs = [
+        Dialog::DirtyNavigation,
+        Dialog::ExternalConflict(carnet::app::ExternalConflict::Modified {
+            path: PathBuf::from("note.md"),
+        }),
+        Dialog::Failure {
+            kind: carnet::app::FailureKind::Runtime,
+            message: "failed".into(),
+        },
+    ];
+
+    for dialog in dialogs {
+        app.dialog = Some(dialog);
+        assert!(
+            map_key(
+                &app,
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)
+            )
+            .is_none()
+        );
+        assert!(map_key(&app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)).is_none());
+        assert!(map_key(&app, KeyEvent::from(KeyCode::Up)).is_none());
+    }
+
+    app.dialog = None;
+    app.overlay = OverlayState::Search {
+        query: String::new(),
+    };
+    assert!(
+        map_key(
+            &app,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)
+        )
+        .is_none()
+    );
+    assert!(map_key(&app, KeyEvent::from(KeyCode::Up)).is_none());
+
+    app.overlay = OverlayState::None;
+    let Screen::Workspace(workspace) = &app.screen else {
+        panic!("workspace fixture did not open")
+    };
+    let origin = carnet::app::WorkspaceOrigin {
+        repository_id: workspace.repository.id,
+        repository_root: workspace.workspace.root().to_path_buf(),
+    };
+    let editor_before = workspace.editor.as_ref().unwrap().text();
+    app.dialog = Some(Dialog::FileAction {
+        origin,
+        kind: FileActionKind::NewFile,
+        target: None,
+    });
+    assert!(map_key(&app, KeyEvent::from(KeyCode::Enter)).is_none());
+    assert!(
+        map_key(
+            &app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
+        )
+        .is_none()
+    );
+    let file_input = map_key(&app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)).unwrap();
+    app.update(file_input);
+    assert_eq!(app.dialog_input, "x");
+    let Screen::Workspace(workspace) = &app.screen else {
+        panic!("workspace fixture did not open")
+    };
+    assert_eq!(workspace.editor.as_ref().unwrap().text(), editor_before);
+
+    app.dialog = Some(Dialog::RepositoryForm {
+        kind: RepositoryActionKind::Create,
+        repository_id: None,
+    });
+    app.repository_form = Default::default();
+    assert!(map_key(&app, KeyEvent::from(KeyCode::Enter)).is_none());
+    assert!(
+        map_key(
+            &app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)
+        )
+        .is_none()
+    );
+    let repository_input =
+        map_key(&app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)).unwrap();
+    app.update(repository_input);
+    assert_eq!(app.repository_form.name, "x");
+    let Screen::Workspace(workspace) = &app.screen else {
+        panic!("workspace fixture did not open")
+    };
+    assert_eq!(workspace.editor.as_ref().unwrap().text(), editor_before);
+}
+
+#[test]
+fn disabled_home_rows_are_inert_for_open_and_default_actions() {
+    let (_sandbox, workspace) = workspace_app();
+    let Screen::Workspace(workspace_state) = &workspace.screen else {
+        panic!("workspace fixture did not open")
+    };
+    let repository = workspace_state.repository.clone();
+    let mut app = App::home(vec![repository.clone()], Some(repository.id), None);
+    app.home.repository_availability[0] = carnet::app::RepositoryAvailability::MissingOrInvalid;
+
+    let open = map_key(&app, KeyEvent::from(KeyCode::Enter)).unwrap();
+    assert!(app.update(open).is_empty());
+    assert!(app.pending_request.is_none());
+
+    app.home.pending_note = Some(PathBuf::from("pending.md"));
+    let set_default = map_key(&app, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)).unwrap();
+    assert!(app.update(set_default).is_empty());
+    assert!(app.pending_request.is_none());
+}
+
+#[test]
+fn repository_create_and_register_forms_emit_typed_outer_effects() {
+    let mut app = App::home(Vec::new(), None, None);
+
+    let create = map_key(&app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)).unwrap();
+    app.update(create);
+    assert!(matches!(
+        app.dialog,
+        Some(Dialog::RepositoryForm {
+            kind: RepositoryActionKind::Create,
+            repository_id: None,
+        })
+    ));
+    type_modal_text(&mut app, "journal");
+    app.update(map_key(&app, KeyEvent::from(KeyCode::Tab)).unwrap());
+    assert_eq!(app.repository_form.active_field, RepositoryFormField::Path);
+    type_modal_text(&mut app, "/tmp/journal");
+    let effects = app.update(map_key(&app, KeyEvent::from(KeyCode::Enter)).unwrap());
+    assert!(matches!(
+        effects.as_slice(),
+        [carnet::app::AppEffect::CreateRepository { name, path }]
+            if name == "journal" && path == &PathBuf::from("/tmp/journal")
+    ));
+
+    let register = map_key(&app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
+    app.update(register);
+    assert!(matches!(
+        app.dialog,
+        Some(Dialog::RepositoryForm {
+            kind: RepositoryActionKind::Register,
+            repository_id: None,
+        })
+    ));
+    type_modal_text(&mut app, "existing");
+    app.update(map_key(&app, KeyEvent::from(KeyCode::Tab)).unwrap());
+    type_modal_text(&mut app, "/tmp/existing");
+    let effects = app.update(map_key(&app, KeyEvent::from(KeyCode::Enter)).unwrap());
+    assert!(matches!(
+        effects.as_slice(),
+        [carnet::app::AppEffect::RegisterRepository { name, path }]
+            if name == "existing" && path == &PathBuf::from("/tmp/existing")
+    ));
+}
+
+#[test]
+fn repository_selected_actions_keep_the_original_repository_id() {
+    let first = RepoEntry {
+        id: Uuid::from_u128(31),
+        name: "first".into(),
+        path: PathBuf::from("/repos/first"),
+    };
+    let second = RepoEntry {
+        id: Uuid::from_u128(32),
+        name: "second".into(),
+        path: PathBuf::from("/repos/second"),
+    };
+    let mut app = App::home(vec![first.clone(), second], None, None);
+
+    app.update(map_key(&app, KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT)).unwrap());
+    assert!(matches!(
+        app.dialog,
+        Some(Dialog::RepositoryForm {
+            kind: RepositoryActionKind::Rename,
+            repository_id: Some(id),
+        }) if id == first.id
+    ));
+    app.repository_form.name.clear();
+    type_modal_text(&mut app, "renamed");
+    app.home.selected = Some(1);
+    let rename = app.update(map_key(&app, KeyEvent::from(KeyCode::Enter)).unwrap());
+    assert!(matches!(
+        rename.as_slice(),
+        [carnet::app::AppEffect::RenameRepository { repository_id, name }]
+            if *repository_id == first.id && name == "renamed"
+    ));
+
+    app.home.selected = Some(0);
+    app.update(map_key(&app, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)).unwrap());
+    assert!(matches!(
+        app.dialog,
+        Some(Dialog::ConfirmSetDefault { repository_id, .. }) if repository_id == first.id
+    ));
+    app.home.selected = Some(1);
+    let set_default = app.update(map_key(&app, KeyEvent::from(KeyCode::Enter)).unwrap());
+    assert!(matches!(
+        set_default.as_slice(),
+        [carnet::app::AppEffect::SetDefaultRepository { repository_id }]
+            if *repository_id == first.id
+    ));
+    assert_eq!(app.home.default_repository, Some(first.id));
+
+    app.home.selected = Some(0);
+    app.update(map_key(&app, KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)).unwrap());
+    assert!(matches!(
+        app.dialog,
+        Some(Dialog::ConfirmUnregister { repository_id, .. }) if repository_id == first.id
+    ));
+    app.home.selected = Some(1);
+    let unregister = app.update(map_key(&app, KeyEvent::from(KeyCode::Enter)).unwrap());
+    assert!(matches!(
+        unregister.as_slice(),
+        [carnet::app::AppEffect::UnregisterRepository { repository_id }]
+            if *repository_id == first.id
+    ));
+}
+
 fn mapped_action(app: &App, key: KeyEvent) -> AppAction {
     match map_key(app, key) {
         Some(AppEvent::Action(action)) => action,
         _ => panic!("key did not map to an app action"),
+    }
+}
+
+fn type_modal_text(app: &mut App, text: &str) {
+    for character in text.chars() {
+        let event = map_key(
+            app,
+            KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+        )
+        .unwrap();
+        app.update(event);
     }
 }
 

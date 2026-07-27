@@ -25,6 +25,21 @@ pub enum AppEffect {
     SetDefaultRepository {
         repository_id: Uuid,
     },
+    CreateRepository {
+        name: String,
+        path: PathBuf,
+    },
+    RegisterRepository {
+        name: String,
+        path: PathBuf,
+    },
+    RenameRepository {
+        repository_id: Uuid,
+        name: String,
+    },
+    UnregisterRepository {
+        repository_id: Uuid,
+    },
     ReadClipboard,
     WriteClipboard {
         text: String,
@@ -145,6 +160,10 @@ impl EffectExecutor {
                 intent,
             )),
             effect @ (AppEffect::SetDefaultRepository { .. }
+            | AppEffect::CreateRepository { .. }
+            | AppEffect::RegisterRepository { .. }
+            | AppEffect::RenameRepository { .. }
+            | AppEffect::UnregisterRepository { .. }
             | AppEffect::ReadClipboard
             | AppEffect::WriteClipboard { .. }) => Err(EffectExecutionError {
                 effect: Box::new(effect),

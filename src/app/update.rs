@@ -11,8 +11,9 @@ use super::{
     App, AppEffect, AppExitStatus, CommitStatus, DefaultChoiceState, Dialog, ExternalConflict,
     FailureKind, FileActionKind, FileMutationAction, Focus, MutationId, NavigationAction,
     OverlayState, PendingFileMutation, PendingIntent, PendingMutation, PendingMutationKind,
-    PendingRequest, PendingSave, RepositoryAvailability, RequestId, RuntimeFailure,
-    SavedCommitFailure, Screen, UnresolvedFailure, WorkspaceOrigin, WorkspaceState,
+    PendingRequest, PendingSave, RepositoryActionKind, RepositoryAvailability, RepositoryFormField,
+    RepositoryFormState, RequestId, RuntimeFailure, SavedCommitFailure, Screen, UnresolvedFailure,
+    WorkspaceOrigin, WorkspaceState,
 };
 use super::{RuntimeError, RuntimeOperation};
 
@@ -22,6 +23,11 @@ pub enum HomeAction {
     Down,
     OpenSelected,
     ChooseSelectedAsDefault,
+    CreateRepository,
+    RegisterRepository,
+    RenameSelected,
+    SetDefaultSelected,
+    UnregisterSelected,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,6 +84,10 @@ pub enum AppAction {
     Tree(TreeAction),
     Dismiss,
     SetDialogInput(String),
+    SetRepositoryFormInput(String),
+    ToggleRepositoryFormField,
+    SubmitRepositoryForm,
+    ConfirmRepositoryAction,
     SetOverlayQuery(String),
     MoveOverlaySelection(isize),
     SubmitOverlay,
@@ -247,6 +257,7 @@ impl App {
             AppEvent::Action(AppAction::Dismiss) => {
                 self.dialog = None;
                 self.dialog_input.clear();
+                self.repository_form = RepositoryFormState::default();
                 self.overlay = OverlayState::None;
                 Vec::new()
             }
@@ -255,6 +266,34 @@ impl App {
                     self.dialog_input = input;
                 }
                 Vec::new()
+            }
+            AppEvent::Action(AppAction::SetRepositoryFormInput(input)) => {
+                if matches!(self.dialog, Some(Dialog::RepositoryForm { .. })) {
+                    match self.repository_form.active_field {
+                        RepositoryFormField::Name => self.repository_form.name = input,
+                        RepositoryFormField::Path => self.repository_form.path = input,
+                    }
+                }
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::ToggleRepositoryFormField) => {
+                if matches!(
+                    self.dialog,
+                    Some(Dialog::RepositoryForm {
+                        kind: RepositoryActionKind::Create | RepositoryActionKind::Register,
+                        ..
+                    })
+                ) {
+                    self.repository_form.active_field = match self.repository_form.active_field {
+                        RepositoryFormField::Name => RepositoryFormField::Path,
+                        RepositoryFormField::Path => RepositoryFormField::Name,
+                    };
+                }
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::SubmitRepositoryForm) => self.submit_repository_form(),
+            AppEvent::Action(AppAction::ConfirmRepositoryAction) => {
+                self.confirm_repository_action()
             }
             AppEvent::Action(AppAction::SetOverlayQuery(query)) => {
                 match &mut self.overlay {
@@ -754,7 +793,19 @@ impl App {
                 Vec::new()
             }
             AppEvent::Action(AppAction::Global(GlobalAction::ToggleSidebar)) => {
-                self.sidebar.visible = !self.sidebar.visible;
+                if let Screen::Workspace(workspace) = &mut self.screen {
+                    match workspace.focus {
+                        Focus::Editor => {
+                            self.sidebar.visible = true;
+                            workspace.focus = Focus::Tree;
+                        }
+                        Focus::Tree => {
+                            self.sidebar.visible = false;
+                            self.sidebar.overlay_intent = false;
+                            workspace.focus = Focus::Editor;
+                        }
+                    }
+                }
                 Vec::new()
             }
             AppEvent::Action(AppAction::SetSidebarOverlayIntent(overlay_intent)) => {
@@ -836,12 +887,15 @@ impl App {
                 Vec::new()
             }
             AppEvent::Action(AppAction::Home(HomeAction::OpenSelected)) => {
-                let Some(repository) = self
-                    .home
-                    .selected
-                    .and_then(|selected| self.home.repositories.get(selected))
-                    .cloned()
-                else {
+                let Some(selected) = self.home.selected else {
+                    return Vec::new();
+                };
+                if self.home.repository_availability.get(selected)
+                    != Some(&RepositoryAvailability::Available)
+                {
+                    return Vec::new();
+                }
+                let Some(repository) = self.home.repositories.get(selected).cloned() else {
                     return Vec::new();
                 };
                 let note = self.home.pending_note.clone();
@@ -857,12 +911,15 @@ impl App {
                 if self.pending_mutation.is_some() {
                     return Vec::new();
                 }
-                let Some(repository) = self
-                    .home
-                    .selected
-                    .and_then(|selected| self.home.repositories.get(selected))
-                    .cloned()
-                else {
+                let Some(selected) = self.home.selected else {
+                    return Vec::new();
+                };
+                if self.home.repository_availability.get(selected)
+                    != Some(&RepositoryAvailability::Available)
+                {
+                    return Vec::new();
+                }
+                let Some(repository) = self.home.repositories.get(selected).cloned() else {
                     return Vec::new();
                 };
                 let Some(note) = self.home.pending_note.clone() else {
@@ -881,6 +938,161 @@ impl App {
                     },
                 );
                 effects
+            }
+            AppEvent::Action(AppAction::Home(HomeAction::CreateRepository)) => {
+                self.repository_form = RepositoryFormState::default();
+                self.dialog = Some(Dialog::RepositoryForm {
+                    kind: RepositoryActionKind::Create,
+                    repository_id: None,
+                });
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::Home(HomeAction::RegisterRepository)) => {
+                self.repository_form = RepositoryFormState::default();
+                self.dialog = Some(Dialog::RepositoryForm {
+                    kind: RepositoryActionKind::Register,
+                    repository_id: None,
+                });
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::Home(HomeAction::RenameSelected)) => {
+                let Some(repository) = self
+                    .home
+                    .selected
+                    .and_then(|selected| self.home.repositories.get(selected))
+                    .cloned()
+                else {
+                    return Vec::new();
+                };
+                self.repository_form = RepositoryFormState {
+                    name: repository.name,
+                    path: String::new(),
+                    active_field: RepositoryFormField::Name,
+                };
+                self.dialog = Some(Dialog::RepositoryForm {
+                    kind: RepositoryActionKind::Rename,
+                    repository_id: Some(repository.id),
+                });
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::Home(HomeAction::SetDefaultSelected)) => {
+                let Some(selected) = self.home.selected else {
+                    return Vec::new();
+                };
+                if self.home.repository_availability.get(selected)
+                    != Some(&RepositoryAvailability::Available)
+                {
+                    return Vec::new();
+                }
+                let Some(repository) = self.home.repositories.get(selected) else {
+                    return Vec::new();
+                };
+                self.dialog = Some(Dialog::ConfirmSetDefault {
+                    repository_id: repository.id,
+                    name: repository.name.clone(),
+                });
+                Vec::new()
+            }
+            AppEvent::Action(AppAction::Home(HomeAction::UnregisterSelected)) => {
+                let Some(repository) = self
+                    .home
+                    .selected
+                    .and_then(|selected| self.home.repositories.get(selected))
+                else {
+                    return Vec::new();
+                };
+                self.dialog = Some(Dialog::ConfirmUnregister {
+                    repository_id: repository.id,
+                    name: repository.name.clone(),
+                });
+                Vec::new()
+            }
+        }
+    }
+
+    fn submit_repository_form(&mut self) -> Vec<AppEffect> {
+        let Some(Dialog::RepositoryForm {
+            kind,
+            repository_id,
+        }) = self.dialog.clone()
+        else {
+            return Vec::new();
+        };
+        let name = self.repository_form.name.trim().to_owned();
+        if name.is_empty() {
+            return Vec::new();
+        }
+        let path = self.repository_form.path.trim();
+        let effect = match kind {
+            RepositoryActionKind::Create if !path.is_empty() => AppEffect::CreateRepository {
+                name,
+                path: path.into(),
+            },
+            RepositoryActionKind::Register if !path.is_empty() => AppEffect::RegisterRepository {
+                name,
+                path: path.into(),
+            },
+            RepositoryActionKind::Rename => {
+                let Some(repository_id) = repository_id.filter(|repository_id| {
+                    self.home
+                        .repositories
+                        .iter()
+                        .any(|repository| repository.id == *repository_id)
+                }) else {
+                    return Vec::new();
+                };
+                AppEffect::RenameRepository {
+                    repository_id,
+                    name,
+                }
+            }
+            RepositoryActionKind::Create | RepositoryActionKind::Register => return Vec::new(),
+        };
+        self.dialog = None;
+        self.repository_form = RepositoryFormState::default();
+        vec![effect]
+    }
+
+    fn confirm_repository_action(&mut self) -> Vec<AppEffect> {
+        match self.dialog.take() {
+            Some(Dialog::ConfirmSetDefault { repository_id, .. }) => {
+                let Some((selected, repository)) = self
+                    .home
+                    .repositories
+                    .iter()
+                    .enumerate()
+                    .find(|(_, repository)| repository.id == repository_id)
+                    .map(|(index, repository)| (index, repository.clone()))
+                else {
+                    return Vec::new();
+                };
+                if self.home.repository_availability.get(selected)
+                    != Some(&RepositoryAvailability::Available)
+                {
+                    return Vec::new();
+                }
+                self.home.default_repository = Some(repository_id);
+                let mut effects = vec![AppEffect::SetDefaultRepository { repository_id }];
+                if let Some(note) = self.home.pending_note.clone() {
+                    self.home.default_choice = DefaultChoiceState::ResumingPendingNote {
+                        repository_id,
+                        note: note.clone(),
+                    };
+                    effects.extend(self.request_open_workspace(repository, Some(note)));
+                }
+                effects
+            }
+            Some(Dialog::ConfirmUnregister { repository_id, .. }) => self
+                .home
+                .repositories
+                .iter()
+                .any(|repository| repository.id == repository_id)
+                .then_some(AppEffect::UnregisterRepository { repository_id })
+                .into_iter()
+                .collect(),
+            dialog => {
+                self.dialog = dialog;
+                Vec::new()
             }
         }
     }

@@ -3,7 +3,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::{
     app::{
         App, AppAction, AppEvent, ConflictChoice, Dialog, DirtyChoice, Focus, GlobalAction,
-        HomeAction, OverlayState, Screen, TreeAction,
+        HomeAction, OverlayState, RepositoryActionKind, RepositoryFormField, Screen, TreeAction,
     },
     editor::{EditorCommand, Motion},
 };
@@ -12,14 +12,14 @@ pub fn map_key(app: &App, key: KeyEvent) -> Option<AppEvent> {
     if key.kind == KeyEventKind::Release {
         return None;
     }
+    if app.dialog.is_some() {
+        return dialog_event(app, key);
+    }
+    if !matches!(app.overlay, OverlayState::None) {
+        return overlay_action(app, key).map(AppEvent::Action);
+    }
     if let Some(action) = global_action(key) {
         return Some(AppEvent::Action(AppAction::Global(action)));
-    }
-    if let Some(event) = dialog_event(app, key) {
-        return Some(event);
-    }
-    if let Some(action) = overlay_action(app, key) {
-        return Some(AppEvent::Action(action));
     }
     match &app.screen {
         Screen::Home => home_action(key).map(|action| AppEvent::Action(AppAction::Home(action))),
@@ -109,6 +109,56 @@ fn dialog_event(app: &App, key: KeyEvent) -> Option<AppEvent> {
             }
             _ => None,
         },
+        Dialog::RepositoryForm { kind, .. } => match key.code {
+            KeyCode::Esc => Some(AppEvent::Action(AppAction::Dismiss)),
+            KeyCode::Tab
+                if matches!(
+                    kind,
+                    RepositoryActionKind::Create | RepositoryActionKind::Register
+                ) =>
+            {
+                Some(AppEvent::Action(AppAction::ToggleRepositoryFormField))
+            }
+            KeyCode::Enter
+                if !app.repository_form.name.trim().is_empty()
+                    && (*kind == RepositoryActionKind::Rename
+                        || !app.repository_form.path.trim().is_empty()) =>
+            {
+                Some(AppEvent::Action(AppAction::SubmitRepositoryForm))
+            }
+            KeyCode::Backspace => {
+                let mut input = match app.repository_form.active_field {
+                    RepositoryFormField::Name => app.repository_form.name.clone(),
+                    RepositoryFormField::Path => app.repository_form.path.clone(),
+                };
+                input.pop();
+                Some(AppEvent::Action(AppAction::SetRepositoryFormInput(input)))
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                let mut input = match app.repository_form.active_field {
+                    RepositoryFormField::Name => app.repository_form.name.clone(),
+                    RepositoryFormField::Path => app.repository_form.path.clone(),
+                };
+                input.push(character);
+                Some(AppEvent::Action(AppAction::SetRepositoryFormInput(input)))
+            }
+            _ => None,
+        },
+        Dialog::ConfirmSetDefault { .. } | Dialog::ConfirmUnregister { .. } => {
+            match plain_character(key) {
+                Some('y') => Some(AppEvent::Action(AppAction::ConfirmRepositoryAction)),
+                Some('n') => Some(AppEvent::Action(AppAction::Dismiss)),
+                _ if key.code == KeyCode::Enter => {
+                    Some(AppEvent::Action(AppAction::ConfirmRepositoryAction))
+                }
+                _ if key.code == KeyCode::Esc => Some(AppEvent::Action(AppAction::Dismiss)),
+                _ => None,
+            }
+        }
         Dialog::Failure { .. } => (key.code == KeyCode::Esc || key.code == KeyCode::Enter)
             .then_some(AppEvent::Action(AppAction::Dismiss)),
     }
@@ -161,8 +211,20 @@ fn home_action(key: KeyEvent) -> Option<HomeAction> {
         KeyCode::Up => Some(HomeAction::Up),
         KeyCode::Down => Some(HomeAction::Down),
         KeyCode::Enter => Some(HomeAction::OpenSelected),
+        KeyCode::Char('c') if key.modifiers == KeyModifiers::NONE => {
+            Some(HomeAction::CreateRepository)
+        }
+        KeyCode::Char('a') if key.modifiers == KeyModifiers::NONE => {
+            Some(HomeAction::RegisterRepository)
+        }
+        KeyCode::Char('R') | KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            Some(HomeAction::RenameSelected)
+        }
         KeyCode::Char('d') if key.modifiers == KeyModifiers::NONE => {
-            Some(HomeAction::ChooseSelectedAsDefault)
+            Some(HomeAction::SetDefaultSelected)
+        }
+        KeyCode::Char('u') if key.modifiers == KeyModifiers::NONE => {
+            Some(HomeAction::UnregisterSelected)
         }
         _ => None,
     }

@@ -7,8 +7,11 @@ use ratatui::{
 };
 
 use crate::app::{
-    App, Dialog, ExternalConflict, FailureKind, FileActionKind, OverlayState, Screen,
+    App, Dialog, ExternalConflict, FailureKind, FileActionKind, OverlayState, RepositoryActionKind,
+    RepositoryFormField, Screen,
 };
+
+use super::selection_viewport;
 
 pub(super) fn render(frame: &mut Frame<'_>, app: &App) {
     if let Some(dialog) = &app.dialog {
@@ -120,6 +123,64 @@ fn render_dialog(frame: &mut Frame<'_>, app: &App, dialog: &Dialog) {
             8,
             Color::Red,
         ),
+        Dialog::RepositoryForm { kind, .. } => {
+            let (title, path_label) = match kind {
+                RepositoryActionKind::Create => (" Create repository ", "Directory to create"),
+                RepositoryActionKind::Register => (" Register repository ", "Existing directory"),
+                RepositoryActionKind::Rename => (" Rename registration ", ""),
+            };
+            let name_marker = if app.repository_form.active_field == RepositoryFormField::Name {
+                ">"
+            } else {
+                " "
+            };
+            let mut lines = vec![Line::from(format!(
+                "{name_marker} Repository name: {}_",
+                app.repository_form.name
+            ))];
+            if *kind != RepositoryActionKind::Rename {
+                let path_marker = if app.repository_form.active_field == RepositoryFormField::Path {
+                    ">"
+                } else {
+                    " "
+                };
+                lines.push(Line::from(format!(
+                    "{path_marker} {path_label}: {}_",
+                    app.repository_form.path
+                )));
+                lines.push(Line::from(""));
+                lines.push(choice_line(&[
+                    ("Tab", "Switch field"),
+                    ("Enter", "Submit"),
+                    ("Esc", "Cancel"),
+                ]));
+            } else {
+                lines.push(Line::from(""));
+                lines.push(choice_line(&[("Enter", "Rename"), ("Esc", "Cancel")]));
+            }
+            (title, lines, 8, Color::Cyan)
+        }
+        Dialog::ConfirmSetDefault { name, .. } => (
+            " Set default repository ",
+            vec![
+                Line::from(format!("Use {name} as the default repository?")),
+                Line::from(""),
+                choice_line(&[("y/Enter", "Set default"), ("n/Esc", "Cancel")]),
+            ],
+            7,
+            Color::Yellow,
+        ),
+        Dialog::ConfirmUnregister { name, .. } => (
+            " Unregister repository ",
+            vec![
+                Line::from(format!("Remove {name} from Carnet's registrations?")),
+                Line::from("The repository directory and its files will not be deleted."),
+                Line::from(""),
+                choice_line(&[("y/Enter", "Unregister"), ("n/Esc", "Cancel")]),
+            ],
+            8,
+            Color::Red,
+        ),
     };
     let area = centered(frame.area(), 66, height);
     frame.render_widget(Clear, area);
@@ -173,14 +234,23 @@ fn render_quick_open(frame: &mut Frame<'_>, app: &App, query: &str, selected: Op
             Style::default().fg(Color::DarkGray),
         )));
     } else {
-        items.extend(files.into_iter().enumerate().map(|(index, path)| {
-            let style = if selected.unwrap_or(0) == index {
-                Style::default().fg(Color::Black).bg(Color::Cyan)
-            } else {
-                Style::default()
-            };
-            ListItem::new(Line::styled(format!("{}", path.display()), style))
-        }));
+        let candidate_capacity = usize::from(area.height.saturating_sub(2)).saturating_sub(3);
+        let viewport = selection_viewport(files.len(), selected, candidate_capacity);
+        items.extend(
+            files
+                .iter()
+                .enumerate()
+                .skip(viewport.start)
+                .take(viewport.len())
+                .map(|(index, path)| {
+                    let style = if selected.unwrap_or(0) == index {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else {
+                        Style::default()
+                    };
+                    ListItem::new(Line::styled(format!("{}", path.display()), style))
+                }),
+        );
     }
     items.push(ListItem::new(Line::default()));
     items.push(ListItem::new(choice_line(&[

@@ -281,11 +281,31 @@ fn load_failures_return_typed_runtime_events_and_leave_app_state_retryable() {
 
 #[test]
 fn executor_returns_outer_runtime_effects_intact() {
-    let error = EffectExecutor::default()
-        .execute(AppEffect::ReadClipboard)
-        .unwrap_err();
+    let executor = EffectExecutor::default();
+    let error = executor.execute(AppEffect::ReadClipboard).unwrap_err();
 
     assert!(matches!(error.into_effect(), AppEffect::ReadClipboard));
+
+    let error = executor
+        .execute(AppEffect::CreateRepository {
+            name: "new".into(),
+            path: PathBuf::from("/repos/new"),
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error.into_effect(),
+        AppEffect::CreateRepository { name, path }
+            if name == "new" && path.as_path() == std::path::Path::new("/repos/new")
+    ));
+
+    let repository_id = Uuid::from_u128(123);
+    let error = executor
+        .execute(AppEffect::UnregisterRepository { repository_id })
+        .unwrap_err();
+    assert!(matches!(
+        error.into_effect(),
+        AppEffect::UnregisterRepository { repository_id: actual } if actual == repository_id
+    ));
 }
 
 #[test]

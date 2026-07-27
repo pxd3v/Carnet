@@ -7,9 +7,10 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::COMFORTABLE_WIDTH;
+use super::{COMFORTABLE_WIDTH, selection_viewport};
 use crate::{
     app::{App, CommitStatus, Focus, PendingMutationKind, WorkspaceState},
     editor::{Editor, HighlightLanguage, HighlightSpan, HighlightStyle},
@@ -72,9 +73,16 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &App, workspace: &WorkspaceStat
 
 fn render_tree(frame: &mut Frame<'_>, area: Rect, workspace: &WorkspaceState, overlay: bool) {
     let entries = visible_tree(&workspace.tree, &workspace.expanded);
+    let viewport = selection_viewport(
+        entries.len(),
+        workspace.tree_selection,
+        usize::from(area.height.saturating_sub(2)),
+    );
     let items = entries
         .iter()
         .enumerate()
+        .skip(viewport.start)
+        .take(viewport.len())
         .map(|(index, entry)| {
             let selected = workspace.tree_selection == Some(index);
             let icon = match entry.kind {
@@ -147,6 +155,11 @@ fn render_editor(frame: &mut Frame<'_>, area: Rect, workspace: &WorkspaceState) 
         .as_ref()
         .map(|editor| editor_scroll(editor, inner))
         .unwrap_or_default();
+    let highlights = workspace
+        .editor
+        .as_ref()
+        .map(Editor::render_highlighted_spans)
+        .unwrap_or_default();
     let content = workspace.editor.as_ref().map_or_else(
         || {
             Text::from(vec![
@@ -157,7 +170,7 @@ fn render_editor(frame: &mut Frame<'_>, area: Rect, workspace: &WorkspaceState) 
                 )),
             ])
         },
-        editor_text,
+        |editor| editor_text(editor, &highlights),
     );
     frame.render_widget(Paragraph::new(content).scroll(scroll).block(block), area);
 }
@@ -173,22 +186,31 @@ fn editor_scroll(editor: &Editor, viewport: Rect) -> (u16, u16) {
         .rsplit_once('\n')
         .map_or(before.as_str(), |(_, tail)| tail);
     let cursor_column = UnicodeWidthStr::width(cursor_column);
+    let cursor_grapheme = text.chars().skip(editor.cursor()).collect::<String>();
+    let cursor_width = cursor_grapheme
+        .graphemes(true)
+        .next()
+        .filter(|grapheme| *grapheme != "\n")
+        .map(UnicodeWidthStr::width)
+        .unwrap_or(1)
+        .max(1);
     let vertical = cursor_line.saturating_sub(viewport.height.saturating_sub(1).into());
-    let horizontal = cursor_column.saturating_sub(viewport.width.saturating_sub(1).into());
+    let horizontal = (cursor_column + cursor_width).saturating_sub(viewport.width.into());
     (
         u16::try_from(vertical).unwrap_or(u16::MAX),
         u16::try_from(horizontal).unwrap_or(u16::MAX),
     )
 }
 
-fn editor_text(editor: &Editor) -> Text<'static> {
+fn editor_text(editor: &Editor, highlights: &[HighlightSpan]) -> Text<'static> {
     let text = editor.text();
-    let highlights = editor.render_highlighted_spans();
     let selection = editor.selection();
     let cursor = editor.cursor();
     let mut lines = vec![Line::default()];
-    for (index, character) in text.chars().enumerate() {
-        if character == '\n' {
+    let mut index = 0;
+    for grapheme in text.graphemes(true) {
+        let grapheme_len = grapheme.chars().count();
+        if grapheme == "\n" {
             if cursor == index {
                 lines
                     .last_mut()
@@ -196,29 +218,37 @@ fn editor_text(editor: &Editor) -> Text<'static> {
                     .push_span(cursor_span(" "));
             }
             lines.push(Line::default());
+            index += grapheme_len;
             continue;
         }
-        let mut style = highlight_style_at(&highlights, index);
-        if selection
-            .as_ref()
-            .is_some_and(|selection| selection.contains(&index))
-        {
-            style = style.bg(Color::Blue).fg(Color::White);
-        }
-        let span = if cursor == index {
-            Span::styled(character.to_string(), cursor_style(style))
-        } else {
-            Span::styled(character.to_string(), style)
-        };
+        let style = grapheme_style(highlights, selection.as_ref(), cursor, index);
+        let span = Span::styled(grapheme.to_owned(), style);
         lines.last_mut().expect("one line").push_span(span);
+        index += grapheme_len;
     }
-    if cursor == text.chars().count() {
+    if cursor == index {
         lines
             .last_mut()
             .expect("one line")
             .push_span(cursor_span(" "));
     }
     Text::from(lines)
+}
+
+fn grapheme_style(
+    highlights: &[HighlightSpan],
+    selection: Option<&std::ops::Range<usize>>,
+    cursor: usize,
+    index: usize,
+) -> Style {
+    let mut style = highlight_style_at(highlights, index);
+    if selection.is_some_and(|selection| selection.contains(&index)) {
+        style = style.bg(Color::Blue).fg(Color::White);
+    }
+    if cursor == index {
+        style = cursor_style(style);
+    }
+    style
 }
 
 fn highlight_style_at(spans: &[HighlightSpan], index: usize) -> Style {

@@ -24,6 +24,6 @@ expression: terminal.backend()
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "┌ Repository actions ──────────────────────────────────────────────────────────┐"
-"│ [c] Create  [a] Register  [Enter] Open  [r] Rename  [d] Default              │"
-"│ [u] Unregister  [Ctrl+Q] Quit                                                │"
+"│ [c] Create  [a] Register  [Enter] Open available  [R] Rename                 │"
+"│ [d] Default  [u] Unregister  [Ctrl+Q] Quit                                   │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
