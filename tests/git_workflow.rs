@@ -385,6 +385,103 @@ fn rejects_a_git_repo_from_another_workspace_before_mutating_or_staging_either_r
     assert_eq!(repo_b.subjects(), vec!["carnet: create b.md"]);
 }
 
+#[cfg(unix)]
+#[test]
+fn moved_root_save_and_commit_retry_never_touch_an_external_replacement_repository() {
+    let sandbox = tempdir().unwrap();
+    let registered = sandbox.path().join("registered");
+    let moved = sandbox.path().join("moved");
+    fs::create_dir(&registered).unwrap();
+    let git = GitRepo::initialize(&registered).unwrap();
+    configure_identity(&registered);
+    fs::write(registered.join("note.md"), "before\n").unwrap();
+    git.commit_all(CommitIntent::Create(PathBuf::from("note.md")))
+        .unwrap();
+    let workspace = open_workspace(&registered);
+    let note = workspace
+        .load_note(&workspace.resolve_note(Path::new("note.md")).unwrap())
+        .unwrap();
+
+    fs::rename(&registered, &moved).unwrap();
+    let replacement_git = GitRepo::initialize(&registered).unwrap();
+    configure_identity(&registered);
+    fs::write(registered.join("external.md"), "external\n").unwrap();
+    replacement_git
+        .commit_all(CommitIntent::Create(PathBuf::from("external.md")))
+        .unwrap();
+    let replacement_head = git_output(&registered, ["rev-parse", "HEAD"]);
+    let replacement_index = git_output(&registered, ["status", "--porcelain=v1"]);
+
+    let outcome = apply_and_commit(
+        &workspace,
+        &git,
+        FileOperation::Save {
+            note,
+            content: "saved in opened root\n".into(),
+            overwrite: false,
+        },
+        CommitIntent::Update(PathBuf::from("note.md")),
+    )
+    .unwrap();
+
+    let MutationCommitOutcome::SavedCommitFailed { error, .. } = outcome else {
+        panic!("root replacement must be a typed Git failure");
+    };
+    assert!(error.to_string().contains("opened repository root changed"));
+    let retry = git
+        .commit_all(CommitIntent::Update(PathBuf::from("note.md")))
+        .unwrap_err();
+    assert!(retry.to_string().contains("opened repository root changed"));
+    assert_eq!(
+        fs::read_to_string(moved.join("note.md")).unwrap(),
+        "saved in opened root\n"
+    );
+    assert_eq!(
+        fs::read_to_string(registered.join("external.md")).unwrap(),
+        "external\n"
+    );
+    assert!(!registered.join("note.md").exists());
+    assert_eq!(
+        git_output(&registered, ["rev-parse", "HEAD"]),
+        replacement_head
+    );
+    assert_eq!(
+        git_output(&registered, ["status", "--porcelain=v1"]),
+        replacement_index
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_mismatch_uses_directory_identity_even_when_stale_paths_are_equal() {
+    let sandbox = tempdir().unwrap();
+    let registered = sandbox.path().join("registered");
+    let moved = sandbox.path().join("moved");
+    fs::create_dir(&registered).unwrap();
+    let git = GitRepo::initialize(&registered).unwrap();
+    let opened_workspace = open_workspace(&registered);
+    fs::rename(&registered, &moved).unwrap();
+    fs::create_dir(&registered).unwrap();
+    let replacement_workspace = open_workspace(&registered);
+
+    let result = apply_and_commit(
+        &opened_workspace,
+        &git,
+        FileOperation::CreateFile {
+            workspace: replacement_workspace,
+            path: PathBuf::from("wrong.md"),
+        },
+        CommitIntent::Create(PathBuf::from("wrong.md")),
+    );
+
+    assert!(matches!(
+        result,
+        Err(MutationCommitError::WorkspaceMismatch)
+    ));
+    assert!(!registered.join("wrong.md").exists());
+    assert!(!moved.join("wrong.md").exists());
+}
+
 struct TestRepo {
     _temp: TempDir,
     git: GitRepo,
@@ -397,6 +494,30 @@ fn open_workspace(root: &Path) -> Workspace {
         path: fs::canonicalize(root).unwrap(),
     })
     .unwrap()
+}
+
+fn configure_identity(root: &Path) {
+    for args in [
+        ["config", "user.name", "Carnet Test"],
+        ["config", "user.email", "carnet@example.test"],
+    ] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    }
+}
+
+fn git_output<const N: usize>(root: &Path, args: [&str; N]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap()
 }
 
 impl TestRepo {

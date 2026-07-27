@@ -51,6 +51,8 @@ pub enum PathError {
     DirectoryTarget { path: PathBuf },
     #[error("note path contains a symbolic link: {path}")]
     Symlink { path: PathBuf },
+    #[error("opened repository root changed: {path}")]
+    RootChanged { path: PathBuf },
     #[error("could not inspect path {path}: {source}")]
     Io {
         path: PathBuf,
@@ -67,6 +69,7 @@ impl PathError {
             Self::GitMetadata { .. } => "git",
             Self::DirectoryTarget { .. } => "directory",
             Self::Symlink { .. } => "symlink",
+            Self::RootChanged { .. } => "root-changed",
             Self::Io { .. } => "io",
         }
     }
@@ -156,17 +159,4 @@ pub(crate) fn resolve_target(
         }
     };
     Ok(ResolvedPath { relative, metadata })
-}
-
-pub(crate) fn validate_root(root: &Path) -> Result<(), PathError> {
-    let canonical_root = std::fs::canonicalize(root).map_err(|source| PathError::Io {
-        path: root.to_path_buf(),
-        source,
-    })?;
-    if canonical_root != root {
-        return Err(PathError::Symlink {
-            path: root.to_path_buf(),
-        });
-    }
-    Ok(())
 }

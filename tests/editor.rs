@@ -3,7 +3,8 @@ use std::{fs, path::Path};
 use carnet::{
     catalog::RepoEntry,
     editor::{
-        Clipboard, ClipboardError, Editor, EditorCommand, EditorOutcome, HighlightLanguage, Motion,
+        Clipboard, ClipboardError, EDITOR_HISTORY_ENTRY_LIMIT, Editor, EditorCommand,
+        EditorOutcome, HighlightLanguage, Motion,
     },
     workspace::{FileError, FileOperation, FileOutcome, NewlineStyle, Workspace},
 };
@@ -147,6 +148,30 @@ fn edits_are_single_transactions_and_new_edits_clear_redo() {
     editor.apply(EditorCommand::Insert("x".into()));
     assert_eq!(editor.apply(EditorCommand::Redo), EditorOutcome::NoChange);
     assert_eq!(editor.text(), "axbase");
+}
+
+#[test]
+fn large_note_history_stays_bounded_and_full_undo_reaches_the_loaded_baseline() {
+    let baseline = "x".repeat(32 * 1024);
+    let mut editor = editor_from("large-history.md", &baseline);
+    let edit_count = EDITOR_HISTORY_ENTRY_LIMIT * 2;
+
+    for _ in 0..edit_count {
+        assert_eq!(
+            editor.apply(EditorCommand::Insert("y".into())),
+            EditorOutcome::Changed
+        );
+        assert!(editor.history_entry_count() <= EDITOR_HISTORY_ENTRY_LIMIT);
+    }
+
+    let mut undo_count = 0;
+    while editor.apply(EditorCommand::Undo) == EditorOutcome::Changed {
+        undo_count += 1;
+        assert!(editor.history_entry_count() <= EDITOR_HISTORY_ENTRY_LIMIT);
+    }
+    assert!(undo_count <= EDITOR_HISTORY_ENTRY_LIMIT);
+    assert_eq!(editor.text(), baseline);
+    assert!(!editor.is_dirty());
 }
 
 #[test]

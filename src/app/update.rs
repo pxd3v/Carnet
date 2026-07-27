@@ -1,3 +1,6 @@
+mod mutation;
+mod requests;
+
 use uuid::Uuid;
 
 use crate::{
@@ -13,8 +16,7 @@ use super::{
     PendingCatalogOperation, PendingClipboardRead, PendingDefaultIntent, PendingFileMutation,
     PendingIntent, PendingMutation, PendingMutationKind, PendingRequest, PendingSave,
     RepositoryActionKind, RepositoryAvailability, RepositoryFormField, RepositoryFormState,
-    RequestId, RuntimeFailure, SavedCommitFailure, Screen, UnresolvedFailure, WorkspaceOrigin,
-    WorkspaceState,
+    RequestId, RuntimeFailure, Screen, UnresolvedFailure, WorkspaceOrigin, WorkspaceState,
 };
 use super::{RuntimeError, RuntimeOperation};
 
@@ -310,48 +312,7 @@ impl App {
                 repository_id,
                 operation,
                 error,
-            } => {
-                let current = match operation {
-                    RuntimeOperation::OpenWorkspace => matches!(
-                        self.pending_request,
-                        Some(PendingRequest::OpenWorkspace {
-                            request_id: pending_request,
-                            repository_id: pending_repository,
-                            ..
-                        }) if pending_request == request_id && pending_repository == repository_id
-                    ),
-                    RuntimeOperation::LoadNote => matches!(
-                        self.pending_request,
-                        Some(PendingRequest::LoadNote {
-                            request_id: pending_request,
-                            repository_id: pending_repository,
-                            ..
-                        }) if pending_request == request_id && pending_repository == repository_id
-                    ),
-                    RuntimeOperation::Mutation | RuntimeOperation::RefreshTree => false,
-                };
-                if !current {
-                    return Vec::new();
-                }
-                self.pending_request = None;
-                if operation == RuntimeOperation::OpenWorkspace
-                    && let Some(availability) = self
-                        .home
-                        .repositories
-                        .iter()
-                        .position(|repository| repository.id == repository_id)
-                        .and_then(|index| self.home.repository_availability.get_mut(index))
-                {
-                    *availability = RepositoryAvailability::MissingOrInvalid;
-                }
-                self.record_request_failure(
-                    request_id,
-                    repository_id,
-                    operation,
-                    error.to_string(),
-                );
-                Vec::new()
-            }
+            } => self.handle_runtime_failed(request_id, repository_id, operation, error),
             AppEvent::Action(AppAction::ConfirmDelete) => self.confirm_delete(),
             AppEvent::Action(AppAction::SubmitFileAction(path)) => self.submit_file_action(path),
             AppEvent::Action(AppAction::Dismiss) => {
@@ -477,106 +438,26 @@ impl App {
                 repository_id,
                 repository_root,
                 error,
-            } => {
-                if !self.mutation_result_is_current(mutation_id, repository_id, &repository_root) {
-                    return Vec::new();
-                }
-                self.pending_mutation = None;
-                let kind = match error {
-                    MutationCommitError::File(_) => FailureKind::Write,
-                    MutationCommitError::WorkspaceMismatch
-                    | MutationCommitError::RepositoryMismatch
-                    | MutationCommitError::Runtime { .. } => FailureKind::Runtime,
-                };
-                let message = error.to_string();
-                let failure = UnresolvedFailure {
-                    kind,
-                    message: message.clone(),
-                };
-                match kind {
-                    FailureKind::Write => self.failures.write = Some(failure),
-                    FailureKind::Runtime => self.record_unscoped_runtime_failure(
-                        repository_id,
-                        RuntimeOperation::Mutation,
-                        message.clone(),
-                    ),
-                    FailureKind::Git => unreachable!("mutation errors are write or runtime"),
-                }
-                self.status.commit = CommitStatus::Idle;
-                self.status.message = Some(message.clone());
-                self.dialog = Some(Dialog::Failure { kind, message });
-                Vec::new()
-            }
+            } => self.handle_mutation_failed(mutation_id, repository_id, repository_root, error),
             AppEvent::CommitRetryFailed {
                 mutation_id,
                 repository_id,
                 repository_root,
                 error,
             } => {
-                if !self.mutation_result_is_current(mutation_id, repository_id, &repository_root)
-                    || !matches!(
-                        self.pending_mutation.as_ref().map(|pending| pending.kind),
-                        Some(PendingMutationKind::RetryCommit)
-                    )
-                {
-                    return Vec::new();
-                }
-                let pending = self.pending_mutation.take().expect("checked above");
-                let message = error.to_string();
-                self.saved_commit_failure = Some(SavedCommitFailure {
-                    repository_id,
-                    intent: pending.intent,
-                    message: message.clone(),
-                });
-                self.failures.git = Some(UnresolvedFailure {
-                    kind: FailureKind::Git,
-                    message: message.clone(),
-                });
-                self.status.commit = CommitStatus::SavedCommitFailed {
-                    message: message.clone(),
-                };
-                self.status.message = Some(message.clone());
-                self.dialog = Some(Dialog::SavedCommitFailed { message });
-                Vec::new()
+                self.handle_commit_retry_failed(mutation_id, repository_id, repository_root, error)
             }
             AppEvent::CommitRetryApplied {
                 mutation_id,
                 repository_id,
                 repository_root,
                 commit,
-            } => {
-                if !self.mutation_result_is_current(mutation_id, repository_id, &repository_root)
-                    || !matches!(
-                        self.pending_mutation.as_ref().map(|pending| pending.kind),
-                        Some(PendingMutationKind::RetryCommit)
-                    )
-                {
-                    return Vec::new();
-                }
-                self.pending_mutation = None;
-                self.saved_commit_failure = None;
-                self.failures.git = None;
-                if matches!(self.dialog, Some(Dialog::SavedCommitFailed { .. })) {
-                    self.dialog = None;
-                }
-                self.status.commit = match commit {
-                    CommitOutcome::Committed { revision } => CommitStatus::Committed { revision },
-                    CommitOutcome::NoChanges => CommitStatus::NoChanges,
-                };
-                self.status.message = None;
-                if self.pending_intent.is_some()
-                    && self
-                        .workspace_editor_mut()
-                        .is_some_and(|editor| editor.is_dirty())
-                {
-                    self.dialog = Some(Dialog::DirtyNavigation);
-                    return Vec::new();
-                }
-                let intent = self.pending_intent.take();
-                intent
-                    .map(|intent| self.perform_intent(intent))
-                    .unwrap_or_default()
-            }
+            } => self.handle_commit_retry_applied(
+                mutation_id,
+                repository_id,
+                repository_root,
+                commit,
+            ),
             AppEvent::MutationSavedCommitFailed {
                 mutation_id,
                 repository_id,
@@ -584,70 +465,19 @@ impl App {
                 file,
                 error,
                 tree,
-            } => {
-                if !self.mutation_result_is_current(mutation_id, repository_id, &repository_root) {
-                    return Vec::new();
-                }
-                let pending = self.pending_mutation.take().expect("checked above");
-                if let Screen::Workspace(workspace) = &mut self.screen {
-                    if let Ok(tree) = tree {
-                        workspace.tree = tree;
-                    }
-                    if let (Some(editor), FileOutcome::Saved(note)) = (&mut workspace.editor, file)
-                    {
-                        editor.accept_saved(note);
-                    }
-                }
-                let message = error.to_string();
-                self.saved_commit_failure = Some(SavedCommitFailure {
-                    repository_id,
-                    intent: pending.intent,
-                    message: message.clone(),
-                });
-                self.failures.git = Some(UnresolvedFailure {
-                    kind: FailureKind::Git,
-                    message: message.clone(),
-                });
-                self.status.commit = CommitStatus::SavedCommitFailed {
-                    message: message.clone(),
-                };
-                self.status.message = Some(message.clone());
-                self.dialog = Some(Dialog::SavedCommitFailed { message });
-                Vec::new()
-            }
+            } => self.handle_saved_commit_failed(
+                mutation_id,
+                repository_id,
+                repository_root,
+                file,
+                error,
+                tree,
+            ),
             AppEvent::NoteLoaded {
                 request_id,
                 repository_id,
                 note,
-            } => {
-                if !matches!(
-                    self.pending_request.as_ref(),
-                    Some(PendingRequest::LoadNote {
-                        request_id: pending_request,
-                        repository_id: pending_repository,
-                        path,
-                    }) if *pending_request == request_id
-                        && *pending_repository == repository_id
-                        && path.as_path() == note.path().relative()
-                ) {
-                    return Vec::new();
-                }
-                let editor_instance_id = self.next_editor_instance_id();
-                let Screen::Workspace(workspace) = &mut self.screen else {
-                    return Vec::new();
-                };
-                if workspace.repository.id != repository_id {
-                    return Vec::new();
-                }
-                workspace.current_note = Some(note.path().relative().to_path_buf());
-                workspace.editor = Some(Editor::from_loaded(note));
-                workspace.editor_instance_id = Some(editor_instance_id);
-                workspace.editor_revision = 0;
-                self.pending_clipboard_read = None;
-                self.pending_request = None;
-                self.clear_runtime_failures(repository_id, RuntimeOperation::LoadNote);
-                Vec::new()
-            }
+            } => self.handle_note_loaded(request_id, repository_id, note),
             AppEvent::ConflictChoice(ConflictChoice::Reload) => {
                 if !matches!(self.dialog, Some(Dialog::ExternalConflict(_))) {
                     return Vec::new();
@@ -691,9 +521,7 @@ impl App {
                 self.dialog = Some(Dialog::ExternalConflict(conflict));
                 Vec::new()
             }
-            AppEvent::Action(AppAction::Global(GlobalAction::Quit)) => self.update(
-                AppEvent::Action(AppAction::Navigate(NavigationAction::Quit)),
-            ),
+            AppEvent::Action(AppAction::Global(GlobalAction::Quit)) => self.request_quit(),
             AppEvent::MutationApplied {
                 mutation_id,
                 repository_id,
@@ -701,100 +529,14 @@ impl App {
                 file,
                 commit,
                 tree,
-            } => {
-                if !self.mutation_result_is_current(mutation_id, repository_id, &repository_root) {
-                    return Vec::new();
-                }
-                let pending = self.pending_mutation.take().expect("checked above");
-                let tree_error = tree.as_ref().err().map(ToString::to_string);
-                let tree_refreshed = tree.is_ok();
-                let mut editor_has_newer_edits = false;
-                let mut note_to_load = None;
-                if let Screen::Workspace(workspace) = &mut self.screen {
-                    if let Ok(tree) = tree {
-                        workspace.tree = tree;
-                    }
-                    match file {
-                        FileOutcome::Saved(note) => {
-                            if let Some(editor) = &mut workspace.editor {
-                                editor_has_newer_edits = pending
-                                    .save
-                                    .as_ref()
-                                    .is_some_and(|save| editor.text() != save.snapshot);
-                                editor.accept_saved(note);
-                                editor_has_newer_edits |= editor.is_dirty();
-                            }
-                            clamp_tree_selection(workspace);
-                        }
-                        FileOutcome::CreatedFile(note) => {
-                            let path = note.relative().to_path_buf();
-                            select_tree_path(workspace, &path);
-                            note_to_load = Some(path);
-                        }
-                        FileOutcome::CreatedFolder(path) => {
-                            select_tree_path(workspace, &path);
-                        }
-                        FileOutcome::Renamed { from, to } | FileOutcome::Moved { from, to } => {
-                            select_tree_path(workspace, &to);
-                            if let Some(rebased) = workspace
-                                .current_note
-                                .as_deref()
-                                .and_then(|path| rebase_path(path, &from, &to))
-                            {
-                                note_to_load = Some(rebased);
-                            }
-                        }
-                        FileOutcome::Deleted(path) => {
-                            if workspace
-                                .current_note
-                                .as_deref()
-                                .is_some_and(|note| note.starts_with(&path))
-                            {
-                                workspace.current_note = None;
-                                workspace.editor = None;
-                                workspace.editor_instance_id = None;
-                                workspace.editor_revision = 0;
-                            }
-                            clamp_tree_selection(workspace);
-                        }
-                    }
-                }
-                self.status.commit = match commit {
-                    CommitOutcome::Committed { revision } => CommitStatus::Committed { revision },
-                    CommitOutcome::NoChanges => CommitStatus::NoChanges,
-                };
-                self.failures.write = None;
-                self.clear_runtime_failures(repository_id, RuntimeOperation::Mutation);
-                if tree_refreshed {
-                    self.clear_runtime_failures(repository_id, RuntimeOperation::RefreshTree);
-                }
-                self.status.message = None;
-                if let Some(message) = tree_error {
-                    self.record_unscoped_runtime_failure(
-                        repository_id,
-                        RuntimeOperation::RefreshTree,
-                        message,
-                    );
-                    return note_to_load
-                        .map(|path| self.request_note_load(path))
-                        .unwrap_or_default();
-                }
-                if matches!(pending.kind, PendingMutationKind::Save { .. }) {
-                    if editor_has_newer_edits {
-                        if self.pending_intent.is_some() {
-                            self.dialog = Some(Dialog::DirtyNavigation);
-                        }
-                        return Vec::new();
-                    }
-                    let intent = self.pending_intent.take();
-                    return intent
-                        .map(|intent| self.perform_intent(intent))
-                        .unwrap_or_default();
-                }
-                note_to_load
-                    .map(|path| self.request_note_load(path))
-                    .unwrap_or_default()
-            }
+            } => self.handle_mutation_applied(
+                mutation_id,
+                repository_id,
+                repository_root,
+                file,
+                commit,
+                tree,
+            ),
             AppEvent::DirtyChoice(DirtyChoice::Save) => {
                 if !matches!(self.dialog, Some(Dialog::DirtyNavigation))
                     || self.pending_mutation.is_some()
@@ -829,6 +571,9 @@ impl App {
             }
             AppEvent::Action(AppAction::Navigate(target)) => {
                 self.pending_clipboard_read = None;
+                if target == NavigationAction::Quit {
+                    return self.request_quit();
+                }
                 if self.pending_mutation.is_some()
                     || matches!(self.pending_intent, Some(PendingIntent::Mutation(_)))
                 {
@@ -968,73 +713,7 @@ impl App {
                 tree,
                 note,
             } => {
-                let current_registration = self
-                    .home
-                    .repositories
-                    .iter()
-                    .find(|repository| **repository == *workspace.repo());
-                let request_matches = matches!(
-                    &self.pending_request,
-                    Some(PendingRequest::OpenWorkspace {
-                        request_id: pending_request,
-                        repository_id: pending_repository,
-                        repository: pending_registration,
-                    }) if *pending_request == request_id
-                        && *pending_repository == repository_id
-                        && pending_registration == workspace.repo()
-                );
-                if workspace.repo().id != repository_id
-                    || current_registration.is_none()
-                    || !request_matches
-                {
-                    return Vec::new();
-                }
-                self.pending_request = None;
-                if let Some(availability) = self
-                    .home
-                    .repositories
-                    .iter()
-                    .position(|repository| repository.id == repository_id)
-                    .and_then(|index| self.home.repository_availability.get_mut(index))
-                {
-                    *availability = RepositoryAvailability::Available;
-                }
-                let current_note = note
-                    .as_ref()
-                    .map(|note| note.path().relative().to_path_buf());
-                let editor_instance_id = note.as_ref().map(|_| self.next_editor_instance_id());
-                let opened_origin = WorkspaceOrigin {
-                    repository_id,
-                    repository_root: workspace.root().to_path_buf(),
-                };
-                let repository = workspace.repo().clone();
-                let tree_selection = (!tree.is_empty()).then_some(0);
-                self.screen = Screen::Workspace(Box::new(WorkspaceState {
-                    repository,
-                    workspace,
-                    git,
-                    tree,
-                    current_note,
-                    editor: note.map(Editor::from_loaded),
-                    editor_instance_id,
-                    editor_revision: 0,
-                    focus: Focus::Editor,
-                    tree_selection,
-                    expanded: Default::default(),
-                }));
-                self.invalidate_workspace_bound_state(&opened_origin);
-                if matches!(
-                    self.home.default_choice,
-                    DefaultChoiceState::ResumingPendingNote {
-                        repository_id: expected,
-                        ..
-                    } if expected == repository_id
-                ) {
-                    self.home.pending_note = None;
-                    self.home.default_choice = DefaultChoiceState::NotNeeded;
-                }
-                self.clear_runtime_failures(repository_id, RuntimeOperation::OpenWorkspace);
-                Vec::new()
+                self.handle_workspace_opened(request_id, repository_id, workspace, git, tree, note)
             }
             AppEvent::Action(AppAction::Home(HomeAction::Down)) => {
                 if let Some(selected) = self.home.selected {
@@ -1576,6 +1255,27 @@ impl App {
                 }
             }
         }
+    }
+
+    fn request_quit(&mut self) -> Vec<AppEffect> {
+        self.pending_clipboard_read = None;
+        let dirty_text = self
+            .workspace_editor_mut()
+            .filter(|editor| editor.is_dirty())
+            .map(|editor| editor.text());
+        if let Some(dirty_text) = dirty_text {
+            let pending_save_covers_dirty_text = self
+                .pending_mutation
+                .as_ref()
+                .and_then(|pending| pending.save.as_ref())
+                .is_some_and(|save| save.snapshot == dirty_text);
+            if !pending_save_covers_dirty_text {
+                self.pending_intent = Some(PendingIntent::Navigation(NavigationAction::Quit));
+                self.dialog = Some(Dialog::DirtyNavigation);
+                return Vec::new();
+            }
+        }
+        self.perform_navigation(NavigationAction::Quit)
     }
 
     fn discard_editor_changes(&mut self) {

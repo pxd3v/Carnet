@@ -10,7 +10,7 @@ use cap_std::fs::{Dir, File, OpenOptions, Permissions};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::{NotePath, PathError, Workspace, paths};
+use super::{DirectoryIdentity, NotePath, PathError, Workspace, paths};
 
 #[cfg(test)]
 thread_local! {
@@ -94,6 +94,17 @@ impl FileOperation {
             | Self::Rename { workspace, .. }
             | Self::Move { workspace, .. }
             | Self::Delete { workspace, .. } => workspace.root(),
+        }
+    }
+
+    pub(crate) fn workspace_identity(&self) -> Option<DirectoryIdentity> {
+        match self {
+            Self::Save { note, .. } => DirectoryIdentity::from_dir(note.path.directory()).ok(),
+            Self::CreateFile { workspace, .. }
+            | Self::CreateFolder { workspace, .. }
+            | Self::Rename { workspace, .. }
+            | Self::Move { workspace, .. }
+            | Self::Delete { workspace, .. } => Some(workspace.identity()),
         }
     }
 }

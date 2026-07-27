@@ -7,6 +7,8 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(unix)]
+use cap_std::fs::MetadataExt;
 use cap_std::{ambient_authority, fs::Dir};
 use thiserror::Error;
 
@@ -33,6 +35,39 @@ pub struct Workspace {
     repo: RepoEntry,
     root: PathBuf,
     directory: Arc<Dir>,
+    identity: DirectoryIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DirectoryIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl DirectoryIdentity {
+    pub(crate) fn from_dir(directory: &Dir) -> std::io::Result<Self> {
+        let metadata = directory.dir_metadata()?;
+        Ok(Self {
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })
+    }
+
+    pub(crate) fn from_ambient(path: &Path) -> std::io::Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })
+    }
 }
 
 impl Workspace {
@@ -53,10 +88,16 @@ impl Workspace {
                     source,
                 }
             })?;
+        let identity =
+            DirectoryIdentity::from_dir(&directory).map_err(|source| WorkspaceError::Io {
+                path: canonical.clone(),
+                source,
+            })?;
         Ok(Workspace {
             repo,
             root: canonical,
             directory: Arc::new(directory),
+            identity,
         })
     }
 
@@ -69,7 +110,8 @@ impl Workspace {
     }
 
     pub fn tree(&self) -> Result<Vec<TreeEntry>, FileError> {
-        tree::build(&self.root)
+        self.ensure_registered_root()?;
+        tree::build(&self.directory, &self.root)
     }
 
     pub fn apply(operation: FileOperation) -> Result<FileOutcome, FileError> {
@@ -86,5 +128,27 @@ impl Workspace {
 
     pub(crate) fn directory(&self) -> &Arc<Dir> {
         &self.directory
+    }
+
+    pub(crate) fn identity(&self) -> DirectoryIdentity {
+        self.identity
+    }
+
+    fn ensure_registered_root(&self) -> Result<(), PathError> {
+        match DirectoryIdentity::from_ambient(&self.root) {
+            Ok(identity) if identity == self.identity => Ok(()),
+            Ok(_) => Err(PathError::RootChanged {
+                path: self.root.clone(),
+            }),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                Err(PathError::RootChanged {
+                    path: self.root.clone(),
+                })
+            }
+            Err(source) => Err(PathError::Io {
+                path: self.root.clone(),
+                source,
+            }),
+        }
     }
 }

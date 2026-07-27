@@ -3,6 +3,7 @@ use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+#[derive(Clone)]
 pub(super) struct TextBuffer {
     rope: Rope,
 }
@@ -26,7 +27,14 @@ impl TextBuffer {
         self.rope.slice(range).to_string()
     }
 
-    pub(super) fn replace(&mut self, range: Range<usize>, text: &str) {
+    pub(super) fn replace(&mut self, range: Range<usize>, text: &str) -> bool {
+        if range.is_empty() {
+            if text.is_empty() {
+                return false;
+            }
+        } else if self.rope.slice(range.clone()).chars().eq(text.chars()) {
+            return false;
+        }
         let start = range.start;
         if !range.is_empty() {
             self.rope.remove(range);
@@ -34,6 +42,7 @@ impl TextBuffer {
         if !text.is_empty() {
             self.rope.insert(start, text);
         }
+        true
     }
 
     pub(super) fn previous_grapheme_boundary(&self, char_index: usize) -> usize {

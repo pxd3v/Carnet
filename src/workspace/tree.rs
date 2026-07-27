@@ -1,11 +1,15 @@
 use std::{
     ffi::OsStr,
-    fs,
+    io::Read,
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
-use super::{FileError, files::bytes_are_text, paths};
+use cap_std::fs::Dir;
+use std::os::unix::process::CommandExt;
+
+use super::{FileError, files::bytes_are_text};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum TreeEntryKind {
@@ -40,47 +44,61 @@ impl TreeEntry {
     }
 }
 
-pub(crate) fn build(root: &Path) -> Result<Vec<TreeEntry>, FileError> {
-    paths::validate_root(root)?;
-    build_directory(root, root)
+pub(crate) fn build(directory: &Dir, root: &Path) -> Result<Vec<TreeEntry>, FileError> {
+    build_directory(directory, directory, root, Path::new("."))
 }
 
-fn build_directory(root: &Path, directory: &Path) -> Result<Vec<TreeEntry>, FileError> {
+fn build_directory(
+    root_directory: &Dir,
+    directory: &Dir,
+    root: &Path,
+    relative_directory: &Path,
+) -> Result<Vec<TreeEntry>, FileError> {
     let mut entries = Vec::new();
-    let iterator = fs::read_dir(directory).map_err(|source| FileError::Io {
-        path: directory.to_path_buf(),
+    let iterator = directory.entries().map_err(|source| FileError::Io {
+        path: relative_directory.to_path_buf(),
         source,
     })?;
     for entry in iterator {
         let entry = entry.map_err(|source| FileError::Io {
-            path: directory.to_path_buf(),
+            path: relative_directory.to_path_buf(),
             source,
         })?;
         if entry.file_name() == OsStr::new(".git") {
             continue;
         }
-        let absolute = entry.path();
-        let relative = absolute
-            .strip_prefix(root)
-            .expect("directory traversal begins at root")
+        let relative = relative_directory.join(entry.file_name());
+        let relative = relative
+            .strip_prefix(".")
+            .unwrap_or(&relative)
             .to_path_buf();
-        if is_ignored(root, &relative)? {
+        if is_ignored(root_directory, root, &relative)? {
             continue;
         }
-        let metadata = fs::symlink_metadata(&absolute).map_err(|source| FileError::Io {
-            path: absolute.clone(),
+        let file_type = entry.file_type().map_err(|source| FileError::Io {
+            path: relative.clone(),
             source,
         })?;
-        let (kind, enabled, children) = if metadata.file_type().is_symlink() {
+        let (kind, enabled, children) = if file_type.is_symlink() {
             (TreeEntryKind::Symlink, false, Vec::new())
-        } else if metadata.is_dir() {
+        } else if file_type.is_dir() {
+            let child = entry.open_dir().map_err(|source| FileError::Io {
+                path: relative.clone(),
+                source,
+            })?;
             (
                 TreeEntryKind::Directory,
                 true,
-                build_directory(root, &absolute)?,
+                build_directory(root_directory, &child, root, &relative)?,
             )
         } else {
-            let enabled = fs::read(&absolute)
+            let enabled = entry
+                .open()
+                .and_then(|mut file| {
+                    let mut bytes = Vec::new();
+                    file.read_to_end(&mut bytes)?;
+                    Ok(bytes)
+                })
                 .map(|bytes| bytes_are_text(&bytes))
                 .unwrap_or(false);
             (TreeEntryKind::File, enabled, Vec::new())
@@ -100,17 +118,28 @@ fn build_directory(root: &Path, directory: &Path) -> Result<Vec<TreeEntry>, File
     Ok(entries)
 }
 
-fn is_ignored(root: &Path, relative: &Path) -> Result<bool, FileError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
+fn is_ignored(directory: &Dir, root: &Path, relative: &Path) -> Result<bool, FileError> {
+    let directory_fd = directory.as_raw_fd();
+    let mut command = Command::new("git");
+    command
         .args(["check-ignore", "-q", "--"])
         .arg(relative)
-        .output()
-        .map_err(|source| FileError::Io {
-            path: root.to_path_buf(),
-            source,
-        })?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: this closure calls only async-signal-safe fchdir with a raw fd
+    // kept alive by `directory` until after the child has spawned.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fchdir(directory_fd) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().map_err(|source| FileError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
     match output.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),

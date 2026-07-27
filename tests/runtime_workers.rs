@@ -1,11 +1,14 @@
 use std::{
+    collections::HashSet,
     fs,
     path::Path,
+    process::{Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
     },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -15,7 +18,7 @@ use carnet::{
     cli::{Cli, route},
     editor::{Clipboard, ClipboardError, EditorCommand, Motion},
     git::GitRepo,
-    runtime::{Runtime, WorkerHook, WorkerKind},
+    runtime::{EFFECT_WORKER_COUNT, Runtime, WorkerHook, WorkerKind},
     ui::{map_key, render},
 };
 use clap::Parser;
@@ -400,6 +403,98 @@ fn quit_with_no_active_work_finalizes_immediately_and_cleanly() {
     assert!(started.elapsed() < Duration::from_millis(200));
 }
 
+#[cfg(unix)]
+#[test]
+fn quit_cancels_and_reaps_a_permanently_blocked_git_hook() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = tempdir().unwrap();
+    let root = sandbox.path().join("notes");
+    let git = GitRepo::initialize(&root).unwrap();
+    configure_identity(&root);
+    fs::write(root.join("note.md"), "base").unwrap();
+    git.commit_all(carnet::git::CommitIntent::Create("note.md".into()))
+        .unwrap();
+    let hook = root.join(".git/hooks/pre-commit");
+    fs::write(
+        &hook,
+        "#!/bin/sh\necho $$ > hook-pid\ntouch hook-entered\nwhile :; do :; done\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut catalog = Catalog::create_at(sandbox.path().join("catalog.toml"));
+    catalog.register("notes", &root).unwrap();
+    let launch = route(
+        Cli::try_parse_from(["carnet", "note.md"]).unwrap(),
+        &catalog,
+    )
+    .unwrap();
+    let mut runtime = Runtime::with_clipboard(catalog, launch, Box::new(FailingClipboard));
+    runtime.wait_for_idle(Duration::from_secs(3)).unwrap();
+    runtime.dispatch(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "changed ".into(),
+    ))));
+    runtime.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::Save)));
+    wait_for_path(
+        &root.join("hook-entered"),
+        Instant::now() + Duration::from_secs(3),
+    );
+    let hook_pid = fs::read_to_string(root.join("hook-pid"))
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    let mut cleanup = ProcessCleanup(Some(hook_pid));
+
+    runtime.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::Quit)));
+    assert!(runtime.app().quit.requested);
+    let started = Instant::now();
+    let status = runtime.finalize_quit(Duration::from_millis(100));
+
+    assert_eq!(status, AppExitStatus::Failure);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    wait_for_process_exit(hook_pid, Instant::now() + Duration::from_secs(1));
+    cleanup.0 = None;
+    assert_eq!(
+        fs::read_to_string(root.join("note.md")).unwrap(),
+        "changed base"
+    );
+}
+
+#[test]
+fn blocked_load_burst_uses_bounded_workers_and_executes_only_the_latest_queued_read() {
+    let sandbox = tempdir().unwrap();
+    let root = sandbox.path().join("notes");
+    GitRepo::initialize(&root).unwrap();
+    for (name, text) in [("a.md", "A"), ("b.md", "B"), ("c.md", "C"), ("d.md", "D")] {
+        fs::write(root.join(name), text).unwrap();
+    }
+    let mut catalog = Catalog::create_at(sandbox.path().join("catalog.toml"));
+    catalog.register("notes", &root).unwrap();
+    let launch = route(Cli::try_parse_from(["carnet", "a.md"]).unwrap(), &catalog).unwrap();
+    let (hook, entered, release) = RecordingBlockingHook::new();
+    let mut runtime =
+        Runtime::with_clipboard_and_hook(catalog, launch, Box::new(FailingClipboard), hook.clone());
+    runtime.wait_for_idle(Duration::from_secs(3)).unwrap();
+
+    runtime.dispatch(AppEvent::Action(AppAction::Navigate(
+        NavigationAction::Note("b.md".into()),
+    )));
+    entered.recv_timeout(Duration::from_secs(1)).unwrap();
+    for name in ["c.md", "a.md", "d.md"] {
+        runtime.dispatch(AppEvent::Action(AppAction::Navigate(
+            NavigationAction::Note(name.into()),
+        )));
+    }
+    release.send(()).unwrap();
+    runtime.wait_for_idle(Duration::from_secs(3)).unwrap();
+
+    assert_eq!(editor_text(&runtime), "D");
+    let names = hook.worker_names.lock().unwrap();
+    assert_eq!(names.len(), 2, "active oldest plus newest queued load only");
+    assert!(names.iter().collect::<HashSet<_>>().len() <= EFFECT_WORKER_COUNT);
+}
+
 #[test]
 fn panicking_mutation_worker_clears_pending_and_preserves_disk() {
     let sandbox = tempdir().unwrap();
@@ -565,6 +660,46 @@ struct BlockingHook {
     fired: AtomicBool,
 }
 
+struct RecordingBlockingHook {
+    entered: SyncSender<()>,
+    release: Mutex<Receiver<()>>,
+    blocked: AtomicBool,
+    worker_names: Mutex<Vec<String>>,
+}
+
+impl RecordingBlockingHook {
+    fn new() -> (Arc<Self>, Receiver<()>, SyncSender<()>) {
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        (
+            Arc::new(Self {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+                blocked: AtomicBool::new(false),
+                worker_names: Mutex::new(Vec::new()),
+            }),
+            entered_rx,
+            release_tx,
+        )
+    }
+}
+
+impl WorkerHook for RecordingBlockingHook {
+    fn before_execute(&self, kind: WorkerKind) {
+        if kind != WorkerKind::LoadNote {
+            return;
+        }
+        self.worker_names
+            .lock()
+            .unwrap()
+            .push(thread::current().name().unwrap_or("unnamed").to_owned());
+        if !self.blocked.swap(true, Ordering::SeqCst) {
+            self.entered.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+        }
+    }
+}
+
 impl BlockingHook {
     fn new(target: WorkerKind) -> (Arc<Self>, Receiver<()>, SyncSender<()>) {
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
@@ -714,5 +849,66 @@ impl Clipboard for FixedClipboard {
 
     fn write_text(&mut self, _text: &str) -> Result<(), ClipboardError> {
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+struct ProcessCleanup(Option<u32>);
+
+#[cfg(unix)]
+impl Drop for ProcessCleanup {
+    fn drop(&mut self) {
+        let Some(pid) = self.0 else {
+            return;
+        };
+        let _ = Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_process_exit(pid: u32, deadline: Instant) {
+    while Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        assert!(
+            Instant::now() < deadline,
+            "process {pid} survived cancellation"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_path(path: &Path, deadline: Instant) {
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(unix)]
+fn configure_identity(root: &Path) {
+    for args in [
+        ["config", "user.name", "Carnet Test"],
+        ["config", "user.email", "carnet@example.test"],
+    ] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
     }
 }

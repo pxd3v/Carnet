@@ -1,11 +1,11 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     ffi::OsString,
     fs, io,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Component, Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     },
     thread::{self, JoinHandle},
@@ -30,7 +30,7 @@ use crate::{
     catalog::{Catalog, CatalogError},
     cli::Launch,
     editor::{Clipboard, ClipboardError, SystemClipboard},
-    git::{GitError, GitRepo, MutationCommitError},
+    git::{GitCancellation, GitError, GitRepo, MutationCommitError},
     ui,
 };
 
@@ -146,6 +146,8 @@ pub enum RuntimeDriverError {
 }
 
 pub const DEFAULT_QUIT_GRACE: Duration = Duration::from_secs(2);
+pub const EFFECT_WORKER_COUNT: usize = 2;
+const GIT_CANCELLATION_REAP_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct JobId(u64);
@@ -303,10 +305,41 @@ impl WorkerOrigin {
     }
 }
 
+fn git_cancellation(effect: &AppEffect) -> Option<GitCancellation> {
+    match effect {
+        AppEffect::ApplyAndCommit { git, .. } | AppEffect::RetryCommit { git, .. } => {
+            Some(git.cancellation())
+        }
+        _ => None,
+    }
+}
+
 struct WorkerJob {
     id: JobId,
     origin: WorkerOrigin,
     effect: AppEffect,
+}
+
+impl WorkerJob {
+    fn repository_root(&self) -> Option<&Path> {
+        match &self.effect {
+            AppEffect::OpenWorkspace { repository, .. } => Some(&repository.path),
+            AppEffect::LoadNote { workspace, .. } | AppEffect::ApplyAndCommit { workspace, .. } => {
+                Some(workspace.root())
+            }
+            AppEffect::RetryCommit {
+                repository_root, ..
+            } => Some(repository_root),
+            _ => None,
+        }
+    }
+
+    fn is_coalescible_read(&self) -> bool {
+        matches!(
+            self.effect,
+            AppEffect::OpenWorkspace { .. } | AppEffect::LoadNote { .. }
+        )
+    }
 }
 
 struct WorkerCompletion {
@@ -315,13 +348,91 @@ struct WorkerCompletion {
     panicked: bool,
 }
 
+#[derive(Default)]
+struct EffectQueueState {
+    pending: VecDeque<WorkerJob>,
+    active_roots: HashSet<PathBuf>,
+    closed: bool,
+}
+
+#[derive(Default)]
+struct EffectQueue {
+    state: Mutex<EffectQueueState>,
+    ready: Condvar,
+}
+
+impl EffectQueue {
+    fn enqueue(&self, job: WorkerJob) -> Vec<JobId> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut superseded = Vec::new();
+        if job.is_coalescible_read() {
+            let root = job
+                .repository_root()
+                .expect("filesystem reads have a repository root")
+                .to_path_buf();
+            state.pending.retain(|pending| {
+                let remove = pending.is_coalescible_read()
+                    && pending.repository_root().is_some_and(|other| other == root);
+                if remove {
+                    superseded.push(pending.id);
+                }
+                !remove
+            });
+        }
+        state.pending.push_back(job);
+        self.ready.notify_all();
+        superseded
+    }
+
+    fn take(&self) -> Option<(WorkerJob, PathBuf)> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        loop {
+            if let Some(index) = state.pending.iter().position(|job| {
+                job.repository_root()
+                    .is_some_and(|root| !state.active_roots.contains(root))
+            }) {
+                let job = state
+                    .pending
+                    .remove(index)
+                    .expect("position came from queue");
+                let root = job
+                    .repository_root()
+                    .expect("effect workers receive repository jobs")
+                    .to_path_buf();
+                state.active_roots.insert(root.clone());
+                return Some((job, root));
+            }
+            if state.closed {
+                return None;
+            }
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    fn finish(&self, root: &Path) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.active_roots.remove(root);
+        self.ready.notify_all();
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.closed = true;
+        self.ready.notify_all();
+    }
+}
+
 pub struct Runtime {
     app: App,
     catalog_tx: Option<Sender<WorkerJob>>,
     clipboard_tx: Option<Sender<WorkerJob>>,
-    effect_tx: Option<Sender<WorkerJob>>,
+    effect_queue: Arc<EffectQueue>,
     completion_rx: Receiver<WorkerCompletion>,
     jobs: HashMap<JobId, WorkerOrigin>,
+    job_cancellations: HashMap<JobId, GitCancellation>,
     next_job_id: u64,
     service_handles: Vec<JoinHandle<()>>,
 }
@@ -347,7 +458,7 @@ impl Runtime {
         let (completion_tx, completion_rx) = mpsc::channel();
         let (catalog_tx, catalog_rx) = mpsc::channel();
         let (clipboard_tx, clipboard_rx) = mpsc::channel();
-        let (effect_tx, effect_rx) = mpsc::channel();
+        let effect_queue = Arc::new(EffectQueue::default());
 
         let catalog_handle = spawn_catalog_service(
             catalog,
@@ -362,18 +473,25 @@ impl Runtime {
             completion_tx.clone(),
             Arc::clone(&hook),
         );
-        let effect_handle =
-            spawn_effect_service(executor, effect_rx, completion_tx, Arc::clone(&hook));
+        let effect_handles = spawn_effect_workers(
+            executor,
+            Arc::clone(&effect_queue),
+            completion_tx,
+            Arc::clone(&hook),
+        );
+        let mut service_handles = vec![catalog_handle, clipboard_handle];
+        service_handles.extend(effect_handles);
 
         let mut runtime = Self {
             app,
             catalog_tx: Some(catalog_tx),
             clipboard_tx: Some(clipboard_tx),
-            effect_tx: Some(effect_tx),
+            effect_queue,
             completion_rx,
             jobs: HashMap::new(),
+            job_cancellations: HashMap::new(),
             next_job_id: 1,
-            service_handles: vec![catalog_handle, clipboard_handle, effect_handle],
+            service_handles,
         };
         if let Some(navigation) = initial_navigation {
             runtime.dispatch(AppEvent::Action(AppAction::Navigate(navigation)));
@@ -433,15 +551,19 @@ impl Runtime {
         }
 
         let deadline = Instant::now() + grace;
+        let mut shutdown_deadline = deadline;
+        let mut timed_out = false;
         while !self.jobs.is_empty() {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 self.record_finalization_timeout();
+                timed_out = true;
                 break;
             };
             match self.completion_rx.recv_timeout(remaining) {
                 Ok(completion) => self.finish_job(completion),
                 Err(RecvTimeoutError::Timeout) => {
                     self.record_finalization_timeout();
+                    timed_out = true;
                     break;
                 }
                 Err(RecvTimeoutError::Disconnected) => {
@@ -454,42 +576,71 @@ impl Runtime {
             }
         }
 
+        if timed_out && self.cancel_active_git_jobs() {
+            shutdown_deadline = Instant::now() + GIT_CANCELLATION_REAP_GRACE;
+            while !self.jobs.is_empty() {
+                let Some(remaining) = shutdown_deadline.checked_duration_since(Instant::now())
+                else {
+                    break;
+                };
+                match self.completion_rx.recv_timeout(remaining) {
+                    Ok(completion) => self.finish_job(completion),
+                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        }
+
         self.dispatch(AppEvent::QuitFinalized);
         self.close_service_inputs();
-        self.join_services_until(deadline);
+        self.join_services_until(shutdown_deadline);
         self.app.quit.final_status.unwrap_or(AppExitStatus::Failure)
     }
 
     fn queue_effect(&mut self, effect: AppEffect) {
         let origin = WorkerOrigin::for_effect(&effect);
+        let cancellation = git_cancellation(&effect);
         let id = JobId(self.next_job_id);
         self.next_job_id = self
             .next_job_id
             .checked_add(1)
             .expect("runtime job ID overflow");
         self.jobs.insert(id, origin.clone());
+        if let Some(cancellation) = cancellation {
+            self.job_cancellations.insert(id, cancellation);
+        }
         let job = WorkerJob { id, origin, effect };
         let send_result = match job.origin.kind() {
-            WorkerKind::Catalog => self.catalog_tx.as_ref().expect("catalog service").send(job),
+            WorkerKind::Catalog => {
+                Some(self.catalog_tx.as_ref().expect("catalog service").send(job))
+            }
             WorkerKind::ClipboardRead | WorkerKind::ClipboardWrite => self
                 .clipboard_tx
                 .as_ref()
                 .expect("clipboard service")
-                .send(job),
+                .send(job)
+                .into(),
             WorkerKind::OpenWorkspace
             | WorkerKind::LoadNote
             | WorkerKind::Mutation
-            | WorkerKind::RetryCommit => self.effect_tx.as_ref().expect("effect service").send(job),
+            | WorkerKind::RetryCommit => {
+                for superseded in self.effect_queue.enqueue(job) {
+                    self.jobs.remove(&superseded);
+                    self.job_cancellations.remove(&superseded);
+                }
+                None
+            }
         };
-        if let Err(error) = send_result {
+        if let Some(Err(error)) = send_result {
             let job = error.0;
             self.jobs.remove(&job.id);
+            self.job_cancellations.remove(&job.id);
             self.dispatch(job.origin.panic_event());
         }
     }
 
     fn finish_job(&mut self, completion: WorkerCompletion) {
         if self.jobs.remove(&completion.id).is_some() {
+            self.job_cancellations.remove(&completion.id);
             if completion.panicked && self.app.quit.requested {
                 self.dispatch(AppEvent::RuntimeFinalizationFailed {
                     message: "background worker panicked during quit finalization".into(),
@@ -505,10 +656,17 @@ impl Runtime {
         });
     }
 
+    fn cancel_active_git_jobs(&self) -> bool {
+        for cancellation in self.job_cancellations.values() {
+            cancellation.cancel();
+        }
+        !self.job_cancellations.is_empty()
+    }
+
     fn close_service_inputs(&mut self) {
         self.catalog_tx.take();
         self.clipboard_tx.take();
-        self.effect_tx.take();
+        self.effect_queue.close();
     }
 
     fn join_services_until(&mut self, deadline: Instant) {
@@ -616,49 +774,36 @@ fn spawn_clipboard_service(
         .expect("could not start clipboard worker")
 }
 
-fn spawn_effect_service(
+fn spawn_effect_workers(
     executor: EffectExecutor,
-    receiver: Receiver<WorkerJob>,
+    queue: Arc<EffectQueue>,
     completion: Sender<WorkerCompletion>,
     hook: Arc<dyn WorkerHook>,
-) -> JoinHandle<()> {
-    thread::Builder::new()
-        .name("carnet-effect-dispatch".into())
-        .spawn(move || {
-            let mut handles = Vec::new();
-            for job in receiver {
-                join_finished(&mut handles);
-                let completion = completion.clone();
-                let worker_completion = completion.clone();
-                let executor = executor.clone();
-                let hook = Arc::clone(&hook);
-                let failed_id = job.id;
-                let failed_event = job.origin.panic_event();
-                match thread::Builder::new()
-                    .name(format!("carnet-{:?}-{}", job.origin.kind(), job.id.0))
-                    .spawn(move || {
+) -> Vec<JoinHandle<()>> {
+    (0..EFFECT_WORKER_COUNT)
+        .map(|index| {
+            let executor = executor.clone();
+            let queue = Arc::clone(&queue);
+            let completion = completion.clone();
+            let hook = Arc::clone(&hook);
+            thread::Builder::new()
+                .name(format!("carnet-effect-{index}"))
+                .spawn(move || {
+                    while let Some((job, root)) = queue.take() {
                         let completion_message = supervise(job, &hook, |effect| {
                             executor
                                 .execute(effect)
                                 .unwrap_or_else(|error| error.into_effect().into_failure_event())
                         });
-                        let _ = worker_completion.send(completion_message);
-                    }) {
-                    Ok(handle) => handles.push(handle),
-                    Err(_) => {
-                        let _ = completion.send(WorkerCompletion {
-                            id: failed_id,
-                            event: failed_event,
-                            panicked: true,
-                        });
+                        queue.finish(&root);
+                        if completion.send(completion_message).is_err() {
+                            break;
+                        }
                     }
-                }
-            }
-            for handle in handles {
-                let _ = handle.join();
-            }
+                })
+                .expect("could not start effect worker")
         })
-        .expect("could not start effect dispatcher")
+        .collect()
 }
 
 fn join_finished(handles: &mut Vec<JoinHandle<()>>) {

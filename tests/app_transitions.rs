@@ -1,4 +1,7 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use carnet::{
     app::{
@@ -90,7 +93,7 @@ fn global_save_emits_one_apply_and_commit_effect_and_suppresses_competing_saves(
 }
 
 #[test]
-fn pending_mutations_reject_clean_navigation_quit_and_dirty_discard() {
+fn pending_mutations_allow_safe_quit_but_reject_other_navigation_and_dirty_discard() {
     use carnet::app::{
         DirtyChoice, FileActionKind, Focus, GlobalAction, NavigationAction, PendingMutationKind,
         TreeAction,
@@ -115,7 +118,7 @@ fn pending_mutations_reject_clean_navigation_quit_and_dirty_discard() {
             .update(AppEvent::Action(AppAction::Global(GlobalAction::Quit)))
             .is_empty()
     );
-    assert!(!create_app.quit.requested);
+    assert!(create_app.quit.requested);
     create_app.update(AppEvent::Action(AppAction::Navigate(
         NavigationAction::Home,
     )));
@@ -138,6 +141,35 @@ fn pending_mutations_reject_clean_navigation_quit_and_dirty_discard() {
     assert!(!save_app.quit.requested);
     assert_eq!(
         save_app.pending_intent,
+        Some(PendingIntent::Navigation(NavigationAction::Quit))
+    );
+}
+
+#[test]
+fn quit_during_a_pending_save_is_immediate_only_without_newer_dirty_content() {
+    use carnet::app::{Dialog, GlobalAction, NavigationAction};
+
+    let (_sandbox, mut clean_snapshot) = app_with_note(170, "note.md", "base");
+    clean_snapshot.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "saved ".into(),
+    ))));
+    clean_snapshot.update(AppEvent::Action(AppAction::Global(GlobalAction::Save)));
+    clean_snapshot.update(AppEvent::Action(AppAction::Global(GlobalAction::Quit)));
+    assert!(clean_snapshot.quit.requested);
+
+    let (_sandbox, mut newer_edits) = app_with_note(171, "note.md", "base");
+    newer_edits.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "saved ".into(),
+    ))));
+    newer_edits.update(AppEvent::Action(AppAction::Global(GlobalAction::Save)));
+    newer_edits.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "newer ".into(),
+    ))));
+    newer_edits.update(AppEvent::Action(AppAction::Global(GlobalAction::Quit)));
+    assert!(!newer_edits.quit.requested);
+    assert_eq!(newer_edits.dialog, Some(Dialog::DirtyNavigation));
+    assert_eq!(
+        newer_edits.pending_intent,
         Some(PendingIntent::Navigation(NavigationAction::Quit))
     );
 }
@@ -2225,6 +2257,111 @@ fn mutation_results_reconcile_active_note_and_tree_selection() {
     assert_eq!(workspace.current_note, None);
     assert!(workspace.editor.is_none());
     assert_eq!(workspace.tree_selection, None);
+}
+
+#[test]
+fn saved_commit_failures_reconcile_every_successful_filesystem_outcome() {
+    use carnet::{
+        app::{Dialog, Focus, GlobalAction, TreeAction},
+        git::GitError,
+    };
+
+    fn fail(app: &mut App, effect: AppEffect) -> Vec<AppEffect> {
+        let (mutation_id, repository_id, repository_root, file, tree) =
+            apply_mutation_effect(effect);
+        app.update(AppEvent::MutationSavedCommitFailed {
+            mutation_id,
+            repository_id,
+            repository_root,
+            file,
+            error: GitError::CommandFailed {
+                operation: "commit",
+                status: Some(1),
+                stderr: "rejected".into(),
+            },
+            tree,
+        })
+    }
+
+    let (_sandbox, mut created) = empty_app(176);
+    created.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    created.update(AppEvent::Action(AppAction::Tree(TreeAction::NewFile)));
+    let effect = created
+        .update(AppEvent::Action(AppAction::SubmitFileAction(
+            PathBuf::from("created.md"),
+        )))
+        .pop()
+        .unwrap();
+    let follow_up = fail(&mut created, effect);
+    assert!(matches!(
+        follow_up.as_slice(),
+        [AppEffect::LoadNote { path, .. }] if path == Path::new("created.md")
+    ));
+    assert!(matches!(
+        created.dialog,
+        Some(Dialog::SavedCommitFailed { .. })
+    ));
+
+    let (_sandbox, mut folder) = empty_app(177);
+    folder.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    folder.update(AppEvent::Action(AppAction::Tree(TreeAction::NewFolder)));
+    let effect = folder
+        .update(AppEvent::Action(AppAction::SubmitFileAction(
+            PathBuf::from("folder"),
+        )))
+        .pop()
+        .unwrap();
+    assert!(fail(&mut folder, effect).is_empty());
+    assert_eq!(selected_tree_path(&folder), Some(PathBuf::from("folder")));
+
+    for (id, action, destination) in [
+        (178, TreeAction::Rename, PathBuf::from("renamed")),
+        (179, TreeAction::Move, PathBuf::from("archive/folder")),
+    ] {
+        let (sandbox, mut app) = app_with_note(id, "folder/sub/note.md", "base");
+        if action == TreeAction::Move {
+            fs::create_dir(sandbox.path().join("archive")).unwrap();
+        }
+        app.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+        app.update(AppEvent::Action(AppAction::Tree(action)));
+        let effect = app
+            .update(AppEvent::Action(AppAction::SubmitFileAction(
+                destination.clone(),
+            )))
+            .pop()
+            .unwrap();
+        let follow_up = fail(&mut app, effect);
+        let note = destination.join("sub/note.md");
+        assert!(matches!(
+            follow_up.as_slice(),
+            [AppEffect::LoadNote { path, .. }] if path == &note
+        ));
+        assert!(
+            app.update(AppEvent::Action(AppAction::Global(GlobalAction::Save)))
+                .is_empty(),
+            "the stale old-path editor must not overwrite after {action:?}"
+        );
+    }
+
+    let (_sandbox, mut deleted) = app_with_note(180, "folder/sub/note.md", "base");
+    deleted.update(AppEvent::Action(AppAction::Focus(Focus::Tree)));
+    deleted.update(AppEvent::Action(AppAction::Tree(TreeAction::Delete)));
+    let effect = deleted
+        .update(AppEvent::Action(AppAction::ConfirmDelete))
+        .pop()
+        .unwrap();
+    assert!(fail(&mut deleted, effect).is_empty());
+    let Screen::Workspace(workspace) = &deleted.screen else {
+        panic!("expected workspace");
+    };
+    assert_eq!(workspace.current_note, None);
+    assert!(workspace.editor.is_none());
+    assert!(matches!(
+        deleted
+            .update(AppEvent::Action(AppAction::Global(GlobalAction::Save)))
+            .as_slice(),
+        [AppEffect::RetryCommit { .. }]
+    ));
 }
 
 #[test]

@@ -651,6 +651,52 @@ fn mutations_reject_a_repository_root_replaced_by_a_symlink() {
 
 #[cfg(unix)]
 #[test]
+fn tree_refresh_rejects_an_external_repository_replacing_the_opened_root() {
+    let sandbox = tempdir().unwrap();
+    let registered = sandbox.path().join("registered");
+    let moved = sandbox.path().join("moved");
+    fs::create_dir(&registered).unwrap();
+    assert!(
+        Command::new("git")
+            .arg("init")
+            .arg(&registered)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    fs::write(registered.join("opened.md"), "opened").unwrap();
+    let workspace = open_workspace(fs::canonicalize(&registered).unwrap());
+
+    fs::rename(&registered, &moved).unwrap();
+    fs::create_dir(&registered).unwrap();
+    assert!(
+        Command::new("git")
+            .arg("init")
+            .arg(&registered)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    fs::write(registered.join("external.md"), "external").unwrap();
+
+    let error = workspace.tree().unwrap_err();
+
+    assert!(error.to_string().contains("opened repository root changed"));
+    assert_eq!(
+        fs::read_to_string(registered.join("external.md")).unwrap(),
+        "external"
+    );
+    assert!(!registered.join("opened.md").exists());
+    assert_eq!(
+        fs::read_to_string(moved.join("opened.md")).unwrap(),
+        "opened"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn mutations_remain_bound_to_the_opened_root_directory_identity() {
     let sandbox = tempdir().unwrap();
     let repo = sandbox.path().join("repo");

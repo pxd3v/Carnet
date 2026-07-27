@@ -17,6 +17,10 @@ use history::{History, Snapshot};
 use search::SearchState;
 use thiserror::Error;
 
+/// Maximum number of persistent Rope snapshots retained across undo and redo.
+/// The loaded baseline is always one of these entries.
+pub const EDITOR_HISTORY_ENTRY_LIMIT: usize = 256;
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ClipboardError {
     #[error("clipboard is unavailable")]
@@ -204,6 +208,11 @@ impl Editor {
         self.buffer.text() != self.loaded.text()
     }
 
+    /// Returns the number of persistent undo/redo entries currently retained.
+    pub fn history_entry_count(&self) -> usize {
+        self.history.entry_count()
+    }
+
     pub fn cursor(&self) -> usize {
         self.cursor
     }
@@ -332,49 +341,49 @@ impl Editor {
         }
     }
 
-    fn replace_selection(&mut self, text: &str) {
+    fn replace_selection(&mut self, text: &str) -> bool {
         let range = self.selection().unwrap_or(self.cursor..self.cursor);
-        if range.is_empty() && text.is_empty() {
-            return;
+        if !self.buffer.replace(range.clone(), text) {
+            return false;
         }
         let start = range.start;
-        self.buffer.replace(range, text);
         self.cursor = self
             .buffer
             .boundary_at_or_after(start + text.chars().count());
         self.anchor = None;
         self.preferred_column = None;
         self.search.reset_navigation();
+        true
     }
 
-    fn backspace(&mut self) {
+    fn backspace(&mut self) -> bool {
         if self.selection().is_some() {
-            self.replace_selection("");
-            return;
+            return self.replace_selection("");
         }
         let start = self.buffer.previous_grapheme_boundary(self.cursor);
         if start == self.cursor {
-            return;
+            return false;
         }
         self.buffer.replace(start..self.cursor, "");
         self.cursor = self.buffer.boundary_at_or_after(start);
         self.anchor = None;
         self.preferred_column = None;
+        true
     }
 
-    fn delete(&mut self) {
+    fn delete(&mut self) -> bool {
         if self.selection().is_some() {
-            self.replace_selection("");
-            return;
+            return self.replace_selection("");
         }
         let end = self.buffer.next_grapheme_boundary(self.cursor);
         if end == self.cursor {
-            return;
+            return false;
         }
         self.buffer.replace(self.cursor..end, "");
         self.cursor = self.buffer.boundary_at_or_after(self.cursor);
         self.anchor = None;
         self.preferred_column = None;
+        true
     }
 
     fn copy(&mut self) -> EditorOutcome {
@@ -414,7 +423,7 @@ impl Editor {
         }
     }
 
-    fn indent(&mut self) {
+    fn indent(&mut self) -> bool {
         let starts = self.selected_line_starts();
         for start in starts.iter().rev() {
             self.buffer.replace(*start..*start, "    ");
@@ -425,9 +434,10 @@ impl Editor {
         }
         self.snap_endpoints();
         self.preferred_column = None;
+        true
     }
 
-    fn outdent(&mut self) {
+    fn outdent(&mut self) -> bool {
         let removals: Vec<_> = self
             .selected_line_starts()
             .into_iter()
@@ -445,6 +455,9 @@ impl Editor {
                 (count > 0).then_some((start, count))
             })
             .collect();
+        if removals.is_empty() {
+            return false;
+        }
         for (start, count) in removals.iter().rev() {
             self.buffer.replace(*start..*start + *count, "");
         }
@@ -454,6 +467,7 @@ impl Editor {
         }
         self.snap_endpoints();
         self.preferred_column = None;
+        true
     }
 
     fn snap_endpoints(&mut self) {
@@ -495,10 +509,9 @@ impl Editor {
             .collect()
     }
 
-    fn transact(&mut self, edit: impl FnOnce(&mut Self)) -> EditorOutcome {
+    fn transact(&mut self, edit: impl FnOnce(&mut Self) -> bool) -> EditorOutcome {
         let before = self.snapshot();
-        edit(self);
-        if self.buffer.text() != before.text {
+        if edit(self) {
             self.history.record(before);
             self.search.reset_navigation();
             EditorOutcome::Changed
@@ -529,7 +542,7 @@ impl Editor {
 
     fn snapshot(&self) -> Snapshot {
         Snapshot {
-            text: self.buffer.text(),
+            buffer: self.buffer.clone(),
             cursor: self.cursor,
             anchor: self.anchor,
             preferred_column: self.preferred_column,
@@ -537,7 +550,7 @@ impl Editor {
     }
 
     fn restore(&mut self, snapshot: Snapshot) {
-        self.buffer = TextBuffer::new(&snapshot.text);
+        self.buffer = snapshot.buffer;
         self.cursor = snapshot.cursor;
         self.anchor = snapshot.anchor;
         self.preferred_column = snapshot.preferred_column;
