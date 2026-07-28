@@ -14,9 +14,15 @@ use std::{
 
 use crossterm::{
     cursor::{Hide, Show},
-    event::{DisableBracketedPaste, EnableBracketedPaste, Event},
+    event::{
+        DisableBracketedPaste, EnableBracketedPaste, Event, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        supports_keyboard_enhancement,
+    },
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -40,11 +46,71 @@ pub trait TerminalLifecycle {
 }
 
 #[derive(Debug, Default)]
-pub struct CrosstermLifecycle;
+pub struct CrosstermLifecycle {
+    keyboard: KeyboardEnhancementState,
+}
+
+#[derive(Debug, Default)]
+struct KeyboardEnhancementState {
+    pushed: bool,
+}
+
+impl KeyboardEnhancementState {
+    fn requested_flags(probe: io::Result<bool>) -> Option<KeyboardEnhancementFlags> {
+        probe.ok().filter(|supported| *supported).map(|_| {
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        })
+    }
+
+    fn mark_pushed(&mut self) {
+        self.pushed = true;
+    }
+
+    fn take_pop(&mut self) -> bool {
+        std::mem::take(&mut self.pushed)
+    }
+}
+
+fn enable_keyboard_enhancement(
+    state: &mut KeyboardEnhancementState,
+    probe: io::Result<bool>,
+    push: impl FnOnce(KeyboardEnhancementFlags) -> io::Result<()>,
+) -> io::Result<()> {
+    let Some(flags) = KeyboardEnhancementState::requested_flags(probe) else {
+        return Ok(());
+    };
+    push(flags)?;
+    state.mark_pushed();
+    Ok(())
+}
+
+fn restore_terminal_modes(
+    state: &mut KeyboardEnhancementState,
+    pop_keyboard: impl FnOnce() -> io::Result<()>,
+    restore_screen: impl FnOnce() -> io::Result<()>,
+    restore_raw: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let keyboard_result = if state.take_pop() {
+        pop_keyboard()
+    } else {
+        Ok(())
+    };
+    let screen_result = restore_screen();
+    let raw_result = restore_raw();
+    keyboard_result.and(screen_result).and(raw_result)
+}
 
 impl TerminalLifecycle for CrosstermLifecycle {
     fn enter(&mut self) -> io::Result<()> {
         enable_raw_mode()?;
+        enable_keyboard_enhancement(
+            &mut self.keyboard,
+            supports_keyboard_enhancement(),
+            |flags| execute!(io::stdout(), PushKeyboardEnhancementFlags(flags)),
+        )?;
         execute!(
             io::stdout(),
             EnterAlternateScreen,
@@ -54,14 +120,19 @@ impl TerminalLifecycle for CrosstermLifecycle {
     }
 
     fn restore(&mut self) -> io::Result<()> {
-        let terminal_result = execute!(
-            io::stdout(),
-            Show,
-            DisableBracketedPaste,
-            LeaveAlternateScreen
-        );
-        let raw_result = disable_raw_mode();
-        terminal_result.and(raw_result)
+        restore_terminal_modes(
+            &mut self.keyboard,
+            || execute!(io::stdout(), PopKeyboardEnhancementFlags),
+            || {
+                execute!(
+                    io::stdout(),
+                    Show,
+                    DisableBracketedPaste,
+                    LeaveAlternateScreen
+                )
+            },
+            disable_raw_mode,
+        )
     }
 }
 
@@ -1122,5 +1193,97 @@ impl Clipboard for ClipboardBoundary {
         self.local.push_str(text);
         let _ = self.primary.write_text(text);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyboardEnhancementFlags;
+
+    #[test]
+    fn keyboard_enhancement_falls_back_on_false_or_probe_error() {
+        assert!(KeyboardEnhancementState::requested_flags(Ok(false)).is_none());
+        assert!(
+            KeyboardEnhancementState::requested_flags(Err(io::Error::other("probe"))).is_none()
+        );
+    }
+
+    #[test]
+    fn keyboard_enhancement_uses_all_flags_and_pops_once() {
+        let flags = KeyboardEnhancementState::requested_flags(Ok(true)).unwrap();
+        assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+
+        let mut state = KeyboardEnhancementState::default();
+        state.mark_pushed();
+        assert!(state.take_pop());
+        assert!(!state.take_pop());
+    }
+
+    #[test]
+    fn keyboard_enablement_owns_only_a_successful_push() {
+        let mut state = KeyboardEnhancementState::default();
+        let mut pushed = None;
+        enable_keyboard_enhancement(&mut state, Ok(true), |flags| {
+            pushed = Some(flags);
+            Ok(())
+        })
+        .unwrap();
+        assert!(pushed.is_some());
+        assert!(state.take_pop());
+
+        for probe in [Ok(false), Err(io::Error::other("probe"))] {
+            let mut state = KeyboardEnhancementState::default();
+            enable_keyboard_enhancement(&mut state, probe, |_| {
+                panic!("fallback must not push keyboard flags")
+            })
+            .unwrap();
+            assert!(!state.take_pop());
+        }
+
+        let mut state = KeyboardEnhancementState::default();
+        let error =
+            enable_keyboard_enhancement(&mut state, Ok(true), |_| Err(io::Error::other("push")))
+                .unwrap_err();
+        assert_eq!(error.to_string(), "push");
+        assert!(!state.take_pop());
+    }
+
+    #[test]
+    fn keyboard_pop_failure_does_not_skip_remaining_terminal_cleanup() {
+        use std::cell::RefCell;
+
+        let mut state = KeyboardEnhancementState::default();
+        state.mark_pushed();
+        let calls = RefCell::new(Vec::new());
+        let error = restore_terminal_modes(
+            &mut state,
+            || {
+                calls.borrow_mut().push("pop");
+                Err(io::Error::other("pop"))
+            },
+            || {
+                calls.borrow_mut().push("screen");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("raw");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "pop");
+        assert_eq!(*calls.borrow(), ["pop", "screen", "raw"]);
+        restore_terminal_modes(
+            &mut state,
+            || panic!("keyboard flags must pop only once"),
+            || Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
     }
 }

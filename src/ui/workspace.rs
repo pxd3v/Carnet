@@ -10,7 +10,7 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::{COMFORTABLE_WIDTH, selection_viewport};
+use super::{COMFORTABLE_WIDTH, ShortcutStyle, selection_viewport};
 use crate::{
     app::{App, CommitStatus, Focus, PendingMutationKind, PushStatus, WorkspaceState},
     editor::{Editor, HighlightLanguage, HighlightSpan, HighlightStyle},
@@ -56,7 +56,12 @@ pub fn workspace_geometry(area: Rect, sidebar_visible: bool) -> WorkspaceGeometr
     }
 }
 
-pub(super) fn render(frame: &mut Frame<'_>, app: &App, workspace: &WorkspaceState) {
+pub(super) fn render(
+    frame: &mut Frame<'_>,
+    app: &App,
+    workspace: &WorkspaceState,
+    shortcut_style: ShortcutStyle,
+) {
     let [main, shortcuts, status] = Layout::vertical([
         Constraint::Min(5),
         Constraint::Length(3),
@@ -72,29 +77,43 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &App, workspace: &WorkspaceStat
         render_tree(frame, tree, workspace, geometry.tree_is_overlay);
     }
 
-    render_shortcuts(frame, shortcuts, workspace.focus);
+    render_shortcuts(frame, shortcuts, workspace.focus, shortcut_style);
     render_status(frame, status, app, workspace);
 }
 
-fn render_shortcuts(frame: &mut Frame<'_>, area: Rect, focus: Focus) {
+fn render_shortcuts(frame: &mut Frame<'_>, area: Rect, focus: Focus, style: ShortcutStyle) {
     let lines = vec![
-        shortcut_line(
-            "Global",
-            false,
-            "^S Save  ^G Push  ^F Find  ^P Open  ^B Files  ^Z/Y Undo/Redo  ^C/X/V Clipboard  ^A All  ^Q Quit",
-        ),
+        shortcut_line("Global", false, global_shortcuts(style)),
         shortcut_line(
             "Files",
             focus == Focus::Tree,
             "↑↓ Preview  →/Enter Folder  ← Parent  Enter Edit  n File  N Folder  r Rename  m Move  Del Delete",
         ),
-        shortcut_line(
-            "Editor",
-            focus == Focus::Editor,
-            "Esc Files  ⌥←→ Word  ⌘←→ Line  ⌘↑↓ Doc  Enter/S-Enter Newline  Tab/S-Tab Indent",
-        ),
+        shortcut_line("Editor", focus == Focus::Editor, editor_shortcuts(style)),
     ];
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn global_shortcuts(style: ShortcutStyle) -> &'static str {
+    match style {
+        ShortcutStyle::MacOs => {
+            "⌘S Save  ^G Push  ⌘F Find  ⌘P Open  ⌘B Files  ⌘Z/⇧⌘Z Undo/Redo  ⌘C/X/V Clipboard  ⌘A All  ^Q Quit"
+        }
+        ShortcutStyle::Portable => {
+            "^S Save  ^G Push  ^F Find  ^P Open  ^B Files  ^Z/Y Undo/Redo  ^C/X/V Clipboard  ^A All  ^Q Quit"
+        }
+    }
+}
+
+fn editor_shortcuts(style: ShortcutStyle) -> &'static str {
+    match style {
+        ShortcutStyle::MacOs => {
+            "Esc Files  ⇧←→ Select  ⌥←→ Word  ⌘←→ Line  ⌘↑↓ Doc  ⌥⌫/Del Word Del  ⌘⌫/Del Line Del  Tab/S-Tab Indent"
+        }
+        ShortcutStyle::Portable => {
+            "Esc Files  ⇧←→ Select  Alt←→ Word  Home/End Line  Alt⌫/Del Word Del  Tab/S-Tab Indent"
+        }
+    }
 }
 
 fn shortcut_line(label: &'static str, active: bool, shortcuts: &'static str) -> Line<'static> {

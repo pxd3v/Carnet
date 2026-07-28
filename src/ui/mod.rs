@@ -13,6 +13,22 @@ pub use workspace::{WorkspaceGeometry, workspace_geometry};
 /// Below this width the editor retains the full workspace and the tree floats over it.
 pub const COMFORTABLE_WIDTH: u16 = 96;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShortcutStyle {
+    MacOs,
+    Portable,
+}
+
+impl ShortcutStyle {
+    const fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else {
+            Self::Portable
+        }
+    }
+}
+
 pub(super) fn selection_viewport(
     len: usize,
     selected: Option<usize>,
@@ -30,9 +46,14 @@ pub(super) fn selection_viewport(
 }
 
 pub fn render(frame: &mut Frame<'_>, app: &App) {
+    render_with_shortcut_style(frame, app, ShortcutStyle::current());
+}
+
+#[doc(hidden)]
+pub fn render_with_shortcut_style(frame: &mut Frame<'_>, app: &App, style: ShortcutStyle) {
     match &app.screen {
         Screen::Home => home::render(frame, app),
-        Screen::Workspace(workspace) => workspace::render(frame, app, workspace),
+        Screen::Workspace(workspace) => workspace::render(frame, app, workspace, style),
     }
     dialogs::render(frame, app);
 }

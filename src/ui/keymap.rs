@@ -36,16 +36,14 @@ pub fn map_key(app: &App, key: KeyEvent) -> Option<AppEvent> {
 }
 
 fn global_action(key: KeyEvent) -> Option<GlobalAction> {
-    if !key.modifiers.contains(KeyModifiers::CONTROL) {
-        return None;
-    }
+    let primary = primary_modifier(key.modifiers)?;
     let KeyCode::Char(character) = key.code else {
         return None;
     };
     let character = character.to_ascii_lowercase();
     match character {
         's' => Some(GlobalAction::Save),
-        'g' => Some(GlobalAction::Push),
+        'g' if primary == KeyModifiers::CONTROL => Some(GlobalAction::Push),
         'f' => Some(GlobalAction::Find),
         'p' => Some(GlobalAction::QuickOpen),
         'b' => Some(GlobalAction::ToggleSidebar),
@@ -56,7 +54,21 @@ fn global_action(key: KeyEvent) -> Option<GlobalAction> {
         'x' => Some(GlobalAction::Cut),
         'v' => Some(GlobalAction::Paste),
         'a' => Some(GlobalAction::SelectAll),
-        'q' => Some(GlobalAction::Quit),
+        'q' if primary == KeyModifiers::CONTROL => Some(GlobalAction::Quit),
+        _ => None,
+    }
+}
+
+fn primary_modifier(modifiers: KeyModifiers) -> Option<KeyModifiers> {
+    if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::HYPER | KeyModifiers::META) {
+        return None;
+    }
+    match (
+        modifiers.contains(KeyModifiers::CONTROL),
+        modifiers.contains(KeyModifiers::SUPER),
+    ) {
+        (true, false) => Some(KeyModifiers::CONTROL),
+        (false, true) => Some(KeyModifiers::SUPER),
         _ => None,
     }
 }
@@ -97,16 +109,12 @@ fn dialog_event(app: &App, key: KeyEvent) -> Option<AppEvent> {
             KeyCode::Enter if !app.dialog_input.is_empty() => Some(AppEvent::Action(
                 AppAction::SubmitFileAction(app.dialog_input.clone().into()),
             )),
-            KeyCode::Backspace => {
+            KeyCode::Backspace if !has_non_text_modifier(key.modifiers) => {
                 let mut input = app.dialog_input.clone();
                 input.pop();
                 Some(AppEvent::Action(AppAction::SetDialogInput(input)))
             }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
+            KeyCode::Char(character) if !has_non_text_modifier(key.modifiers) => {
                 let mut input = app.dialog_input.clone();
                 input.push(character);
                 Some(AppEvent::Action(AppAction::SetDialogInput(input)))
@@ -130,7 +138,7 @@ fn dialog_event(app: &App, key: KeyEvent) -> Option<AppEvent> {
             {
                 Some(AppEvent::Action(AppAction::SubmitRepositoryForm))
             }
-            KeyCode::Backspace => {
+            KeyCode::Backspace if !has_non_text_modifier(key.modifiers) => {
                 let mut input = match app.repository_form.active_field {
                     RepositoryFormField::Name => app.repository_form.name.clone(),
                     RepositoryFormField::Path => app.repository_form.path.clone(),
@@ -138,11 +146,7 @@ fn dialog_event(app: &App, key: KeyEvent) -> Option<AppEvent> {
                 input.pop();
                 Some(AppEvent::Action(AppAction::SetRepositoryFormInput(input)))
             }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
+            KeyCode::Char(character) if !has_non_text_modifier(key.modifiers) => {
                 let mut input = match app.repository_form.active_field {
                     RepositoryFormField::Name => app.repository_form.name.clone(),
                     RepositoryFormField::Path => app.repository_form.path.clone(),
@@ -175,7 +179,7 @@ fn overlay_action(app: &App, key: KeyEvent) -> Option<AppAction> {
     };
     match key.code {
         KeyCode::Esc => Some(AppAction::Dismiss),
-        KeyCode::Backspace => {
+        KeyCode::Backspace if !has_non_text_modifier(key.modifiers) => {
             let mut query = query.clone();
             query.pop();
             Some(AppAction::SetOverlayQuery(query))
@@ -197,11 +201,7 @@ fn overlay_action(app: &App, key: KeyEvent) -> Option<AppAction> {
         KeyCode::Down if matches!(app.overlay, OverlayState::QuickOpen { .. }) => {
             Some(AppAction::MoveOverlaySelection(1))
         }
-        KeyCode::Char(character)
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
+        KeyCode::Char(character) if !has_non_text_modifier(key.modifiers) => {
             let mut query = query.clone();
             query.push(character);
             Some(AppAction::SetOverlayQuery(query))
@@ -236,42 +236,47 @@ fn home_action(key: KeyEvent) -> Option<HomeAction> {
 
 fn tree_action(key: KeyEvent) -> Option<TreeAction> {
     match key.code {
-        KeyCode::Up => Some(TreeAction::Up),
-        KeyCode::Down => Some(TreeAction::Down),
-        KeyCode::Left => Some(TreeAction::Left),
-        KeyCode::Right => Some(TreeAction::Right),
-        KeyCode::Enter => Some(TreeAction::Open),
-        KeyCode::Char('n') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-            Some(TreeAction::NewFile)
-        }
-        KeyCode::Char('N') | KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+        KeyCode::Up if key.modifiers == KeyModifiers::NONE => Some(TreeAction::Up),
+        KeyCode::Down if key.modifiers == KeyModifiers::NONE => Some(TreeAction::Down),
+        KeyCode::Left if key.modifiers == KeyModifiers::NONE => Some(TreeAction::Left),
+        KeyCode::Right if key.modifiers == KeyModifiers::NONE => Some(TreeAction::Right),
+        KeyCode::Enter if key.modifiers == KeyModifiers::NONE => Some(TreeAction::Open),
+        KeyCode::Char('n') if key.modifiers == KeyModifiers::NONE => Some(TreeAction::NewFile),
+        KeyCode::Char('N' | 'n') if key.modifiers == KeyModifiers::SHIFT => {
             Some(TreeAction::NewFolder)
         }
         KeyCode::Char('r') if key.modifiers == KeyModifiers::NONE => Some(TreeAction::Rename),
         KeyCode::Char('m') if key.modifiers == KeyModifiers::NONE => Some(TreeAction::Move),
-        KeyCode::Delete => Some(TreeAction::Delete),
-        KeyCode::Esc => Some(TreeAction::Escape),
+        KeyCode::Delete if key.modifiers == KeyModifiers::NONE => Some(TreeAction::Delete),
+        KeyCode::Esc if key.modifiers == KeyModifiers::NONE => Some(TreeAction::Escape),
         _ => None,
     }
 }
 
 fn editor_action(key: KeyEvent) -> Option<EditorCommand> {
     let extend_selection = key.modifiers.contains(KeyModifiers::SHIFT);
-    let command = key.modifiers.contains(KeyModifiers::SUPER);
-    let option = key.modifiers.contains(KeyModifiers::ALT);
+    let modifiers = key.modifiers;
     let motion = match key.code {
-        KeyCode::Left if command => Some(Motion::LineStart),
-        KeyCode::Right if command => Some(Motion::LineEnd),
-        KeyCode::Up if command => Some(Motion::DocumentStart),
-        KeyCode::Down if command => Some(Motion::DocumentEnd),
-        KeyCode::Left if option => Some(Motion::WordLeft),
-        KeyCode::Right if option => Some(Motion::WordRight),
-        KeyCode::Left => Some(Motion::Left),
-        KeyCode::Right => Some(Motion::Right),
-        KeyCode::Up => Some(Motion::Up),
-        KeyCode::Down => Some(Motion::Down),
-        KeyCode::Home => Some(Motion::LineStart),
-        KeyCode::End => Some(Motion::LineEnd),
+        KeyCode::Left if motion_modifiers(modifiers, KeyModifiers::SUPER) => {
+            Some(Motion::LineStart)
+        }
+        KeyCode::Right if motion_modifiers(modifiers, KeyModifiers::SUPER) => Some(Motion::LineEnd),
+        KeyCode::Up if motion_modifiers(modifiers, KeyModifiers::SUPER) => {
+            Some(Motion::DocumentStart)
+        }
+        KeyCode::Down if motion_modifiers(modifiers, KeyModifiers::SUPER) => {
+            Some(Motion::DocumentEnd)
+        }
+        KeyCode::Left if motion_modifiers(modifiers, KeyModifiers::ALT) => Some(Motion::WordLeft),
+        KeyCode::Right if motion_modifiers(modifiers, KeyModifiers::ALT) => Some(Motion::WordRight),
+        KeyCode::Left if motion_modifiers(modifiers, KeyModifiers::NONE) => Some(Motion::Left),
+        KeyCode::Right if motion_modifiers(modifiers, KeyModifiers::NONE) => Some(Motion::Right),
+        KeyCode::Up if motion_modifiers(modifiers, KeyModifiers::NONE) => Some(Motion::Up),
+        KeyCode::Down if motion_modifiers(modifiers, KeyModifiers::NONE) => Some(Motion::Down),
+        KeyCode::Home if motion_modifiers(modifiers, KeyModifiers::NONE) => Some(Motion::LineStart),
+        KeyCode::End if motion_modifiers(modifiers, KeyModifiers::NONE) => Some(Motion::LineEnd),
+        KeyCode::Char('b' | 'B') if modifiers == KeyModifiers::ALT => Some(Motion::WordLeft),
+        KeyCode::Char('f' | 'F') if modifiers == KeyModifiers::ALT => Some(Motion::WordRight),
         _ => None,
     };
     if let Some(motion) = motion {
@@ -281,31 +286,53 @@ fn editor_action(key: KeyEvent) -> Option<EditorCommand> {
         });
     }
     match key.code {
-        KeyCode::Enter => Some(EditorCommand::Newline),
-        KeyCode::Backspace => Some(EditorCommand::Backspace),
-        KeyCode::Delete => Some(EditorCommand::Delete),
-        KeyCode::Tab => Some(EditorCommand::Indent),
-        KeyCode::BackTab => Some(EditorCommand::Outdent),
-        KeyCode::Char(character)
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
-        {
+        KeyCode::Enter if modifiers == KeyModifiers::NONE || modifiers == KeyModifiers::SHIFT => {
+            Some(EditorCommand::Newline)
+        }
+        KeyCode::Backspace if modifiers == KeyModifiers::SUPER => {
+            Some(EditorCommand::DeleteToLineStart)
+        }
+        KeyCode::Delete if modifiers == KeyModifiers::SUPER => Some(EditorCommand::DeleteToLineEnd),
+        KeyCode::Backspace if modifiers == KeyModifiers::ALT => {
+            Some(EditorCommand::DeleteWordBackward)
+        }
+        KeyCode::Delete if modifiers == KeyModifiers::ALT => Some(EditorCommand::DeleteWordForward),
+        KeyCode::Char('u' | 'U') if modifiers == KeyModifiers::CONTROL => {
+            Some(EditorCommand::DeleteToLineStart)
+        }
+        KeyCode::Backspace if modifiers == KeyModifiers::NONE => Some(EditorCommand::Backspace),
+        KeyCode::Delete if modifiers == KeyModifiers::NONE => Some(EditorCommand::Delete),
+        KeyCode::Tab if modifiers == KeyModifiers::NONE => Some(EditorCommand::Indent),
+        KeyCode::BackTab if modifiers == KeyModifiers::NONE || modifiers == KeyModifiers::SHIFT => {
+            Some(EditorCommand::Outdent)
+        }
+        KeyCode::Char(character) if !has_non_text_modifier(modifiers) => {
             Some(EditorCommand::Insert(character.to_string()))
         }
         _ => None,
     }
 }
 
+fn motion_modifiers(actual: KeyModifiers, base: KeyModifiers) -> bool {
+    actual == base || actual == base | KeyModifiers::SHIFT
+}
+
 fn plain_character(key: KeyEvent) -> Option<char> {
-    if key
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-    {
+    if has_non_text_modifier(key.modifiers) {
         return None;
     }
     let KeyCode::Char(character) = key.code else {
         return None;
     };
     Some(character.to_ascii_lowercase())
+}
+
+fn has_non_text_modifier(modifiers: KeyModifiers) -> bool {
+    modifiers.intersects(
+        KeyModifiers::CONTROL
+            | KeyModifiers::ALT
+            | KeyModifiers::SUPER
+            | KeyModifiers::HYPER
+            | KeyModifiers::META,
+    )
 }

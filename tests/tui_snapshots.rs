@@ -5,7 +5,7 @@ use carnet::{
     catalog::RepoEntry,
     editor::{EditorCommand, Motion},
     git::GitRepo,
-    ui::render,
+    ui::{ShortcutStyle, render_with_shortcut_style},
     workspace::Workspace,
 };
 use ratatui::{Terminal, backend::TestBackend};
@@ -18,7 +18,9 @@ fn repository_home_is_a_discoverable_first_run_surface() {
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
 
-    terminal.draw(|frame| render(frame, &app)).unwrap();
+    terminal
+        .draw(|frame| render_with_shortcut_style(frame, &app, ShortcutStyle::MacOs))
+        .unwrap();
 
     insta::assert_snapshot!(terminal.backend());
 }
@@ -39,7 +41,9 @@ fn wide_workspace_keeps_tree_and_editor_visible() {
     let backend = TestBackend::new(110, 30);
     let mut terminal = Terminal::new(backend).unwrap();
 
-    terminal.draw(|frame| render(frame, &app)).unwrap();
+    terminal
+        .draw(|frame| render_with_shortcut_style(frame, &app, ShortcutStyle::MacOs))
+        .unwrap();
 
     insta::assert_snapshot!(terminal.backend());
 }
@@ -55,7 +59,9 @@ fn narrow_workspace_floats_the_tree_over_a_full_editor() {
     let backend = TestBackend::new(72, 22);
     let mut terminal = Terminal::new(backend).unwrap();
 
-    terminal.draw(|frame| render(frame, &app)).unwrap();
+    terminal
+        .draw(|frame| render_with_shortcut_style(frame, &app, ShortcutStyle::MacOs))
+        .unwrap();
 
     insta::assert_snapshot!(terminal.backend());
 }
@@ -76,7 +82,9 @@ fn dirty_navigation_prompt_exposes_save_discard_and_cancel() {
     let backend = TestBackend::new(90, 24);
     let mut terminal = Terminal::new(backend).unwrap();
 
-    terminal.draw(|frame| render(frame, &app)).unwrap();
+    terminal
+        .draw(|frame| render_with_shortcut_style(frame, &app, ShortcutStyle::MacOs))
+        .unwrap();
 
     insta::assert_snapshot!(terminal.backend());
 }
@@ -91,7 +99,9 @@ fn external_conflict_prompt_exposes_reload_overwrite_and_cancel() {
     let backend = TestBackend::new(90, 24);
     let mut terminal = Terminal::new(backend).unwrap();
 
-    terminal.draw(|frame| render(frame, &app)).unwrap();
+    terminal
+        .draw(|frame| render_with_shortcut_style(frame, &app, ShortcutStyle::MacOs))
+        .unwrap();
 
     insta::assert_snapshot!(terminal.backend());
 }
@@ -109,7 +119,9 @@ fn git_failure_distinguishes_saved_from_committed_and_offers_retry() {
     let backend = TestBackend::new(90, 24);
     let mut terminal = Terminal::new(backend).unwrap();
 
-    terminal.draw(|frame| render(frame, &app)).unwrap();
+    terminal
+        .draw(|frame| render_with_shortcut_style(frame, &app, ShortcutStyle::MacOs))
+        .unwrap();
 
     insta::assert_snapshot!(terminal.backend());
 }

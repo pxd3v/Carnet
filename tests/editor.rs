@@ -148,6 +148,68 @@ fn insertion_deletion_and_newline_replace_whole_selections() {
 }
 
 #[test]
+fn word_deletion_handles_unicode_spacing_and_one_step_undo() {
+    let mut editor = editor_from("words.md", "one  café, 世界");
+    editor.apply(move_command(Motion::DocumentEnd, false));
+
+    assert_eq!(
+        editor.apply(EditorCommand::DeleteWordBackward),
+        EditorOutcome::Changed
+    );
+    assert_eq!(editor.text(), "one  café, 世");
+    assert_eq!(editor.apply(EditorCommand::Undo), EditorOutcome::Changed);
+    assert_eq!(editor.text(), "one  café, 世界");
+
+    editor.apply(move_command(Motion::DocumentStart, false));
+    assert_eq!(
+        editor.apply(EditorCommand::DeleteWordForward),
+        EditorOutcome::Changed
+    );
+    assert_eq!(editor.text(), "  café, 世界");
+}
+
+#[test]
+fn line_deletion_stops_at_boundaries_without_joining_lines() {
+    let mut editor = editor_from("lines.md", "alpha\nbeta\ngamma");
+    editor.apply(move_command(Motion::Down, false));
+    editor.apply(move_command(Motion::LineEnd, false));
+
+    assert_eq!(
+        editor.apply(EditorCommand::DeleteToLineStart),
+        EditorOutcome::Changed
+    );
+    assert_eq!(editor.text(), "alpha\n\ngamma");
+    assert_eq!(
+        editor.apply(EditorCommand::DeleteToLineStart),
+        EditorOutcome::NoChange
+    );
+    assert_eq!(
+        editor.apply(EditorCommand::DeleteToLineEnd),
+        EditorOutcome::NoChange
+    );
+}
+
+#[test]
+fn semantic_deletion_replaces_a_grapheme_safe_selection() {
+    let commands = [
+        EditorCommand::DeleteWordBackward,
+        EditorCommand::DeleteWordForward,
+        EditorCommand::DeleteToLineStart,
+        EditorCommand::DeleteToLineEnd,
+    ];
+
+    for command in commands {
+        let mut editor = editor_from("selection.md", "a👩‍🚀b");
+        editor.apply(move_command(Motion::Right, false));
+        editor.apply(move_command(Motion::Right, true));
+
+        assert_eq!(editor.apply(command), EditorOutcome::Changed);
+        assert_eq!(editor.text(), "ab");
+        assert_valid_editor_endpoints(&editor);
+    }
+}
+
+#[test]
 fn identical_replacement_collapses_the_selection_before_the_next_insert() {
     let mut editor = editor_from("identical.md", "x");
     editor.apply(move_command(Motion::Right, true));
@@ -459,7 +521,7 @@ proptest! {
     #[test]
     fn generated_unicode_actions_keep_endpoints_on_graphemes_and_fully_undo(
         original in unicode_text(),
-        actions in prop::collection::vec((0_u8..16, any::<bool>(), unicode_text()), 0..48),
+        actions in prop::collection::vec((0_u8..20, any::<bool>(), unicode_text()), 0..48),
     ) {
         let mut editor = editor_from("generated.md", &original);
         let baseline = editor.text();
@@ -483,6 +545,10 @@ proptest! {
                 12 => move_command(Motion::LineEnd, extend),
                 13 => move_command(Motion::DocumentStart, extend),
                 14 => move_command(Motion::DocumentEnd, extend),
+                15 => EditorCommand::DeleteWordBackward,
+                16 => EditorCommand::DeleteWordForward,
+                17 => EditorCommand::DeleteToLineStart,
+                18 => EditorCommand::DeleteToLineEnd,
                 _ => EditorCommand::SelectAll,
             };
             let before = editor.text();

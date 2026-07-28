@@ -8,20 +8,22 @@ These shortcuts work from the applicable repository workspace unless a dialog or
 
 | Key | Action |
 | --- | --- |
-| `Ctrl+S` | Save the current note and create a local commit, or retry a failed local commit without rewriting the file |
+| `Command+S` or `Ctrl+S` | Save the current note and create a local commit, or retry a failed local commit without rewriting the file |
 | `Ctrl+G` | Push already-committed changes with ordinary `git push`; retry a failed push |
-| `Ctrl+F` | Open literal find in the current note |
-| `Ctrl+P` | Open quick open for text files in the current repository |
-| `Ctrl+B` | Safely return to Files from Editing; from Files, hide it and edit the current preview |
-| `Ctrl+Z` | Undo |
-| `Ctrl+Shift+Z` or `Ctrl+Y` | Redo |
-| `Ctrl+C` | Copy the selection |
-| `Ctrl+X` | Cut the selection |
-| `Ctrl+V` | Paste from the system clipboard or process-local fallback |
-| `Ctrl+A` | Select all note text |
+| `Command+F` or `Ctrl+F` | Open literal find in the current note |
+| `Command+P` or `Ctrl+P` | Open quick open for text files in the current repository |
+| `Command+B` or `Ctrl+B` | Safely return to Files from Editing; from Files, hide it and edit the current preview |
+| `Command+Z` or `Ctrl+Z` | Undo |
+| `Command+Shift+Z`, `Ctrl+Shift+Z`, or `Ctrl+Y` | Redo |
+| `Command+C` or `Ctrl+C` | Copy the selection |
+| `Command+X` or `Ctrl+X` | Cut the selection |
+| `Command+V` or `Ctrl+V` | Paste from the system clipboard or process-local fallback |
+| `Command+A` or `Ctrl+A` | Select all note text |
 | `Ctrl+Q` | Quit; a dirty note opens the dirty-navigation dialog |
 
 Terminal bracketed-paste input is inserted as one editor transaction, so one undo removes the entire paste.
+
+Ghostty owns several macOS shortcuts by default. Follow [Ghostty setup for native macOS editing](ghostty.md) once to forward them to Carnet. The `Ctrl` aliases remain available in every supported terminal.
 
 `Ctrl+G` never saves dirty editor content, creates a commit, chooses a branch, or configures a remote. The current branch must already have upstream tracking, and authentication must already work non-interactively through the system Git/SSH configuration. A failed push leaves local files and commits untouched.
 
@@ -67,6 +69,8 @@ Selecting a folder, binary/non-UTF-8 file, or symlink clears the preview. Binary
 | `Option+Left` / `Option+Right` | Move to the previous word start / next word end |
 | `Command+Left` / `Command+Right` | Move to the start/end of the current line |
 | `Command+Up` / `Command+Down` | Move to the start/end of the document |
+| `Option+Backspace` / `Option+Delete` | Delete through the previous word start / next word end |
+| `Command+Backspace` / `Command+Delete` | Delete to the start/end of the current line without joining lines |
 | Text input | Replace the selection or insert at the cursor |
 | `Enter` or `Shift+Enter` | Insert a newline |
 | `Backspace` / `Delete` | Delete before/after the cursor, or delete the selection |
@@ -74,7 +78,7 @@ Selecting a folder, binary/non-UTF-8 file, or symlink clears the preview. Binary
 | `Shift+Tab` | Outdent the selected lines or current line |
 | `Escape` | Return to Files; prompts Save / Discard / Cancel when modified |
 
-Adding Shift to Option/Command movement extends the selection. Carnet receives Option as Alt and Command as Super; your terminal must forward those combinations instead of reserving them.
+Adding Shift to any arrow, Option movement, or Command movement extends the selection from a fixed anchor. Reversing direction shrinks through that anchor. Carnet receives Option as Alt and Command as Super; your terminal must forward those combinations instead of reserving them.
 
 Save, find, quick open, sidebar, undo/redo, clipboard, select-all, and quit use the global shortcuts above.
 

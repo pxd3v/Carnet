@@ -12,6 +12,8 @@ Carnet supports macOS and Linux. It requires:
 
 Carnet uses the system clipboard when available and keeps a process-local fallback when it is not.
 
+On macOS, Carnet supports native editor shortcuts in Ghostty after a one-time keybinding setup. See [Ghostty setup for native macOS editing](docs/ghostty.md). The portable `Control` shortcuts work without that setup.
+
 ## Install
 
 ### Prebuilt releases

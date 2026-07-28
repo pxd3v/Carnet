@@ -111,6 +111,10 @@ pub enum EditorCommand {
     Insert(String),
     Backspace,
     Delete,
+    DeleteWordBackward,
+    DeleteWordForward,
+    DeleteToLineStart,
+    DeleteToLineEnd,
     Newline,
     BracketedPaste(String),
     Copy,
@@ -180,6 +184,10 @@ impl Editor {
             }
             EditorCommand::Backspace => self.transact(Self::backspace),
             EditorCommand::Delete => self.transact(Self::delete),
+            EditorCommand::DeleteWordBackward => self.transact(Self::delete_word_backward),
+            EditorCommand::DeleteWordForward => self.transact(Self::delete_word_forward),
+            EditorCommand::DeleteToLineStart => self.transact(Self::delete_to_line_start),
+            EditorCommand::DeleteToLineEnd => self.transact(Self::delete_to_line_end),
             EditorCommand::Newline => self.transact(|editor| editor.replace_selection("\n")),
             EditorCommand::BracketedPaste(text) => {
                 let text = normalize_newlines(&text);
@@ -365,30 +373,44 @@ impl Editor {
     }
 
     fn backspace(&mut self) -> bool {
-        if self.selection().is_some() {
-            return self.replace_selection("");
-        }
         let start = self.buffer.previous_grapheme_boundary(self.cursor);
-        if start == self.cursor {
-            return false;
-        }
-        self.buffer.replace(start..self.cursor, "");
-        self.cursor = self.buffer.boundary_at_or_after(start);
-        self.anchor = None;
-        self.preferred_column = None;
-        true
+        self.delete_range(start, self.cursor, start)
     }
 
     fn delete(&mut self) -> bool {
+        let end = self.buffer.next_grapheme_boundary(self.cursor);
+        self.delete_range(self.cursor, end, self.cursor)
+    }
+
+    fn delete_word_backward(&mut self) -> bool {
+        let start = self.buffer.previous_word_start(self.cursor);
+        self.delete_range(start, self.cursor, start)
+    }
+
+    fn delete_word_forward(&mut self) -> bool {
+        let end = self.buffer.next_word_end(self.cursor);
+        self.delete_range(self.cursor, end, self.cursor)
+    }
+
+    fn delete_to_line_start(&mut self) -> bool {
+        let start = self.buffer.line_start(self.cursor);
+        self.delete_range(start, self.cursor, start)
+    }
+
+    fn delete_to_line_end(&mut self) -> bool {
+        let end = self.buffer.line_end(self.cursor);
+        self.delete_range(self.cursor, end, self.cursor)
+    }
+
+    fn delete_range(&mut self, start: usize, end: usize, cursor: usize) -> bool {
         if self.selection().is_some() {
             return self.replace_selection("");
         }
-        let end = self.buffer.next_grapheme_boundary(self.cursor);
-        if end == self.cursor {
+        if start == end {
             return false;
         }
-        self.buffer.replace(self.cursor..end, "");
-        self.cursor = self.buffer.boundary_at_or_after(self.cursor);
+        self.buffer.replace(start..end, "");
+        self.cursor = self.buffer.boundary_at_or_after(cursor);
         self.anchor = None;
         self.preferred_column = None;
         true

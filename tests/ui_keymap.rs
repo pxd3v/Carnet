@@ -73,6 +73,38 @@ fn ctrl_shortcuts_map_to_portable_global_actions() {
 }
 
 #[test]
+fn command_shortcuts_map_to_native_global_actions() {
+    let (_sandbox, app) = workspace_app();
+    let cases = [
+        ('s', KeyModifiers::SUPER, GlobalAction::Save),
+        ('f', KeyModifiers::SUPER, GlobalAction::Find),
+        ('p', KeyModifiers::SUPER, GlobalAction::QuickOpen),
+        ('b', KeyModifiers::SUPER, GlobalAction::ToggleSidebar),
+        ('z', KeyModifiers::SUPER, GlobalAction::Undo),
+        (
+            'Z',
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+            GlobalAction::Redo,
+        ),
+        ('c', KeyModifiers::SUPER, GlobalAction::Copy),
+        ('x', KeyModifiers::SUPER, GlobalAction::Cut),
+        ('v', KeyModifiers::SUPER, GlobalAction::Paste),
+        ('a', KeyModifiers::SUPER, GlobalAction::SelectAll),
+    ];
+
+    for (character, modifiers, expected) in cases {
+        assert_eq!(
+            mapped_action(&app, KeyEvent::new(KeyCode::Char(character), modifiers)),
+            AppAction::Global(expected),
+            "shortcut Command+{character}"
+        );
+    }
+
+    assert!(map_key(&app, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::SUPER)).is_none());
+    assert!(map_key(&app, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::SUPER)).is_none());
+}
+
+#[test]
 fn home_and_tree_keys_map_only_to_their_pure_actions() {
     let home = App::home(Vec::new(), None, None);
     assert_eq!(
@@ -168,6 +200,130 @@ fn editor_modifier_arrows_map_to_word_line_and_document_motion() {
         mapped_action(&app, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
         AppAction::Editor(EditorCommand::Newline)
     );
+}
+
+#[test]
+fn ghostty_legacy_words_and_native_deletions_map_to_editor_commands() {
+    let (_sandbox, app) = workspace_app();
+    let cases = [
+        (
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+            EditorCommand::Move {
+                motion: Motion::WordLeft,
+                extend_selection: false,
+            },
+        ),
+        (
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+            EditorCommand::Move {
+                motion: Motion::WordRight,
+                extend_selection: false,
+            },
+        ),
+        (
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+            EditorCommand::DeleteWordBackward,
+        ),
+        (
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::ALT),
+            EditorCommand::DeleteWordForward,
+        ),
+        (
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER),
+            EditorCommand::DeleteToLineStart,
+        ),
+        (
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::SUPER),
+            EditorCommand::DeleteToLineEnd,
+        ),
+        (
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            EditorCommand::DeleteToLineStart,
+        ),
+    ];
+
+    for (key, expected) in cases {
+        assert_eq!(mapped_action(&app, key), AppAction::Editor(expected));
+    }
+}
+
+#[test]
+fn shift_extends_native_word_line_and_document_motion() {
+    let (_sandbox, app) = workspace_app();
+    let cases = [
+        (
+            KeyCode::Left,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+            Motion::WordLeft,
+        ),
+        (
+            KeyCode::Right,
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+            Motion::LineEnd,
+        ),
+        (
+            KeyCode::Up,
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+            Motion::DocumentStart,
+        ),
+    ];
+
+    for (code, modifiers, motion) in cases {
+        assert_eq!(
+            mapped_action(&app, KeyEvent::new(code, modifiers)),
+            AppAction::Editor(EditorCommand::Move {
+                motion,
+                extend_selection: true,
+            })
+        );
+    }
+}
+
+#[test]
+fn unsupported_enhanced_editor_modifiers_are_inert() {
+    let (_sandbox, app) = workspace_app();
+    let keys = [
+        KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::ALT),
+        KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
+        KeyEvent::new(KeyCode::Home, KeyModifiers::SUPER),
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER),
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::SUPER),
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::SHIFT),
+        KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL),
+    ];
+
+    for key in keys {
+        assert!(
+            map_key(&app, key).is_none(),
+            "unexpected mapping for {key:?}"
+        );
+    }
+}
+
+#[test]
+fn native_editor_modifiers_are_inert_while_files_owns_focus() {
+    let (_sandbox, mut app) = workspace_app();
+    let Screen::Workspace(workspace) = &mut app.screen else {
+        panic!("workspace fixture did not open")
+    };
+    workspace.focus = Focus::Tree;
+    let keys = [
+        KeyEvent::new(KeyCode::Delete, KeyModifiers::SUPER),
+        KeyEvent::new(KeyCode::Delete, KeyModifiers::ALT),
+        KeyEvent::new(KeyCode::Left, KeyModifiers::SUPER),
+        KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+        KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::SUPER),
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::SHIFT),
+    ];
+
+    for key in keys {
+        assert!(
+            map_key(&app, key).is_none(),
+            "unexpected mapping for {key:?}"
+        );
+    }
 }
 
 #[test]
@@ -426,6 +582,40 @@ fn dialogs_and_overlays_consume_keys_that_are_not_explicit_choices() {
         panic!("workspace fixture did not open")
     };
     assert_eq!(workspace.editor.as_ref().unwrap().text(), editor_before);
+}
+
+#[test]
+fn enhanced_command_keys_do_not_mutate_or_choose_modal_input() {
+    let (_sandbox, mut app) = workspace_app();
+    let command_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER);
+    let command_backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER);
+
+    app.dialog = Some(Dialog::DirtyNavigation);
+    assert!(map_key(&app, command_c).is_none());
+
+    app.dialog = None;
+    let Screen::Workspace(workspace) = &app.screen else {
+        panic!("workspace fixture did not open")
+    };
+    let origin = carnet::app::WorkspaceOrigin {
+        repository_id: workspace.repository.id,
+        repository_root: workspace.workspace.root().to_path_buf(),
+    };
+    app.dialog = Some(Dialog::FileAction {
+        origin,
+        kind: FileActionKind::NewFile,
+        target: None,
+    });
+    app.dialog_input = "note".into();
+    assert!(map_key(&app, command_c).is_none());
+    assert!(map_key(&app, command_backspace).is_none());
+
+    app.dialog = None;
+    app.overlay = OverlayState::Search {
+        query: "needle".into(),
+    };
+    assert!(map_key(&app, command_c).is_none());
+    assert!(map_key(&app, command_backspace).is_none());
 }
 
 #[test]

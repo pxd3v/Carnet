@@ -9,7 +9,7 @@ use carnet::{
     catalog::RepoEntry,
     editor::{EditorCommand, Motion},
     git::GitRepo,
-    ui::render,
+    ui::{ShortcutStyle, render, render_with_shortcut_style},
     workspace::Workspace,
     workspace::WorkspaceError,
 };
@@ -427,10 +427,14 @@ fn tree_viewport_keeps_an_offscreen_selection_visible() {
 fn workspace_footer_exposes_global_file_and_editor_shortcuts() {
     let (_sandbox, app) = workspace_app("note.md", "note");
 
-    let output = rendered_text(&app, 110, 16);
+    let output = rendered_text_with_style(&app, 180, 16, ShortcutStyle::MacOs);
 
     assert!(output.contains("Global"), "{output}");
-    assert!(output.contains("^S Save"), "{output}");
+    assert!(output.contains("⌘S Save"), "{output}");
+    assert!(output.contains("⌘F Find"), "{output}");
+    assert!(output.contains("⌘P Open"), "{output}");
+    assert!(output.contains("⌘B Files"), "{output}");
+    assert!(output.contains("⌘Z Undo"), "{output}");
     assert!(output.contains("^G Push"), "{output}");
     assert!(output.contains("^Q Quit"), "{output}");
     assert!(output.contains("Files"), "{output}");
@@ -438,8 +442,19 @@ fn workspace_footer_exposes_global_file_and_editor_shortcuts() {
     assert!(output.contains("Del Delete"), "{output}");
     assert!(output.contains("← Parent"), "{output}");
     assert!(output.contains("Editor"), "{output}");
+    assert!(output.contains("⇧←→ Select"), "{output}");
     assert!(output.contains("⌥←→ Word"), "{output}");
     assert!(output.contains("⌘←→ Line"), "{output}");
+    assert!(output.contains("⌥⌫/Del Word Del"), "{output}");
+    assert!(output.contains("⌘⌫/Del Line Del"), "{output}");
+
+    let portable = rendered_text_with_style(&app, 180, 16, ShortcutStyle::Portable);
+    assert!(portable.contains("^S Save"), "{portable}");
+    assert!(portable.contains("^F Find"), "{portable}");
+    assert!(portable.contains("^P Open"), "{portable}");
+    assert!(portable.contains("^B Files"), "{portable}");
+    assert!(portable.contains("Alt←→ Word"), "{portable}");
+    assert!(!portable.contains("⌘S Save"), "{portable}");
 }
 
 #[test]
@@ -486,6 +501,15 @@ fn quick_open_viewport_keeps_selection_and_footer_visible() {
 
 fn rendered_text(app: &App, width: u16, height: u16) -> String {
     render_backend(app, width, height).to_string()
+}
+
+fn rendered_text_with_style(app: &App, width: u16, height: u16, style: ShortcutStyle) -> String {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| render_with_shortcut_style(frame, app, style))
+        .unwrap();
+    terminal.backend().to_string()
 }
 
 fn render_backend(app: &App, width: u16, height: u16) -> TestBackend {

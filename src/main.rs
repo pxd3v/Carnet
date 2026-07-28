@@ -56,7 +56,7 @@ fn main() -> ExitCode {
 }
 
 fn run_tui(runtime: &mut Runtime) -> io::Result<AppExitStatus> {
-    let guard = RestorationGuard::enter(CrosstermLifecycle)?;
+    let guard = RestorationGuard::enter(CrosstermLifecycle::default())?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     let result = drive_terminal(&mut terminal, runtime);
