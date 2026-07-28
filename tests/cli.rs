@@ -1,8 +1,12 @@
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use carnet::{
     catalog::{Catalog, CatalogError},
-    cli::{Cli, CliError, Launch, route},
+    cli::{Cli, CliError, Invocation, Launch, OutputMode, resolve_invocation, route},
 };
 use clap::{CommandFactory, Parser};
 use tempfile::tempdir;
@@ -24,6 +28,80 @@ fn accepts_a_named_repository_with_or_without_a_note_path() {
     assert_eq!(only_repo.note_path, None);
     assert_eq!(repo_and_note.repo.as_deref(), Some("work"));
     assert_eq!(repo_and_note.note_path, Some(PathBuf::from("roadmap.md")));
+}
+
+#[test]
+fn output_flags_require_a_note_and_conflict_with_each_other() {
+    assert!(Cli::try_parse_from(["carnet", "--path"]).is_err());
+    assert!(Cli::try_parse_from(["carnet", "--print"]).is_err());
+    assert!(Cli::try_parse_from(["carnet", "--path", "--print", "note.md"]).is_err());
+}
+
+#[test]
+fn resolves_path_output_for_a_note_in_a_named_repository() {
+    let sandbox = tempdir().unwrap();
+    let repo = sandbox.path().join("notes");
+    fs::create_dir(&repo).unwrap();
+    let mut catalog = Catalog::create_at(sandbox.path().join("catalog.toml"));
+    catalog.register("work", &repo).unwrap();
+
+    let invocation = resolve_invocation(
+        Cli::try_parse_from(["carnet", "--repo", "work", "--path", "onboarding.md"]).unwrap(),
+        &catalog,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        invocation,
+        Invocation::NoteOutput(request)
+            if request.mode == OutputMode::Path
+                && request.note == Path::new("onboarding.md")
+                && request.repository.name == "work"
+    ));
+}
+
+#[test]
+fn resolves_print_output_for_a_note_in_the_default_repository() {
+    let sandbox = tempdir().unwrap();
+    let repo = sandbox.path().join("notes");
+    fs::create_dir(&repo).unwrap();
+    let mut catalog = Catalog::create_at(sandbox.path().join("catalog.toml"));
+    catalog.register("personal", &repo).unwrap();
+
+    let invocation = resolve_invocation(
+        Cli::try_parse_from(["carnet", "--print", "onboarding.md"]).unwrap(),
+        &catalog,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        invocation,
+        Invocation::NoteOutput(request)
+            if request.mode == OutputMode::Print
+                && request.note == Path::new("onboarding.md")
+                && request.repository.name == "personal"
+    ));
+}
+
+#[test]
+fn resolves_an_ordinary_invocation_to_the_existing_interactive_launch() {
+    let sandbox = tempdir().unwrap();
+    let repo = sandbox.path().join("notes");
+    fs::create_dir(&repo).unwrap();
+    let mut catalog = Catalog::create_at(sandbox.path().join("catalog.toml"));
+    catalog.register("personal", &repo).unwrap();
+
+    let invocation = resolve_invocation(
+        Cli::try_parse_from(["carnet", "onboarding.md"]).unwrap(),
+        &catalog,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        invocation,
+        Invocation::Interactive(Launch::Repository { repository, note })
+            if repository.name == "personal" && note.as_deref() == Some(Path::new("onboarding.md"))
+    ));
 }
 
 #[test]
@@ -120,6 +198,112 @@ fn process_exits_two_for_a_configuration_failure_before_tui_entry() {
         String::from_utf8(output.stderr)
             .unwrap()
             .contains("repository named \"missing\" is not registered")
+    );
+}
+
+struct ProcessFixture {
+    _sandbox: tempfile::TempDir,
+    home: PathBuf,
+    repository: PathBuf,
+}
+
+impl ProcessFixture {
+    fn empty() -> Self {
+        let sandbox = tempdir().unwrap();
+        let home = sandbox.path().join("home");
+        let repository = sandbox.path().join("notes");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&repository).unwrap();
+        let repository = fs::canonicalize(repository).unwrap();
+        let mut catalog = Catalog::create_at(process_catalog_path(&home));
+        catalog.register("personal", &repository).unwrap();
+        catalog.save().unwrap();
+        Self {
+            _sandbox: sandbox,
+            home,
+            repository,
+        }
+    }
+
+    fn with_note(path: &str, contents: &[u8]) -> Self {
+        let fixture = Self::empty();
+        let absolute = fixture.repository.join(path);
+        if let Some(parent) = absolute.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(absolute, contents).unwrap();
+        fixture
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_carnet"));
+        command
+            .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", self.home.join("config"));
+        command
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_catalog_path(home: &Path) -> PathBuf {
+    home.join("Library/Application Support/carnet/catalog.toml")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_catalog_path(home: &Path) -> PathBuf {
+    home.join("config/carnet/catalog.toml")
+}
+
+#[test]
+fn process_prints_a_note_without_entering_the_tui() {
+    let fixture =
+        ProcessFixture::with_note("onboarding.md", b"\xef\xbb\xbffirst line\r\nsecond line");
+
+    let output = fixture
+        .command()
+        .args(["--print", "onboarding.md"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"first line\nsecond line");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn process_prints_an_absolute_note_path_without_entering_the_tui() {
+    let fixture = ProcessFixture::with_note("onboarding.md", b"hello");
+
+    let output = fixture
+        .command()
+        .args(["--path", "onboarding.md"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{}\n", fixture.repository.join("onboarding.md").display())
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn process_reports_a_missing_output_note_as_an_operational_failure() {
+    let fixture = ProcessFixture::empty();
+
+    let output = fixture
+        .command()
+        .args(["--print", "missing.md"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("carnet: note does not exist: missing.md")
     );
 }
 

@@ -57,6 +57,16 @@ carnet --repo work roadmap.md
 
 Missing note paths open as unsaved buffers and are created by the first explicit save. `Ctrl+S` writes the file, stages all non-ignored repository changes with `git add -A`, and creates a commit. If the file changed outside Carnet, choose Reload, Overwrite, or Cancel. If the file write succeeds but the Git commit fails, the bytes remain saved and `Ctrl+S` retries only the commit.
 
+Resolve or read an existing note non-interactively when referencing it from an AI agent or shell command:
+
+```sh
+carnet --path onboarding.md
+carnet --print onboarding.md
+carnet --repo work --path planning/roadmap.md
+```
+
+`--path` prints the absolute path. `--print` prints the logical UTF-8 note text without adding a newline. Both modes require an existing text note and exit without entering the terminal UI or changing files, Git, or repository registrations.
+
 Repository home can create, register, open, rename, set the default, and unregister repositories. Unregistering never deletes files from disk.
 
 See the [CLI reference](docs/cli.md) for command syntax, configuration, and exit codes, and the [keyboard reference](docs/keyboard.md) for every interaction.

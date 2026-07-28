@@ -3,7 +3,8 @@ use std::{io, process::ExitCode, time::Duration};
 use carnet::{
     app::AppExitStatus,
     catalog::Catalog,
-    cli::{Cli, route},
+    cli::{Cli, Invocation, resolve_invocation},
+    note_output::write_note_output,
     runtime::{
         CrosstermLifecycle, DEFAULT_QUIT_GRACE, RestorationGuard, Runtime, map_terminal_event,
     },
@@ -22,19 +23,34 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let launch = match route(cli, &catalog) {
-        Ok(launch) => launch,
+    let invocation = match resolve_invocation(cli, &catalog) {
+        Ok(invocation) => invocation,
         Err(error) => {
             eprintln!("carnet: {error}");
             return ExitCode::from(2);
         }
     };
-    let mut runtime = Runtime::new(catalog, launch);
-    match run_tui(&mut runtime) {
-        Ok(status) => ExitCode::from(status.code()),
-        Err(error) => {
-            eprintln!("carnet: terminal runtime failed: {error}");
-            ExitCode::from(1)
+    match invocation {
+        Invocation::Interactive(launch) => {
+            let mut runtime = Runtime::new(catalog, launch);
+            match run_tui(&mut runtime) {
+                Ok(status) => ExitCode::from(status.code()),
+                Err(error) => {
+                    eprintln!("carnet: terminal runtime failed: {error}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        Invocation::NoteOutput(request) => {
+            let stdout = io::stdout();
+            let mut stdout = stdout.lock();
+            match write_note_output(request, &mut stdout) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("carnet: {error}");
+                    ExitCode::from(1)
+                }
+            }
         }
     }
 }

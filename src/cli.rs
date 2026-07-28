@@ -18,9 +18,36 @@ pub struct Cli {
     #[arg(short, long, value_name = "NAME")]
     pub repo: Option<String>,
 
+    /// Print the absolute path of an existing note and exit.
+    #[arg(long, requires = "note_path", conflicts_with = "print")]
+    pub path: bool,
+
+    /// Print the contents of an existing text note and exit.
+    #[arg(long, requires = "note_path", conflicts_with = "path")]
+    pub print: bool,
+
     /// Note to open or prepare, relative to the selected repository.
     #[arg(value_name = "NOTE_PATH")]
     pub note_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputMode {
+    Path,
+    Print,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NoteOutputRequest {
+    pub repository: RepoEntry,
+    pub note: PathBuf,
+    pub mode: OutputMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Invocation {
+    Interactive(Launch),
+    NoteOutput(NoteOutputRequest),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,6 +70,27 @@ pub enum CliError {
     AbsoluteNotePath { path: PathBuf },
     #[error("note path must not traverse outside its repository: {path}")]
     TraversalNotePath { path: PathBuf },
+    #[error("--path and --print require a note path")]
+    OutputNoteRequired,
+}
+
+pub fn resolve_invocation(cli: Cli, catalog: &Catalog) -> Result<Invocation, CliError> {
+    let mode = match (cli.path, cli.print) {
+        (true, false) => Some(OutputMode::Path),
+        (false, true) => Some(OutputMode::Print),
+        _ => None,
+    };
+    let Some(mode) = mode else {
+        return route(cli, catalog).map(Invocation::Interactive);
+    };
+    let note = cli.note_path.ok_or(CliError::OutputNoteRequired)?;
+    validate_note_path(&note)?;
+    let repository = catalog.resolve_repo(cli.repo.as_deref())?;
+    Ok(Invocation::NoteOutput(NoteOutputRequest {
+        repository,
+        note,
+        mode,
+    }))
 }
 
 pub fn route(cli: Cli, catalog: &Catalog) -> Result<Launch, CliError> {
