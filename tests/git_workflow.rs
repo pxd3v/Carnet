@@ -5,7 +5,7 @@ use std::{
 };
 
 use carnet::git::{
-    CommitIntent, CommitOutcome, GitRepo, MutationCommitError, MutationCommitOutcome,
+    CommitIntent, CommitOutcome, GitRepo, MutationCommitError, MutationCommitOutcome, PushOutcome,
     apply_and_commit,
 };
 use carnet::{
@@ -159,6 +159,60 @@ fn open_accepts_a_work_tree_subdirectory_and_rejects_a_non_repository() {
 
     let outside = tempdir().unwrap();
     assert!(GitRepo::open(outside.path()).is_err());
+}
+
+#[test]
+fn push_updates_the_configured_upstream_and_then_reports_up_to_date() {
+    let repo = TestRepo::initialized_with_commit("baseline.md");
+    let remote = tempdir().unwrap();
+    init_bare_remote(remote.path());
+    repo.git_ok(["remote", "add", "origin", remote.path().to_str().unwrap()]);
+    repo.git_ok(["push", "-u", "origin", "HEAD"]);
+    fs::write(repo.path().join("note.md"), "hello\n").unwrap();
+    repo.git
+        .commit_all(CommitIntent::Create(PathBuf::from("note.md")))
+        .unwrap();
+
+    assert_eq!(repo.git.push().unwrap(), PushOutcome::Pushed);
+    assert_eq!(
+        git_output(remote.path(), ["show", "HEAD:note.md"]),
+        "hello\n"
+    );
+    assert_eq!(repo.git.push().unwrap(), PushOutcome::UpToDate);
+}
+
+#[test]
+fn push_without_an_upstream_returns_a_contextual_git_error() {
+    let repo = TestRepo::initialized_with_commit("note.md");
+
+    let error = repo.git.push().unwrap_err();
+
+    assert!(error.to_string().contains("git push failed"));
+}
+
+#[cfg(unix)]
+#[test]
+fn rejected_push_does_not_change_the_local_commit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = TestRepo::initialized_with_commit("baseline.md");
+    let remote = tempdir().unwrap();
+    init_bare_remote(remote.path());
+    repo.git_ok(["remote", "add", "origin", remote.path().to_str().unwrap()]);
+    repo.git_ok(["push", "-u", "origin", "HEAD"]);
+    fs::write(repo.path().join("note.md"), "local\n").unwrap();
+    repo.git
+        .commit_all(CommitIntent::Create(PathBuf::from("note.md")))
+        .unwrap();
+    let local_head = repo.git_ok(["rev-parse", "HEAD"]).stdout;
+    let hook = remote.path().join("hooks/pre-receive");
+    fs::write(&hook, "#!/bin/sh\necho rejected >&2\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let error = repo.git.push().unwrap_err();
+
+    assert!(error.to_string().contains("rejected"));
+    assert_eq!(repo.git_ok(["rev-parse", "HEAD"]).stdout, local_head);
 }
 
 #[test]
@@ -508,6 +562,19 @@ fn configure_identity(root: &Path) {
             .unwrap();
         assert!(output.status.success());
     }
+}
+
+fn init_bare_remote(root: &Path) {
+    let output = Command::new("git")
+        .args(["init", "--bare"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git init --bare failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn git_output<const N: usize>(root: &Path, args: [&str; N]) -> String {

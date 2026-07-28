@@ -45,6 +45,7 @@ fn global_action(key: KeyEvent) -> Option<GlobalAction> {
     let character = character.to_ascii_lowercase();
     match character {
         's' => Some(GlobalAction::Save),
+        'g' => Some(GlobalAction::Push),
         'f' => Some(GlobalAction::Find),
         'p' => Some(GlobalAction::QuickOpen),
         'b' => Some(GlobalAction::ToggleSidebar),

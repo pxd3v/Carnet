@@ -8,7 +8,8 @@ These shortcuts work from the applicable repository workspace unless a dialog or
 
 | Key | Action |
 | --- | --- |
-| `Ctrl+S` | Save the current note, or retry a failed Git commit without rewriting the file |
+| `Ctrl+S` | Save the current note and create a local commit, or retry a failed local commit without rewriting the file |
+| `Ctrl+G` | Push already-committed changes with ordinary `git push`; retry a failed push |
 | `Ctrl+F` | Open literal find in the current note |
 | `Ctrl+P` | Open quick open for text files in the current repository |
 | `Ctrl+B` | Safely return to Files from Editing; from Files, hide it and edit the current preview |
@@ -21,6 +22,8 @@ These shortcuts work from the applicable repository workspace unless a dialog or
 | `Ctrl+Q` | Quit; a dirty note opens the dirty-navigation dialog |
 
 Terminal bracketed-paste input is inserted as one editor transaction, so one undo removes the entire paste.
+
+`Ctrl+G` never saves dirty editor content, creates a commit, chooses a branch, or configures a remote. The current branch must already have upstream tracking, and authentication must already work non-interactively through the system Git/SSH configuration. A failed push leaves local files and commits untouched.
 
 ## Repository home
 

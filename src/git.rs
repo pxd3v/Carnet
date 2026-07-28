@@ -43,6 +43,12 @@ pub enum CommitOutcome {
     NoChanges,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PushOutcome {
+    Pushed,
+    UpToDate,
+}
+
 #[derive(Debug)]
 pub enum MutationCommitOutcome {
     Applied {
@@ -246,6 +252,16 @@ impl GitRepo {
             self.run_checked("rev-parse", [OsStr::new("rev-parse"), OsStr::new("HEAD")])?;
         Ok(CommitOutcome::Committed {
             revision: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        })
+    }
+
+    pub fn push(&self) -> Result<PushOutcome, GitError> {
+        let output = self.run_checked("push", [OsStr::new("push"), OsStr::new("--porcelain")])?;
+        let report = String::from_utf8_lossy(&output.stdout);
+        Ok(if report.lines().any(|line| line.starts_with('=')) {
+            PushOutcome::UpToDate
+        } else {
+            PushOutcome::Pushed
         })
     }
 

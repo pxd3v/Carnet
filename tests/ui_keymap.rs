@@ -36,9 +36,10 @@ fn narrow_geometry_preserves_the_full_editor_and_overlays_the_tree() {
 
 #[test]
 fn ctrl_shortcuts_map_to_portable_global_actions() {
-    let app = App::home(Vec::new(), None, None);
+    let (_sandbox, mut app) = workspace_app();
     let cases = [
         ('s', KeyModifiers::CONTROL, GlobalAction::Save),
+        ('g', KeyModifiers::CONTROL, GlobalAction::Push),
         ('f', KeyModifiers::CONTROL, GlobalAction::Find),
         ('p', KeyModifiers::CONTROL, GlobalAction::QuickOpen),
         ('b', KeyModifiers::CONTROL, GlobalAction::ToggleSidebar),
@@ -56,12 +57,18 @@ fn ctrl_shortcuts_map_to_portable_global_actions() {
         ('q', KeyModifiers::CONTROL, GlobalAction::Quit),
     ];
 
-    for (character, modifiers, expected) in cases {
-        assert_eq!(
-            mapped_action(&app, KeyEvent::new(KeyCode::Char(character), modifiers)),
-            AppAction::Global(expected),
-            "shortcut Ctrl+{character}"
-        );
+    for focus in [Focus::Tree, Focus::Editor] {
+        let Screen::Workspace(workspace) = &mut app.screen else {
+            panic!("workspace fixture did not open")
+        };
+        workspace.focus = focus;
+        for (character, modifiers, expected) in cases {
+            assert_eq!(
+                mapped_action(&app, KeyEvent::new(KeyCode::Char(character), modifiers)),
+                AppAction::Global(expected),
+                "shortcut Ctrl+{character} from {focus:?}"
+            );
+        }
     }
 }
 

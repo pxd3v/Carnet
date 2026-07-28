@@ -36,7 +36,9 @@ impl App {
                     ..
                 }) if pending_request == request_id && pending_repository == repository_id
             ),
-            RuntimeOperation::Mutation | RuntimeOperation::RefreshTree => false,
+            RuntimeOperation::Mutation | RuntimeOperation::Push | RuntimeOperation::RefreshTree => {
+                false
+            }
         };
         if !current {
             return Vec::new();

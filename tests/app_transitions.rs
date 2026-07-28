@@ -93,6 +93,166 @@ fn global_save_emits_one_apply_and_commit_effect_and_suppresses_competing_saves(
 }
 
 #[test]
+fn global_push_emits_once_and_accepts_only_the_matching_completion() {
+    use carnet::{
+        app::{GlobalAction, PushStatus},
+        git::PushOutcome,
+    };
+
+    let (_sandbox, mut app) = app_with_note(91, "note.md", "base");
+
+    let effects = app.update(AppEvent::Action(AppAction::Global(GlobalAction::Push)));
+    let (push_id, repository_id, repository_root) = push_identity(&effects[0]);
+
+    assert_eq!(app.status.push, PushStatus::Pushing);
+    assert!(app.pending_push.is_some());
+    assert!(
+        app.update(AppEvent::Action(AppAction::Global(GlobalAction::Push)))
+            .is_empty()
+    );
+
+    app.update(AppEvent::PushApplied {
+        push_id: carnet::app::PushId::new(push_id.get() + 1),
+        repository_id,
+        repository_root: repository_root.clone(),
+        outcome: PushOutcome::Pushed,
+    });
+    assert!(app.pending_push.is_some());
+    assert_eq!(app.status.push, PushStatus::Pushing);
+
+    app.update(AppEvent::PushApplied {
+        push_id,
+        repository_id,
+        repository_root: repository_root.join("other"),
+        outcome: PushOutcome::Pushed,
+    });
+    assert!(app.pending_push.is_some());
+    assert_eq!(app.status.push, PushStatus::Pushing);
+
+    app.update(AppEvent::PushApplied {
+        push_id,
+        repository_id,
+        repository_root,
+        outcome: PushOutcome::Pushed,
+    });
+    assert!(app.pending_push.is_none());
+    assert_eq!(app.status.push, PushStatus::Pushed);
+}
+
+#[test]
+fn global_push_is_inert_outside_an_unobstructed_workspace() {
+    use carnet::app::{Dialog, FailureKind, GlobalAction, OverlayState};
+
+    let mut home = App::home(Vec::new(), None, None);
+    assert!(
+        home.update(AppEvent::Action(AppAction::Global(GlobalAction::Push)))
+            .is_empty()
+    );
+
+    let (_dialog_sandbox, mut dialog) = app_with_note(92, "note.md", "base");
+    dialog.dialog = Some(Dialog::Failure {
+        kind: FailureKind::Runtime,
+        message: "busy".into(),
+    });
+    assert!(
+        dialog
+            .update(AppEvent::Action(AppAction::Global(GlobalAction::Push)))
+            .is_empty()
+    );
+
+    let (_overlay_sandbox, mut overlay) = app_with_note(93, "note.md", "base");
+    overlay.overlay = OverlayState::QuickOpen {
+        query: String::new(),
+        selected: None,
+    };
+    assert!(
+        overlay
+            .update(AppEvent::Action(AppAction::Global(GlobalAction::Push)))
+            .is_empty()
+    );
+
+    let (_mutation_sandbox, mut mutation) = app_with_note(94, "note.md", "base");
+    mutation.update(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "dirty ".into(),
+    ))));
+    mutation.update(AppEvent::Action(AppAction::Global(GlobalAction::Save)));
+    assert!(
+        mutation
+            .update(AppEvent::Action(AppAction::Global(GlobalAction::Push)))
+            .is_empty()
+    );
+}
+
+#[test]
+fn push_failure_is_independent_and_retry_clears_only_push_failure() {
+    use carnet::{
+        app::{AppExitStatus, FailureKind, GlobalAction, PushStatus, UnresolvedFailure},
+        git::{GitError, PushOutcome},
+    };
+
+    let (_sandbox, mut app) = app_with_note(95, "note.md", "base");
+    app.failures.git = Some(UnresolvedFailure {
+        kind: FailureKind::Git,
+        message: "local commit failed".into(),
+    });
+    let failed = app.update(AppEvent::Action(AppAction::Global(GlobalAction::Push)));
+    let (push_id, repository_id, repository_root) = push_identity(&failed[0]);
+
+    app.update(AppEvent::PushFailed {
+        push_id,
+        repository_id,
+        repository_root,
+        error: GitError::WorkerPanicked { operation: "push" },
+    });
+
+    assert!(app.failures.git.is_some());
+    assert!(app.failures.push.is_some());
+    assert!(matches!(app.status.push, PushStatus::Failed { .. }));
+
+    let retried = app.update(AppEvent::Action(AppAction::Global(GlobalAction::Push)));
+    let (push_id, repository_id, repository_root) = push_identity(&retried[0]);
+    app.update(AppEvent::PushApplied {
+        push_id,
+        repository_id,
+        repository_root,
+        outcome: PushOutcome::UpToDate,
+    });
+
+    assert!(app.failures.git.is_some());
+    assert!(app.failures.push.is_none());
+    assert_eq!(app.status.push, PushStatus::UpToDate);
+    app.update(AppEvent::Action(AppAction::Global(GlobalAction::Quit)));
+    app.update(AppEvent::QuitFinalized);
+    assert_eq!(app.quit.final_status, Some(AppExitStatus::Failure));
+}
+
+#[test]
+fn leaving_a_repository_invalidates_pending_push_and_its_completion() {
+    use carnet::{
+        app::{GlobalAction, NavigationAction, PushStatus},
+        git::PushOutcome,
+    };
+
+    let (_sandbox, mut app) = app_with_note(96, "note.md", "base");
+    let started = app.update(AppEvent::Action(AppAction::Global(GlobalAction::Push)));
+    let (push_id, repository_id, repository_root) = push_identity(&started[0]);
+
+    app.update(AppEvent::Action(AppAction::Navigate(
+        NavigationAction::Home,
+    )));
+
+    assert!(app.pending_push.is_none());
+    assert_eq!(app.status.push, PushStatus::Idle);
+    app.update(AppEvent::PushApplied {
+        push_id,
+        repository_id,
+        repository_root,
+        outcome: PushOutcome::Pushed,
+    });
+    assert_eq!(app.status.push, PushStatus::Idle);
+}
+
+#[test]
 fn pending_mutations_allow_safe_quit_but_reject_other_navigation_and_dirty_discard() {
     use carnet::app::{
         DirtyChoice, FileActionKind, Focus, GlobalAction, NavigationAction, PendingMutationKind,
@@ -3312,6 +3472,19 @@ fn mutation_identity(effect: &AppEffect) -> (carnet::app::MutationId, Uuid, Path
         panic!("expected mutation effect, got {effect:?}");
     };
     (*mutation_id, *repository_id, repository_root.clone())
+}
+
+fn push_identity(effect: &AppEffect) -> (carnet::app::PushId, Uuid, PathBuf) {
+    let AppEffect::Push {
+        push_id,
+        repository_id,
+        repository_root,
+        ..
+    } = effect
+    else {
+        panic!("expected push effect, got {effect:?}");
+    };
+    (*push_id, *repository_id, repository_root.clone())
 }
 
 fn pending_mutation_identity(app: &App) -> (carnet::app::MutationId, Uuid, PathBuf) {

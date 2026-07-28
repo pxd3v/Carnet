@@ -24,8 +24,8 @@ use uuid::Uuid;
 use crate::{
     app::{
         App, AppAction, AppEffect, AppEvent, AppExitStatus, CatalogSnapshot, ClipboardRequestId,
-        EditorOrigin, EffectExecutor, Focus, MutationId, NavigationAction, OverlayState, RequestId,
-        RuntimeError, RuntimeOperation, Screen,
+        EditorOrigin, EffectExecutor, Focus, MutationId, NavigationAction, OverlayState, PushId,
+        RequestId, RuntimeError, RuntimeOperation, Screen,
     },
     catalog::{Catalog, CatalogError},
     cli::Launch,
@@ -124,6 +124,7 @@ pub enum WorkerKind {
     LoadNote,
     Mutation,
     RetryCommit,
+    Push,
     Catalog,
     ClipboardRead,
     ClipboardWrite,
@@ -169,6 +170,11 @@ enum WorkerOrigin {
     },
     RetryCommit {
         mutation_id: MutationId,
+        repository_id: Uuid,
+        repository_root: PathBuf,
+    },
+    Push {
+        push_id: PushId,
         repository_id: Uuid,
         repository_root: PathBuf,
     },
@@ -219,6 +225,16 @@ impl WorkerOrigin {
                 repository_id: *repository_id,
                 repository_root: repository_root.clone(),
             },
+            AppEffect::Push {
+                push_id,
+                repository_id,
+                repository_root,
+                ..
+            } => Self::Push {
+                push_id: *push_id,
+                repository_id: *repository_id,
+                repository_root: repository_root.clone(),
+            },
             AppEffect::ReadClipboard { request_id, origin } => Self::ClipboardRead {
                 request_id: *request_id,
                 origin: origin.clone(),
@@ -238,6 +254,7 @@ impl WorkerOrigin {
             Self::LoadNote { .. } => WorkerKind::LoadNote,
             Self::Mutation { .. } => WorkerKind::Mutation,
             Self::RetryCommit { .. } => WorkerKind::RetryCommit,
+            Self::Push { .. } => WorkerKind::Push,
             Self::Catalog => WorkerKind::Catalog,
             Self::ClipboardRead { .. } => WorkerKind::ClipboardRead,
             Self::ClipboardWrite => WorkerKind::ClipboardWrite,
@@ -292,6 +309,16 @@ impl WorkerOrigin {
                     operation: "commit retry",
                 },
             },
+            Self::Push {
+                push_id,
+                repository_id,
+                repository_root,
+            } => AppEvent::PushFailed {
+                push_id: *push_id,
+                repository_id: *repository_id,
+                repository_root: repository_root.clone(),
+                error: GitError::WorkerPanicked { operation: "push" },
+            },
             Self::Catalog => AppEvent::RepositoryCatalogFailed {
                 message: "background catalog worker panicked".into(),
             },
@@ -307,9 +334,9 @@ impl WorkerOrigin {
 
 fn git_cancellation(effect: &AppEffect) -> Option<GitCancellation> {
     match effect {
-        AppEffect::ApplyAndCommit { git, .. } | AppEffect::RetryCommit { git, .. } => {
-            Some(git.cancellation())
-        }
+        AppEffect::ApplyAndCommit { git, .. }
+        | AppEffect::RetryCommit { git, .. }
+        | AppEffect::Push { git, .. } => Some(git.cancellation()),
         _ => None,
     }
 }
@@ -328,6 +355,9 @@ impl WorkerJob {
                 Some(workspace.root())
             }
             AppEffect::RetryCommit {
+                repository_root, ..
+            }
+            | AppEffect::Push {
                 repository_root, ..
             } => Some(repository_root),
             _ => None,
@@ -622,7 +652,8 @@ impl Runtime {
             WorkerKind::OpenWorkspace
             | WorkerKind::LoadNote
             | WorkerKind::Mutation
-            | WorkerKind::RetryCommit => {
+            | WorkerKind::RetryCommit
+            | WorkerKind::Push => {
                 for superseded in self.effect_queue.enqueue(job) {
                     self.jobs.remove(&superseded);
                     self.job_cancellations.remove(&superseded);

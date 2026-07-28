@@ -12,7 +12,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{COMFORTABLE_WIDTH, selection_viewport};
 use crate::{
-    app::{App, CommitStatus, Focus, PendingMutationKind, WorkspaceState},
+    app::{App, CommitStatus, Focus, PendingMutationKind, PushStatus, WorkspaceState},
     editor::{Editor, HighlightLanguage, HighlightSpan, HighlightStyle},
     workspace::{TreeEntry, TreeEntryKind},
 };
@@ -81,7 +81,7 @@ fn render_shortcuts(frame: &mut Frame<'_>, area: Rect, focus: Focus) {
         shortcut_line(
             "Global",
             false,
-            "^S Save  ^F Find  ^P Open  ^B Files  ^Z Undo  ^Y Redo  ^C Copy  ^X Cut  ^V Paste  ^A All  ^Q Quit",
+            "^S Save  ^G Push  ^F Find  ^P Open  ^B Files  ^Z/Y Undo/Redo  ^C/X/V Clipboard  ^A All  ^Q Quit",
         ),
         shortcut_line(
             "Files",
@@ -367,12 +367,20 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App, workspace: &Works
             Some(format!("saved · not committed: {message}"))
         }
     };
+    let push = match &app.status.push {
+        PushStatus::Idle => None,
+        PushStatus::Pushing => Some("pushing".to_owned()),
+        PushStatus::Pushed => Some("pushed".to_owned()),
+        PushStatus::UpToDate => Some("remote up to date".to_owned()),
+        PushStatus::Failed { message } => Some(message.clone()),
+    };
     let mut parts = vec![
         file_type.to_owned(),
         if dirty { "modified" } else { "saved" }.to_owned(),
         format!("Ln {line}, Col {column}"),
     ];
     parts.extend(mutation.or(request).map(str::to_owned));
+    parts.extend(push);
     parts.extend(commit);
     if let Some(message) = &app.status.message
         && !parts.iter().any(|part| part.contains(message))

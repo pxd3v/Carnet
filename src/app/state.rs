@@ -37,6 +37,19 @@ impl MutationId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PushId(pub(crate) u64);
+
+impl PushId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ClipboardRequestId(pub(crate) u64);
 
 impl ClipboardRequestId {
@@ -264,6 +277,13 @@ pub struct PendingMutation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingPush {
+    pub push_id: PushId,
+    pub repository_id: Uuid,
+    pub repository_root: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingSave {
     pub generation: u64,
     pub snapshot: String,
@@ -392,8 +412,21 @@ pub enum CommitStatus {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum PushStatus {
+    #[default]
+    Idle,
+    Pushing,
+    Pushed,
+    UpToDate,
+    Failed {
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StatusState {
     pub commit: CommitStatus,
+    pub push: PushStatus,
     pub message: Option<String>,
 }
 
@@ -445,6 +478,7 @@ pub struct FailureState {
     pub runtime_driver: Option<UnresolvedFailure>,
     pub write: Option<UnresolvedFailure>,
     pub git: Option<UnresolvedFailure>,
+    pub push: Option<UnresolvedFailure>,
     pub clipboard: Option<UnresolvedFailure>,
     pub catalog: Option<UnresolvedFailure>,
 }
@@ -455,6 +489,7 @@ impl FailureState {
             && self.runtime_driver.is_none()
             && self.write.is_none()
             && self.git.is_none()
+            && self.push.is_none()
             && self.clipboard.is_none()
             && self.catalog.is_none()
     }
@@ -473,6 +508,7 @@ pub struct App {
     pub sidebar: SidebarState,
     pub overlay: OverlayState,
     pub pending_mutation: Option<PendingMutation>,
+    pub pending_push: Option<PendingPush>,
     pub pending_intent: Option<PendingIntent>,
     pub pending_request: Option<PendingRequest>,
     pub pending_catalog: Option<PendingCatalogOperation>,
@@ -486,6 +522,7 @@ pub struct App {
     pub saved_commit_failure: Option<SavedCommitFailure>,
     pub(crate) next_request_id: u64,
     pub(crate) next_mutation_id: u64,
+    pub(crate) next_push_id: u64,
     pub(crate) next_save_generation: u64,
     pub(crate) next_clipboard_request_id: u64,
     pub(crate) next_editor_instance_id: u64,
@@ -513,6 +550,7 @@ impl App {
             },
             overlay: OverlayState::None,
             pending_mutation: None,
+            pending_push: None,
             pending_intent: None,
             pending_request: None,
             pending_catalog: None,
@@ -526,6 +564,7 @@ impl App {
             saved_commit_failure: None,
             next_request_id: 1,
             next_mutation_id: 1,
+            next_push_id: 1,
             next_save_generation: 1,
             next_clipboard_request_id: 1,
             next_editor_instance_id: 1,

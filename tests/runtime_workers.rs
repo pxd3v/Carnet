@@ -165,6 +165,102 @@ fn editor_and_render_continue_while_clipboard_worker_is_blocked() {
 }
 
 #[test]
+fn push_runs_in_the_background_and_keeps_editor_dispatch_responsive() {
+    use carnet::{app::PushStatus, git::CommitIntent};
+
+    let sandbox = tempdir().unwrap();
+    let root = sandbox.path().join("notes");
+    let remote = sandbox.path().join("remote.git");
+    let git = GitRepo::initialize(&root).unwrap();
+    configure_identity(&root);
+    fs::write(root.join("note.md"), "base").unwrap();
+    git.commit_all(CommitIntent::Create("note.md".into()))
+        .unwrap();
+    git_ok(sandbox.path(), ["init", "--bare", remote.to_str().unwrap()]);
+    git_ok(&root, ["remote", "add", "origin", remote.to_str().unwrap()]);
+    git_ok(&root, ["push", "-u", "origin", "HEAD"]);
+    fs::write(root.join("committed.md"), "remote content\n").unwrap();
+    git.commit_all(CommitIntent::Create("committed.md".into()))
+        .unwrap();
+    let mut catalog = Catalog::create_at(sandbox.path().join("catalog.toml"));
+    catalog.register("notes", &root).unwrap();
+    let launch = route(
+        Cli::try_parse_from(["carnet", "note.md"]).unwrap(),
+        &catalog,
+    )
+    .unwrap();
+    let (hook, entered, release) = BlockingHook::new(WorkerKind::Push);
+    let mut runtime =
+        Runtime::with_clipboard_and_hook(catalog, launch, Box::new(FailingClipboard), hook);
+    runtime.wait_for_idle(Duration::from_secs(3)).unwrap();
+
+    let started = Instant::now();
+    runtime.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::Push)));
+    assert!(started.elapsed() < Duration::from_millis(200));
+    entered.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(runtime.app().status.push, PushStatus::Pushing);
+    runtime.dispatch(AppEvent::Action(AppAction::Editor(EditorCommand::Insert(
+        "responsive ".into(),
+    ))));
+    runtime.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::Save)));
+    render_once(&runtime);
+    assert_eq!(editor_text(&runtime), "responsive base");
+    assert!(runtime.app().pending_mutation.is_some());
+    assert_eq!(fs::read_to_string(root.join("note.md")).unwrap(), "base");
+
+    release.send(()).unwrap();
+    runtime.wait_for_idle(Duration::from_secs(3)).unwrap();
+
+    assert_eq!(runtime.app().status.push, PushStatus::Pushed);
+    assert_eq!(
+        git_output(&remote, ["show", "HEAD:committed.md"]),
+        "remote content\n"
+    );
+    assert_eq!(git_output(&remote, ["show", "HEAD:note.md"]), "base");
+    assert_eq!(
+        fs::read_to_string(root.join("note.md")).unwrap(),
+        "responsive base"
+    );
+}
+
+#[test]
+fn panicking_push_worker_clears_pending_and_records_push_failure() {
+    use carnet::{app::PushStatus, git::CommitIntent};
+
+    let sandbox = tempdir().unwrap();
+    let root = sandbox.path().join("notes");
+    let git = GitRepo::initialize(&root).unwrap();
+    configure_identity(&root);
+    fs::write(root.join("note.md"), "base").unwrap();
+    git.commit_all(CommitIntent::Create("note.md".into()))
+        .unwrap();
+    let mut catalog = Catalog::create_at(sandbox.path().join("catalog.toml"));
+    catalog.register("notes", &root).unwrap();
+    let launch = route(
+        Cli::try_parse_from(["carnet", "note.md"]).unwrap(),
+        &catalog,
+    )
+    .unwrap();
+    let mut runtime = Runtime::with_clipboard_and_hook(
+        catalog,
+        launch,
+        Box::new(FailingClipboard),
+        Arc::new(PanicOnce::new(WorkerKind::Push)),
+    );
+    runtime.wait_for_idle(Duration::from_secs(3)).unwrap();
+
+    runtime.dispatch(AppEvent::Action(AppAction::Global(GlobalAction::Push)));
+    runtime.wait_for_idle(Duration::from_secs(3)).unwrap();
+
+    assert!(runtime.app().pending_push.is_none());
+    assert!(runtime.app().failures.push.is_some());
+    assert!(matches!(
+        runtime.app().status.push,
+        PushStatus::Failed { .. }
+    ));
+}
+
+#[test]
 fn blocked_clipboard_read_does_not_paste_after_note_navigation() {
     let sandbox = tempdir().unwrap();
     let root = sandbox.path().join("notes");
@@ -620,6 +716,33 @@ fn catalog_without_default(config: &Path, sandbox: &Path, chosen: &Path) -> Cata
     catalog.unregister("removed").unwrap();
     catalog.save().unwrap();
     catalog
+}
+
+fn git_ok<const N: usize>(root: &Path, args: [&str; N]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_output<const N: usize>(root: &Path, args: [&str; N]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
 }
 
 fn launched_note(

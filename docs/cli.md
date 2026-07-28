@@ -49,7 +49,9 @@ Repository registrations are stored as canonical paths and must identify an exis
 
 ## Git behavior
 
-Carnet uses the system `git` executable. After a successful save or trackable file mutation, it stages all non-ignored repository changes with `git add -A` and creates a commit. It skips empty commits. A file write is not rolled back if a Git commit fails; Carnet reports that outcome and allows a retry.
+Carnet uses the system `git` executable. After a successful save or trackable file mutation, it stages all non-ignored repository changes with `git add -A` and creates a local commit. It skips empty commits. A file write is not rolled back if a Git commit fails; Carnet reports that outcome and allows a retry with `Ctrl+S`.
+
+Remote synchronization is explicit: `Ctrl+G` runs ordinary `git push` for the open repository in the background. It pushes only commits that already exist; it never saves editor content, creates a commit, chooses a branch, configures a remote, or establishes upstream tracking. The repository's current branch must already have an upstream, and credentials or SSH-agent access must already work non-interactively with system Git. Carnet reports `pushed`, `remote up to date`, or a retryable push failure. A failed push leaves local files and commits untouched.
 
 ## Exit codes
 

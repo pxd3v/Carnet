@@ -20,7 +20,7 @@ expression: terminal.backend()
 "│                                │                                     │"
 "│                                │                                     │"
 "└────────────────────────────────┘─────────────────────────────────────┘"
-"Global  ^S Save  ^F Find  ^P Open  ^B Files  ^Z Undo  ^Y Redo  ^C Copy  "
+"Global  ^S Save  ^G Push  ^F Find  ^P Open  ^B Files  ^Z/Y Undo/Redo  ^C"
 "Files   ↑↓ Preview  →/Enter Folder  ← Parent  Enter Edit  n File  N Fold"
 "Editor  Esc Files  ⌥←→ Word  ⌘←→ Line  ⌘↑↓ Doc  Enter/S-Enter Newline  T"
 " Markdown  ·  saved  ·  Ln 1, Col 1                                     "

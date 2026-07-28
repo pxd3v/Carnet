@@ -3,8 +3,8 @@ use std::{fs, path::PathBuf};
 use carnet::{
     app::{
         App, AppAction, AppEvent, CommitStatus, Dialog, FailureKind, FileActionKind, HomeAction,
-        OverlayState, RepositoryActionKind, RepositoryAvailability, RuntimeError, RuntimeOperation,
-        Screen, WorkspaceOrigin,
+        OverlayState, PushStatus, RepositoryActionKind, RepositoryAvailability, RuntimeError,
+        RuntimeOperation, Screen, WorkspaceOrigin,
     },
     catalog::RepoEntry,
     editor::{EditorCommand, Motion},
@@ -314,6 +314,29 @@ fn status_reports_pending_commit_state() {
 }
 
 #[test]
+fn status_reports_push_lifecycle() {
+    let (_sandbox, mut app) = workspace_app("note.md", "note");
+    app.sidebar.visible = false;
+    let cases = [
+        (PushStatus::Pushing, "pushing"),
+        (PushStatus::Pushed, "pushed"),
+        (PushStatus::UpToDate, "remote up to date"),
+        (
+            PushStatus::Failed {
+                message: "push failed: git push failed: rejected".into(),
+            },
+            "push failed: git push failed: rejected",
+        ),
+    ];
+
+    for (status, expected) in cases {
+        app.status.push = status;
+        let output = rendered_text(&app, 120, 12);
+        assert!(output.contains(expected), "missing {expected:?}: {output}");
+    }
+}
+
+#[test]
 fn editor_viewport_keeps_the_cursor_line_visible() {
     let contents = (1..=20)
         .map(|line| format!("line {line:02}"))
@@ -408,6 +431,7 @@ fn workspace_footer_exposes_global_file_and_editor_shortcuts() {
 
     assert!(output.contains("Global"), "{output}");
     assert!(output.contains("^S Save"), "{output}");
+    assert!(output.contains("^G Push"), "{output}");
     assert!(output.contains("^Q Quit"), "{output}");
     assert!(output.contains("Files"), "{output}");
     assert!(output.contains("Enter Edit"), "{output}");

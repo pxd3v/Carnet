@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::{
     editor::{ClipboardError, Editor, EditorCommand},
-    git::{CommitIntent, CommitOutcome, GitError, GitRepo, MutationCommitError},
+    git::{CommitIntent, CommitOutcome, GitError, GitRepo, MutationCommitError, PushOutcome},
     workspace::{FileOperation, FileOutcome, LoadedNote, TreeEntry, TreeEntryKind, Workspace},
 };
 
@@ -14,10 +14,10 @@ use super::{
     DefaultChoiceState, Dialog, EditorInstanceId, EditorOrigin, ExternalConflict, FailureKind,
     FileActionKind, FileMutationAction, Focus, MutationId, NavigationAction, NoteLoadPurpose,
     OverlayState, PendingCatalogOperation, PendingClipboardRead, PendingDefaultIntent,
-    PendingFileMutation, PendingIntent, PendingMutation, PendingMutationKind, PendingRequest,
-    PendingSave, RepositoryActionKind, RepositoryAvailability, RepositoryFormField,
-    RepositoryFormState, RequestId, RuntimeFailure, Screen, UnresolvedFailure, WorkspaceOrigin,
-    WorkspaceState, directory_entries,
+    PendingFileMutation, PendingIntent, PendingMutation, PendingMutationKind, PendingPush,
+    PendingRequest, PendingSave, PushId, PushStatus, RepositoryActionKind, RepositoryAvailability,
+    RepositoryFormField, RepositoryFormState, RequestId, RuntimeFailure, Screen, UnresolvedFailure,
+    WorkspaceOrigin, WorkspaceState, directory_entries,
 };
 use super::{RuntimeError, RuntimeOperation};
 
@@ -37,6 +37,7 @@ pub enum HomeAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GlobalAction {
     Save,
+    Push,
     Find,
     QuickOpen,
     ToggleSidebar,
@@ -156,6 +157,18 @@ pub enum AppEvent {
     },
     CommitRetryFailed {
         mutation_id: MutationId,
+        repository_id: Uuid,
+        repository_root: std::path::PathBuf,
+        error: GitError,
+    },
+    PushApplied {
+        push_id: PushId,
+        repository_id: Uuid,
+        repository_root: std::path::PathBuf,
+        outcome: PushOutcome,
+    },
+    PushFailed {
+        push_id: PushId,
         repository_id: Uuid,
         repository_root: std::path::PathBuf,
         error: GitError,
@@ -472,6 +485,41 @@ impl App {
                 repository_root,
                 commit,
             ),
+            AppEvent::PushApplied {
+                push_id,
+                repository_id,
+                repository_root,
+                outcome,
+            } => {
+                if !self.push_result_is_current(push_id, repository_id, &repository_root) {
+                    return Vec::new();
+                }
+                self.pending_push = None;
+                self.failures.push = None;
+                self.status.push = match outcome {
+                    PushOutcome::Pushed => PushStatus::Pushed,
+                    PushOutcome::UpToDate => PushStatus::UpToDate,
+                };
+                Vec::new()
+            }
+            AppEvent::PushFailed {
+                push_id,
+                repository_id,
+                repository_root,
+                error,
+            } => {
+                if !self.push_result_is_current(push_id, repository_id, &repository_root) {
+                    return Vec::new();
+                }
+                self.pending_push = None;
+                let message = format!("push failed: {error}");
+                self.failures.push = Some(UnresolvedFailure {
+                    kind: FailureKind::Git,
+                    message: message.clone(),
+                });
+                self.status.push = PushStatus::Failed { message };
+                Vec::new()
+            }
             AppEvent::MutationSavedCommitFailed {
                 mutation_id,
                 repository_id,
@@ -605,6 +653,7 @@ impl App {
                 }
             }
             AppEvent::Action(AppAction::Global(GlobalAction::Save)) => self.global_save(),
+            AppEvent::Action(AppAction::Global(GlobalAction::Push)) => self.global_push(),
             AppEvent::ClipboardRead {
                 request_id,
                 origin,
@@ -1069,6 +1118,27 @@ impl App {
         pending_matches && workspace_matches
     }
 
+    fn push_result_is_current(
+        &self,
+        push_id: PushId,
+        repository_id: Uuid,
+        repository_root: &std::path::Path,
+    ) -> bool {
+        let pending_matches = self.pending_push.as_ref().is_some_and(|pending| {
+            pending.push_id == push_id
+                && pending.repository_id == repository_id
+                && pending.repository_root == repository_root
+        });
+        let workspace_matches = match &self.screen {
+            Screen::Workspace(workspace) => {
+                workspace.repository.id == repository_id
+                    && workspace.workspace.root() == repository_root
+            }
+            Screen::Home => false,
+        };
+        pending_matches && workspace_matches
+    }
+
     fn workspace_origin_matches(&self, origin: &WorkspaceOrigin) -> bool {
         match &self.screen {
             Screen::Workspace(workspace) => {
@@ -1258,6 +1328,35 @@ impl App {
         self.save(false)
     }
 
+    fn global_push(&mut self) -> Vec<AppEffect> {
+        if self.dialog.is_some()
+            || !matches!(self.overlay, OverlayState::None)
+            || self.pending_mutation.is_some()
+            || self.pending_push.is_some()
+        {
+            return Vec::new();
+        }
+        let Screen::Workspace(workspace) = &self.screen else {
+            return Vec::new();
+        };
+        let repository_id = workspace.repository.id;
+        let repository_root = workspace.workspace.root().to_path_buf();
+        let git = workspace.git.clone();
+        let push_id = self.next_push_id();
+        self.pending_push = Some(PendingPush {
+            push_id,
+            repository_id,
+            repository_root: repository_root.clone(),
+        });
+        self.status.push = PushStatus::Pushing;
+        vec![AppEffect::Push {
+            push_id,
+            repository_id,
+            repository_root,
+            git,
+        }]
+    }
+
     fn perform_intent(&mut self, intent: PendingIntent) -> Vec<AppEffect> {
         match intent {
             PendingIntent::Navigation(target) => self.perform_navigation(target),
@@ -1343,6 +1442,8 @@ impl App {
         match target {
             NavigationAction::Home => {
                 self.pending_clipboard_read = None;
+                self.pending_push = None;
+                self.status.push = PushStatus::Idle;
                 self.screen = Screen::Home;
                 self.overlay = OverlayState::None;
                 self.dialog = None;
@@ -1379,6 +1480,15 @@ impl App {
         mutation_id
     }
 
+    fn next_push_id(&mut self) -> PushId {
+        let push_id = PushId(self.next_push_id);
+        self.next_push_id = self
+            .next_push_id
+            .checked_add(1)
+            .expect("application push ID overflow");
+        push_id
+    }
+
     fn next_clipboard_request_id(&mut self) -> ClipboardRequestId {
         let request_id = ClipboardRequestId(self.next_clipboard_request_id);
         self.next_clipboard_request_id = self
@@ -1408,6 +1518,8 @@ impl App {
             return Vec::new();
         }
         self.pending_clipboard_read = None;
+        self.pending_push = None;
+        self.status.push = PushStatus::Idle;
         let request_id = self.next_request_id();
         self.pending_request = Some(PendingRequest::OpenWorkspace {
             request_id,

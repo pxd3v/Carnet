@@ -10,9 +10,10 @@ pub use state::{
     FileActionKind, FileMutationAction, Focus, HomeState, MutationId, NavigationAction,
     NoteLoadPurpose, OverlayState, PendingCatalogOperation, PendingClipboardRead,
     PendingDefaultIntent, PendingFileMutation, PendingIntent, PendingMutation, PendingMutationKind,
-    PendingRequest, PendingSave, QuitState, RepositoryActionKind, RepositoryAvailability,
-    RepositoryFormField, RepositoryFormState, RequestId, RuntimeFailure, SavedCommitFailure,
-    Screen, SidebarState, StatusState, UnresolvedFailure, WorkspaceOrigin, WorkspaceState,
+    PendingPush, PendingRequest, PendingSave, PushId, PushStatus, QuitState, RepositoryActionKind,
+    RepositoryAvailability, RepositoryFormField, RepositoryFormState, RequestId, RuntimeFailure,
+    SavedCommitFailure, Screen, SidebarState, StatusState, UnresolvedFailure, WorkspaceOrigin,
+    WorkspaceState,
 };
 pub use update::{
     AppAction, AppEvent, ConflictChoice, DirtyChoice, GlobalAction, HomeAction, TreeAction,

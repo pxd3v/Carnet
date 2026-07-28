@@ -28,7 +28,7 @@ expression: terminal.backend()
 "│                            ││                                                                              │"
 "│                            ││                                                                              │"
 "└────────────────────────────┘└──────────────────────────────────────────────────────────────────────────────┘"
-"Global  ^S Save  ^F Find  ^P Open  ^B Files  ^Z Undo  ^Y Redo  ^C Copy  ^X Cut  ^V Paste  ^A All  ^Q Quit     "
+"Global  ^S Save  ^G Push  ^F Find  ^P Open  ^B Files  ^Z/Y Undo/Redo  ^C/X/V Clipboard  ^A All  ^Q Quit       "
 "Files   ↑↓ Preview  →/Enter Folder  ← Parent  Enter Edit  n File  N Folder  r Rename  m Move  Del Delete      "
 "Editor  Esc Files  ⌥←→ Word  ⌘←→ Line  ⌘↑↓ Doc  Enter/S-Enter Newline  Tab/S-Tab Indent                       "
 " Markdown  ·  modified  ·  Ln 4, Col 11                                                                       "

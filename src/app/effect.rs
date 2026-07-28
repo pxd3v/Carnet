@@ -69,6 +69,12 @@ pub enum AppEffect {
         git: GitRepo,
         intent: CommitIntent,
     },
+    Push {
+        push_id: super::PushId,
+        repository_id: Uuid,
+        repository_root: PathBuf,
+        git: GitRepo,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,6 +82,7 @@ pub enum RuntimeOperation {
     OpenWorkspace,
     LoadNote,
     Mutation,
+    Push,
     RefreshTree,
 }
 
@@ -164,6 +171,12 @@ impl EffectExecutor {
                 git,
                 intent,
             )),
+            AppEffect::Push {
+                push_id,
+                repository_id,
+                repository_root,
+                git,
+            } => Ok(self.push(push_id, repository_id, repository_root, git)),
             effect @ (AppEffect::SetDefaultRepository { .. }
             | AppEffect::CreateRepository { .. }
             | AppEffect::RegisterRepository { .. }
@@ -326,6 +339,30 @@ impl EffectExecutor {
             },
             Err(error) => super::AppEvent::CommitRetryFailed {
                 mutation_id,
+                repository_id,
+                repository_root,
+                error,
+            },
+        })
+    }
+
+    fn push(
+        &self,
+        push_id: super::PushId,
+        repository_id: Uuid,
+        repository_root: PathBuf,
+        git: GitRepo,
+    ) -> super::AppEvent {
+        let root = repository_root.clone();
+        self.run_serialized(&root, || match git.push() {
+            Ok(outcome) => super::AppEvent::PushApplied {
+                push_id,
+                repository_id,
+                repository_root,
+                outcome,
+            },
+            Err(error) => super::AppEvent::PushFailed {
+                push_id,
                 repository_id,
                 repository_root,
                 error,
